@@ -78,17 +78,33 @@ HTTP-only, mocked Gemini/ffmpeg, D2 real-ffmpeg-silence প্যাটার্
 - Hard constraint মেনে চলা হয়েছে: পুরনো `test_app_orchestration.py` এক
   লাইনও বদলায়নি, এখনো আলাদাভাবে পাশ করে (ব্যাকওয়ার্ড-কম্প্যাট প্রমাণ)।
 
+## স্ট্যাটাস: FA-F1 সম্পূর্ণ — ফুল রিগ্রেশন পাস (কোনো fix লাগেনি)
+
+**`chunk-FA-F1-done` ট্যাগ বসানো হয়েছে।**
+
+FA-F1 verification ফলাফল:
+1. **পুরো test suite** (`python3 -m unittest discover -s pipeline/tests -v`,
+   U0-U5 + FA-A1 থেকে FA-E2 সবকিছু মিলিয়ে) — **২৯০টা টেস্ট, ১০০% পাস**
+   (OK), কোনো regression নেই, কোনো fix প্রয়োজন হয়নি (নতুন ফিচারও যোগ
+   হয়নি — শুধু verification)।
+2. **py_compile** touched ফাইলগুলোতে — OK: `app.py`,
+   `pipeline/full_auto_chain.py`, `pipeline/voiceover_unify.py`।
+3. **dry_run_check (U5)** একটা fixture job-এ (`--job-id audit-fixture`,
+   FA-D4/E1 আর্টিফ্যাক্টসহ) — exit 0, "RESULT: OK — no blocking errors";
+   নতুন flow-এর আউটপুট ফাইলের সাথে compatible (আর্টিফ্যাক্ট নাম/লোকেশন
+   বদলায়নি)।
+4. চূড়ান্ত টেস্ট কাউন্ট: **২৯০** (U-সিরিজ ২৭০+ + FA-A1…FA-E2-এর সব)।
+
 ## পরের কাজ
 
-**গ্রুপ F (ফুল রিগ্রেশন + ফাইনাল wrap-up)।** বিস্তারিত
-`docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-F1 ---` এবং `--- CHUNK FA-F2 ---`
-সেকশনে:
-- FA-F1: পুরো test suite-এর regression pass + `python3 -m py_compile`
-  touched ফাইলগুলোতে + `python3 -m pipeline.dry_run_check --job-id <id>`
-  একটা fixture job-এ + চূড়ান্ত টেস্ট কাউন্ট ডকুমেন্ট।
-- FA-F2: ফাইনাল wrap-up — `docs/FINAL_SUMMARY.md`-এ "## Full-Auto
-  Pipeline (FA1-F2)" সেকশন + ব্যবহারকারীর নিজের real-media QA নোট (তিনটা
-  point) + `manhwa-video-dubber-v6-full-auto-final` ট্যাগ।
+**FA-F2 (একদম শেষ চাংক — ফাইনাল wrap-up)।** বিস্তারিত
+`docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-F2 ---` সেকশনে:
+- `docs/FINAL_SUMMARY.md`-এ নতুন "## Full-Auto Pipeline (FA1-F2)" সেকশন
+  (সংক্ষিপ্ত সারাংশ + কোন ফাইলে কী যোগ হয়েছে + ব্যবহারকারীর নিজের
+  real-media QA নোট — ৩টা point, যা কোনো sandboxed AI agent করতে পারবে না)।
+- `docs/HANDOFF_NEXT.md`: "সব FA চাংক (A1-F2) সম্পূর্ণ।"
+- `docs/CHANGELOG.md`: চূড়ান্ত এন্ট্রি।
+- শেষে commit + push + tag: `manhwa-video-dubber-v6-full-auto-final`।
 
 পুরো data-flow/চলার নিয়ম: `docs/FINAL_SUMMARY.md`। চ্যাঞ্জলগ:
 `docs/CHANGELOG.md`।

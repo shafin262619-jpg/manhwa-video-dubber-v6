@@ -1,5 +1,20 @@
 # Manhwa Video Dubber — Changelog
 
+## [FA-F1] — 2026-08-13 — Full regression pass (Full-Auto Pipeline)
+
+Verification-only chunk: the entire suite (U0-U5 plus everything from FA-A1
+through FA-E2) passes with no regressions and no fixes required.
+
+- `python3 -m unittest discover -s pipeline/tests -v` — **290 tests, 100%
+  pass (OK)**. No regression, no bugfix needed, no new feature added.
+- `python3 -m py_compile` on the touched files — OK: `app.py`,
+  `pipeline/full_auto_chain.py`, `pipeline/voiceover_unify.py`.
+- `python3 -m pipeline.dry_run_check --job-id <fixture>` (U5 tool) on a job
+  carrying the new-flow artifacts (FA-D4/E1) — exit 0, "RESULT: OK — no
+  blocking errors". The tool is compatible with the new flow because artifact
+  names/locations did not change across the FA chunks.
+- Final test count documented: 290.
+
 ## [FA-E2] — 2026-08-13 — Permanent E2E regression tests for both full-auto paths (Full-Auto Pipeline)
 
 Adds two permanent end-to-end regression tests that lock in the PRD's core
