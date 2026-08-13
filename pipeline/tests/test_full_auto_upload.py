@@ -302,9 +302,10 @@ class AutoFullRenderWireTest(unittest.TestCase):
             "no manual voiceover-source click needed on auto_tts path",
         )
 
-    def test_user_upload_status_page_keeps_choose_link(self):
-        # FA-C2: the user_upload page must keep the old "choose voiceover
-        # source" continue link (proof nothing broke on that path).
+    def test_user_upload_status_page_shows_audio_form_directly(self):
+        # FA-C2/FA-D1: the user_upload page must show the audio-upload form
+        # straight away — the voice source was already chosen at upload time
+        # (FA-A1), so no separate "choose voiceover source" click is needed.
         res = self.client.post(
             "/upload",
             data={"voice_source": "user_upload"},
@@ -315,7 +316,12 @@ class AutoFullRenderWireTest(unittest.TestCase):
         self._wait_for_stage(job_id, "upload_pipeline")
 
         page = self.client.get(f"/upload/{job_id}").text
-        self.assertIn("choose voiceover source", page)
+        self.assertIn(
+            f'action="/voiceover/{job_id}/upload"', page,
+            "audio-upload form present directly",
+        )
+        self.assertIn("enctype=\"multipart/form-data\"", page)
+        self.assertNotIn("choose voiceover source", page)
         self.assertNotIn("<video", page)
 
 

@@ -14,43 +14,37 @@ FA-E1 → FA-E2 → FA-F1 → FA-F2। প্রতিটা চাংকের 
 `docs/FA_CHUNK_BATCH.md`। প্রতিটা চাংক শেষে `chunk-FA-<id>-done` ট্যাগ
 বসানো হবে।
 
-## স্ট্যাটাস: গ্রুপ C (Auto-TTS পাথ) সম্পূর্ণ
+## স্ট্যাটাস: FA-D1 সম্পূর্ণ
 
-**গ্রুপ C সম্পূর্ণ — auto_tts বেছে নিয়ে আপলোড করলে ইউজার আর কোনো ক্লিক
-ছাড়াই সরাসরি ফাইনাল ভিডিও দেখেন।** `chunk-FA-C2-done` ট্যাগ বসানো হয়েছে।
+**FA-D1 সম্পূর্ণ — user_upload পাথে upload শেষে সরাসরি অডিও-ফর্ম দেখানো
+হয়, আলাদা "choose" ক্লিক লাগে না।** `chunk-FA-D1-done` ট্যাগ বসানো
+হয়েছে।
 
 এই চাংকে যা হলো:
-- `upload_status_page(job_id)` এখন `get_voice_source(job_id)` দেখে:
-  - `auto_tts`: `auto_full_render`/`done` না হওয়া পর্যন্ত existing
-    `_polling_page(...)` (শুধু target stage `auto_full_render`); শেষ হলে
-    সরাসরি ফাইনাল ভিডিও প্লেয়ার + ডাউনলোড লিংক — `_render_final_result()`
-    reuse (এখন optional `result` dict নেয়; chain-এর
-    `auto_full_render.result.final` payload adapter হিসেবে পাঠানো হয়)।
-  - `user_upload` / None (legacy): অপরিবর্তিত — পুরনো "Continue: choose
-    voiceover source" আচরণ অক্ষত (গ্রুপ D পরে বদলাবে)।
-- `_polling_page()`-এর error branch এখন polled stage অনুপস্থিত থাকলে current
-  stage-এর detail দেখায় (যেমন auto_tts পোলিং পেজে early B1/B2/C1 fail-এ
-  "Unknown error."-এর বদলে আসল error)।
-- `/voiceover/{job_id}/choose` ও `/final/{job_id}` রুট ডিলিট করা হয়নি —
-  সরাসরি URL-এ গেলে এখনো কাজ করে (manual override/backward-compat, গ্রুপ
-  E-তে verify হবে)।
-- টেস্ট: +২টা HTTP টেস্ট — auto_tts-এ `GET /upload/{job_id}` শেষে `<video>`
-  + download লিংক আছে, "choose voiceover source" লিংক নেই; user_upload-এ
-  পুরনো লিংক আছে + `<video>` নেই। পুরো স্যুট এখন **২৮৩টা টেস্ট OK**
-  (২৮১ + ২)।
+- `upload_status_page()`-এর user_upload ব্রাঞ্চে "Continue: choose
+  voiceover source" লিংকের বদলে সরাসরি অডিও-আপলোড ফর্ম বসানো হয়েছে
+  (SRT/TXT রেফারেন্স লিংক + `<form action="/voiceover/{job_id}/upload">`),
+  `voiceover_choose()`-এর mode=="user_upload" markup থেকে reuse।
+- Hard constraint: `/voiceover/{job_id}/choose` রুট ডিলিট করা হয়নি
+  (URL দিয়ে সরাসরি গেলে এখনো কাজ করে); `/voiceover/{job_id}/upload` POST
+  handler স্পর্শ করা হয়নি (ওটা FA-D2)।
+- টেস্ট: FA-C2-এর user_upload page টেস্ট FA-D1 আচরণে আপডেট — অডিও ফর্ম
+  সরাসরি আছে (action + multipart), "choose voiceover source" লিংক নেই,
+  `<video>` নেই। পুরো স্যুট এখন **২৮৩টা টেস্ট OK** (সংখ্যা অপরিবর্তিত —
+  টেস্ট আপডেট, যোগ না)।
 
 ## পরের কাজ
 
-**গ্রুপ D (নিজের-অডিও পাথ, FA-D1 থেকে)।** বিস্তারিত
-`docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-D1 ---` সেকশনে:
-- `upload_status_page()`-এর user_upload ব্রাঞ্চে "Continue: choose
-  voiceover source" লিংকের বদলে সরাসরি অডিও-আপলোড ফর্ম বসানো
-  (`voiceover_choose()`-এর mode=="user_upload" HTML থেকে reuse: SRT/TXT
-  ডাউনলোড লিংক + `<form action="/voiceover/{job_id}/upload">`) — voice_source
-  তো FA-A1-তেই সেভ হয়ে গেছে, আলাদা ক্লিক লাগবে না।
-- Hard constraint: `/voiceover/{job_id}/choose` রুট ডিলিট করা যাবে না;
-  FA-D1-এ `/voiceover/{job_id}/upload` POST handler স্পর্শ করা যাবে না (ওটা
-  FA-D2)।
+**FA-D2 (অডিও POST-এর পর automatic zero-click ফাইনাল ভিডিও পর্যন্ত)।**
+বিস্তারিত `docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-D2 ---` সেকশনে:
+- `/voiceover/{job_id}/upload` POST handler-এ — অডিও সেভ হওয়ার পর (একই
+  থ্রেডে) `full_auto_chain.run_user_upload_chain(job_id)` চালিয়ে
+  `user_full_render` stage-এ running/done/error লিখতে হবে (error-এ
+  friendly message), যাতে ইউজার upload-এর পর আর কোনো ক্লিক ছাড়া ফাইনাল
+  ভিডিও পান; তারপর `/upload/{job_id}` পেজ সেই stage শেষে ফাইনাল ভিডিও
+  দেখাবে (FA-C2-এর auto_tts প্যাটার্ন)।
+- Hard constraint: app.py-তে user_upload-এর অডিও-আপলোড UI ব্রাঞ্চ ভাঙা
+  যাবে না।
 
 পুরো data-flow/চলার নিয়ম: `docs/FINAL_SUMMARY.md`। চ্যাঞ্জলগ:
 `docs/CHANGELOG.md`।

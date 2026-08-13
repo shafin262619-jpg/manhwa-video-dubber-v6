@@ -1,5 +1,23 @@
 # Manhwa Video Dubber — Changelog
 
+## [FA-D1] — 2026-08-13 — Post-upload page shows audio-upload form directly for user_upload (Full-Auto Pipeline)
+
+Removes the redundant "choose voiceover source" click on the user_upload path
+(the choice was already persisted at upload time, FA-A1).
+
+- `app.py` `upload_status_page()` — `user_upload` branch: the "Continue:
+  choose voiceover source" link is replaced by the audio-upload form directly
+  (SRT/TXT reference links + `<form action="/voiceover/{job_id}/upload">`),
+  reusing the markup from `voiceover_choose()`'s user_upload branch.
+- Hard constraint honored: `/voiceover/{job_id}/choose` route is NOT deleted
+  (manual override / backward-compat still works via direct URL); the
+  `/voiceover/{job_id}/upload` POST handler is untouched (that's FA-D2).
+- `pipeline/tests/test_full_auto_upload.py`: the FA-C2 user_upload page test
+  is updated to the FA-D1 behavior — `GET /upload/{job_id}` shows the audio
+  `<form>` directly (action + multipart), with NO "choose voiceover source"
+  link and no `<video>`.
+- Full suite: **283 tests OK** (unchanged count — test updated, not added).
+
 ## [FA-C2] — 2026-08-13 — Upload status page shows final video directly for auto_tts (Full-Auto Pipeline)
 
 Group C done: an auto_tts upload now ends on the final video page with zero

@@ -494,11 +494,23 @@ def upload_status_page(job_id: str) -> HTMLResponse:
         if extraction_status != "ok"
         else ""
     )
+    # FA-D1: voice_source is already known (FA-A1), so the user_upload path
+    # drops straight into the audio-upload form — no extra "choose" click.
     body = f"""
   <h1>Upload complete — job {job_id}</h1>
   <p>{serials if serials is not None else "?"} subtitle line(s) extracted and translated.</p>
   {warning}
-  <p><a href="/voiceover/{job_id}/choose">Continue: choose voiceover source →</a></p>
+  <h2>Upload your voiceover audio</h2>
+  <p>Voice source set to <strong>user_upload</strong> for this job.</p>
+  <p>Use these as reference while making your audio:
+    <a href="/download/{job_id}/subtitles?format=srt">SRT</a> |
+    <a href="/download/{job_id}/subtitles?format=txt">TXT</a>
+  </p>
+  <form method="post" action="/voiceover/{job_id}/upload" enctype="multipart/form-data">
+    <label for="audio">Audio file (mp3/wav/m4a)</label>
+    <input type="file" id="audio" name="audio" accept=".mp3,.wav,.m4a" required>
+    <button type="submit">Upload</button>
+  </form>
   <p><a href="/">Back to home</a></p>"""
     return HTMLResponse(ui.page("Upload Complete — Manhwa Video Dubber", body))
 
