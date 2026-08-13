@@ -1,5 +1,28 @@
 # Manhwa Video Dubber — Changelog
 
+## [FA-B1] — 2026-08-13 — run_auto_tts_chain() — D2 to F3 in one function (Full-Auto Pipeline)
+
+The F3 (final render) used to run only when the user manually visited
+`/final/{job_id}` (biggest gap in the old flow). This chunk introduces a
+pure-Python orchestration wrapper that runs the entire auto-TTS chain **F3
+included** in one place — HTTP wiring still comes later (group C).
+
+- `pipeline/full_auto_chain.py` (new): `run_auto_tts_chain(job_id,
+  call_budget=None)` runs D2 (`voiceover_auto.generate_auto_voiceover`) ->
+  D4 (`voiceover_unify.unify_voiceover_timestamps`) -> E1
+  (`edit_guideline.build_edit_guideline`) -> E2 (`auto_cut.build_draft_video`)
+  -> **F3 (`render_final.finalize_video`)** in sequence and returns
+  `{"voiceover": <D2 result>, "final": <F3 result>}` so the caller (group C)
+  can persist both in the job status. Failures propagate (no swallow).
+- Hard constraint honored: `app.py` untouched — `_process_auto_tts` /
+  `_continue_from_voiceover` unchanged (needed for backward-compat, FA-E1);
+  the new function is standalone and not called from any route yet.
+- `pipeline/tests/test_full_auto_chain.py` (new, 1 test): mocks Gemini TTS
+  with real ffmpeg silence placeholders + `auto_cut._run`, calls
+  `run_auto_tts_chain(job_id)` directly (no HTTP) and asserts
+  `outputs/<job_id>/final_video.mp4` is produced.
+- Full suite: **274 tests OK** (273 prior + 1).
+
 ## [FA-A1] — 2026-08-13 — Upfront voice-source input on /upload (Full-Auto Pipeline)
 
 The voice-source question (auto TTS vs own audio) is now taken on the upload

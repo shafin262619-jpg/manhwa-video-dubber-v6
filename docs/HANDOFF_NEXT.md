@@ -14,36 +14,34 @@ FA-E1 → FA-E2 → FA-F1 → FA-F2। প্রতিটা চাংকের 
 `docs/FA_CHUNK_BATCH.md`। প্রতিটা চাংক শেষে `chunk-FA-<id>-done` ট্যাগ
 বসানো হবে।
 
-## স্ট্যাটাস: FA-A1 সম্পূর্ণ
+## স্ট্যাটাস: FA-B1 সম্পূর্ণ
 
-**FA-A1 (upfront voice-source input) সম্পূর্ণ।** `chunk-FA-A1-done` ট্যাগ
-বসানো হয়েছে।
+**FA-B1 (auto_tts orchestration wrapper, F3 সহ) সম্পূর্ণ, standalone, এখনো
+app.py-তে wire হয়নি।** `chunk-FA-B1-done` ট্যাগ বসানো হয়েছে।
 
 এই চাংকে যা হলো:
-- `home()` upload ফর্মে radio-group যোগ: `voice_source="auto_tts"` (ডিফল্ট
-  checked) / `"user_upload"` — FormData-তে ফিল্ড স্বয়ংক্রিয়ভাবে যায়।
-- `upload_video()` নতুন optional param `voice_source: str = Form("auto_tts")`
-  নেয়; `ALLOWED_MODES`-এর বাইরে হলে 400; valid হলে upload সফল হওয়ার সাথে
-  সাথেই (B1→B2→C1 background thread শুরুর আগে)
-  `voiceover_unify.set_voice_source(job_id, voice_source)` দিয়ে
-  `voice_source_choice.json`-এ সেভ হয়।
-- Hard constraint মেনে চলা: `_run_upload_pipeline`, `voiceover_choose`,
-  `/voiceover/{job_id}/choose` — সবের আচরণ অপরিবর্তিত (backward-compat,
-  FA-E1-এ ভেরিফাই হবে)।
-- টেস্ট: `pipeline/tests/test_full_auto_upload.py` (৩টা নতুন) — user_upload
-  immediate persist, default auto_tts, invalid → 400। পুরো স্যুট এখন
-  **২৭৩টা টেস্ট OK** (আগের ২৭০ + ৩)।
+- নতুন ফাইল `pipeline/full_auto_chain.py`-এ `run_auto_tts_chain(job_id,
+  call_budget=None)` ফাংশন — D2 (`voiceover_auto.generate_auto_voiceover`)
+  → D4 (`voiceover_unify.unify_voiceover_timestamps`) → E1
+  (`edit_guideline.build_edit_guideline`) → E2 (`auto_cut.build_draft_video`)
+  → **F3 (`render_final.finalize_video`)** — এক ফাংশনে, রিটার্ন
+  `{"voiceover": <D2 result>, "final": <F3 result>}`।
+- Hard constraint: app.py স্পর্শ করা হয়নি — `_process_auto_tts` /
+  `_continue_from_voiceover` অপরিবর্তিত (backward-compat, FA-E1-এ ভেরিফাই
+  হবে)। নতুন ফাংশন এখনো কোনো route-এ কল হয়নি।
+- টেস্ট: `pipeline/tests/test_full_auto_chain.py` — Gemini TTS + ffmpeg mock
+  করে সরাসরি কল, `outputs/<job_id>/final_video.mp4` তৈরি হয় যাচাই করা।
+  পুরো স্যুট এখন **২৭৪টা টেস্ট OK** (২৭৩ + ১)।
 
 ## পরের কাজ
 
-**FA-B1 (auto_tts orchestration wrapper, পুরো D2→D4→E1→E2→F3 চেইন এক
-ফাংশনে, এখনো routes-এ wire না)।** বিস্তারিত `docs/FA_CHUNK_BATCH.md`-এর
-`--- CHUNK FA-B1 ---` সেকশনে। নতুন ফাইল
-`pipeline/full_auto_chain.py`-তে `run_auto_tts_chain(job_id,
-call_budget=None)` ফাংশন বানাতে হবে, যা voiceover_auto →
-voiceover_unify → edit_guideline → auto_cut → render_final (F3 সহ) এক
-সাথে চালায়; app.py স্পর্শ করা যাবে না; টেস্ট + commit + push +
-`chunk-FA-B1-done` ট্যাগ।
+**FA-B2 (user_upload-এর জন্য একই প্যাটার্নের wrapper)।** বিস্তারিত
+`docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-B2 ---` সেকশনে।
+`pipeline/full_auto_chain.py`-তে `run_user_upload_chain(job_id)` যোগ করতে
+হবে — D3 (`voiceover_upload.align_uploaded_voiceover`) → D4 → E1 → E2 → F3,
+রিটার্ন `{"alignment": <D3 result>, "final": <F3 result>}`; অডিও সেভ এই
+ফাংশনের কাজ না (গ্রুপ D-তে wire হবে); app.py স্পর্শ করা যাবে না; টেস্ট +
+commit + push + `chunk-FA-B2-done` ট্যাগ।
 
 পুরো data-flow/চলার নিয়ম: `docs/FINAL_SUMMARY.md`। চ্যাঞ্জলগ:
 `docs/CHANGELOG.md`।
