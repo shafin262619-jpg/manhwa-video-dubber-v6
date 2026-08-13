@@ -8,18 +8,19 @@ https://github.com/shafin262619-jpg/manhwa-video-dubber — অক্ষত র�
 (`manhwa-video-dubber-v6-robustness-final` ইত্যাদি) এখানে প্রিজার্ভ
 করা আছে।
 
-বর্তমানে কাজ চলছে **Full-Auto Pipeline** প্ল্যানে — ধারাবাহিক চাংক
-FA-A1 → FA-B1 → FA-B2 → FA-B3 → FA-C1 → FA-C2 → FA-D1 → FA-D2 →
+এই রিপোতে **Full-Auto Pipeline** প্ল্যান সম্পূর্ণ হয়েছে — ধারাবাহিক ১২টা
+চাংক FA-A1 → FA-B1 → FA-B2 → FA-B3 → FA-C1 → FA-C2 → FA-D1 → FA-D2 →
 FA-E1 → FA-E2 → FA-F1 → FA-F2। প্রতিটা চাংকের বিস্তারিত প্রম্পট:
 `docs/FA_CHUNK_BATCH.md`। প্রতিটা চাংক শেষে `chunk-FA-<id>-done` ট্যাগ
 বসানো হয়েছে।
 
-## স্ট্যাটাস: গ্রুপ E সম্পূর্ণ — FA-E1 (ব্যাকওয়ার্ড-কম্প্যাট অডিট + ফিক্স) ও FA-E2 (permanent E2E টেস্ট)
+## স্ট্যাটাস: সব FA চাংক সম্পূর্ণ (A1-F2) — পুরো Full-Auto Pipeline বাস্তবায়িত
 
-**`chunk-FA-E1-done` ও `chunk-FA-E2-done` ট্যাগ বসানো হয়েছে।** গত সেশন
-FA-D2-এর ঠিক পরে থেমেছিল (FA-E1-এর মাঝখানে, docs আপডেটের সময়) — এই
-সেশনে tag history থেকে নিশ্চিত হয়ে FA-E1 শুরু থেকে সম্পূর্ণ করেছি, তারপর
-FA-E2-ও। পুরো স্যুট এখন **২৯০টা টেস্ট OK**।
+**সব চাংক-ট্যাগ (`chunk-FA-*`) বসানো হয়েছে, শেষে
+`manhwa-video-dubber-v6-full-auto-final`।** গত সেশন FA-D2-এর ঠিক পরে
+থেমেছিল (FA-E1-এর মাঝখানে, docs আপডেটের সময়) — এই সেশনে tag history থেকে
+নিশ্চিত হয়ে FA-E1 শুরু থেকে সম্পূর্ণ করেছি, তারপর FA-E2 → FA-F1 → FA-F2
+একে একে শেষ করেছি। পুরো স্যুট এখন **২৯০টা টেস্ট OK**।
 
 ### FA-E1 (ব্যাকওয়ার্ড-কম্প্যাট অডিট) — checklist ফলাফল
 
@@ -78,33 +79,29 @@ HTTP-only, mocked Gemini/ffmpeg, D2 real-ffmpeg-silence প্যাটার্
 - Hard constraint মেনে চলা হয়েছে: পুরনো `test_app_orchestration.py` এক
   লাইনও বদলায়নি, এখনো আলাদাভাবে পাশ করে (ব্যাকওয়ার্ড-কম্প্যাট প্রমাণ)।
 
-## স্ট্যাটাস: FA-F1 সম্পূর্ণ — ফুল রিগ্রেশন পাস (কোনো fix লাগেনি)
+## স্ট্যাটাস: সব FA চাংক (A1-F2) সম্পূর্ণ — PRD-এর মূল requirement বাস্তবায়িত ও রিগ্রেশন-টেস্টেড
 
-**`chunk-FA-F1-done` ট্যাগ বসানো হয়েছে।**
+**`manhwa-video-dubber-v6-full-auto-final` ট্যাগ বসানো হয়েছে।**
 
-FA-F1 verification ফলাফল:
-1. **পুরো test suite** (`python3 -m unittest discover -s pipeline/tests -v`,
-   U0-U5 + FA-A1 থেকে FA-E2 সবকিছু মিলিয়ে) — **২৯০টা টেস্ট, ১০০% পাস**
-   (OK), কোনো regression নেই, কোনো fix প্রয়োজন হয়নি (নতুন ফিচারও যোগ
-   হয়নি — শুধু verification)।
-2. **py_compile** touched ফাইলগুলোতে — OK: `app.py`,
-   `pipeline/full_auto_chain.py`, `pipeline/voiceover_unify.py`।
-3. **dry_run_check (U5)** একটা fixture job-এ (`--job-id audit-fixture`,
-   FA-D4/E1 আর্টিফ্যাক্টসহ) — exit 0, "RESULT: OK — no blocking errors";
-   নতুন flow-এর আউটপুট ফাইলের সাথে compatible (আর্টিফ্যাক্ট নাম/লোকেশন
-   বদলায়নি)।
-4. চূড়ান্ত টেস্ট কাউন্ট: **২৯০** (U-সিরিজ ২৭০+ + FA-A1…FA-E2-এর সব)।
+সব ১২টা Full-Auto Pipeline চাংক (FA-A1 → FA-B1 → FA-B2 → FA-B3 → FA-C1 →
+FA-C2 → FA-D1 → FA-D2 → FA-E1 → FA-E2 → FA-F1 → FA-F2) সম্পূর্ণ, commit +
+push + tag করা হয়েছে। চূড়ান্ত টেস্ট: **২৯০টা, ১০০% পাস**।
 
-## পরের কাজ
+PRD-এর মূল requirement বাস্তবায়িত:
+- **auto_tts পাথ** — upload করলে zero-click ফাইনাল ভিডিও পর্যন্ত চলে।
+- **user_upload পাথ** — শুধু অডিও-আপলোডেই থামে, তারপর zero-click ফাইনাল
+  ভিডিও পর্যন্ত।
+- পুরনো ম্যানুয়াল রুটগুলো অক্ষত (FA-E1 অডিটে যাচাই)।
 
-**FA-F2 (একদম শেষ চাংক — ফাইনাল wrap-up)।** বিস্তারিত
-`docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-F2 ---` সেকশনে:
-- `docs/FINAL_SUMMARY.md`-এ নতুন "## Full-Auto Pipeline (FA1-F2)" সেকশন
-  (সংক্ষিপ্ত সারাংশ + কোন ফাইলে কী যোগ হয়েছে + ব্যবহারকারীর নিজের
-  real-media QA নোট — ৩টা point, যা কোনো sandboxed AI agent করতে পারবে না)।
-- `docs/HANDOFF_NEXT.md`: "সব FA চাংক (A1-F2) সম্পূর্ণ।"
-- `docs/CHANGELOG.md`: চূড়ান্ত এন্ট্রি।
-- শেষে commit + push + tag: `manhwa-video-dubber-v6-full-auto-final`।
+বিস্তারিত: `docs/FA_CHUNK_BATCH.md`, `docs/FINAL_SUMMARY.md`-এর নতুন
+"## Full-Auto Pipeline (FA1-F2)" সেকশন, `docs/CHANGELOG.md`।
 
-পুরো data-flow/চলার নিয়ম: `docs/FINAL_SUMMARY.md`। চ্যাঞ্জলগ:
-`docs/CHANGELOG.md`।
+**বাকি শুধু ব্যবহারকারীর নিজের real-media QA রান** — `docs/FINAL_SUMMARY.md`-এর
+"Full-Auto Pipeline (FA1-F2)" সেকশনের নোট অনুযায়ী তিনটা point:
+(ক) real Gemini key + real ভিডিও দিয়ে auto_tts পাথে সত্যিই কোনো ক্লিক ছাড়াই
+ফাইনাল ভিডিও আসে কিনা browser-এ নিজের চোখে যাচাই;
+(খ) user_upload পাথে সত্যিই শুধু অডিও-আপলোডেই থামে, এরপর আর কোনো ক্লিক লাগে
+না কিনা যাচাই;
+(গ) ফাইনাল ভিডিওর কোয়ালিটি U-সিরিজের আগের আউটপুটের মতোই আছে (এই আপডেট
+UX/wiring বদলেছে, pipeline-এর আউটপুট কোয়ালিটি বদলায়নি) — স্পট-চেক করে
+কনফার্ম।

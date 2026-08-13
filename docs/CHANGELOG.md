@@ -1,5 +1,24 @@
 # Manhwa Video Dubber — Changelog
 
+## [FA-F2] — 2026-08-13 — Final wrap-up: Full-Auto Pipeline complete (Full-Auto Pipeline)
+
+The final Full-Auto chunk — all 12 chunks (FA-A1 … FA-F2) are done,
+committed, pushed and tagged (`chunk-FA-<id>-done`, plus the final
+`manhwa-video-dubber-v6-full-auto-final`).
+
+- `docs/FINAL_SUMMARY.md`: added the "## Full-Auto Pipeline (FA1-F2)" section
+  (not a replacement) — the zero-click / single-pause summary, what was added
+  and where (`pipeline/full_auto_chain.py` new; `app.py` stage names
+  `auto_full_render` / `user_audio_pipeline`), and the clear note that the
+  real-media QA can only be done by the user: (a) real-Gemini zero-click
+  auto_tts run, (b) real single-pause user_upload run, (c) output-quality
+  spot-check against the pre-FA U-series output.
+- `docs/HANDOFF_NEXT.md`: "all FA chunks (A1-F2) complete — the PRD's core
+  requirement (upload → zero-click final video, and stop only at the audio
+  upload when the user supplies their own audio) is implemented and
+  regression-tested; only the user's own real-media QA run remains."
+- Final state: **290 tests, 100% pass**.
+
 ## [FA-F1] — 2026-08-13 — Full regression pass (Full-Auto Pipeline)
 
 Verification-only chunk: the entire suite (U0-U5 plus everything from FA-A1

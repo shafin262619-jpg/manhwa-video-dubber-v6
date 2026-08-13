@@ -209,6 +209,81 @@ invalid/overlapping duration — রেন্ডারের আগে ফিক
 
 ---
 
+## Full-Auto Pipeline (FA1-F2)
+
+### Short summary
+
+The Full-Auto update removes the manual clicks from the PRD's core flow.
+Uploading a video now needs no further interaction:
+
+- **`auto_tts` choice** (the default) — after upload the job runs the whole
+  backend chain **zero-click** straight to the final video
+  (B1→B2→C1 → D2→D4→E1→E2→F3). The user watches the status page and gets the
+  final video player + download link.
+- **`user_upload` choice** — the job stops at **exactly one** pause: the audio
+  upload. The upload page drops straight into the audio form (no separate
+  "choose voice source" click — the choice is taken on the upload form since
+  FA-A1). After the audio is posted, it auto-continues zero-click to the final
+  video (D3→D4→E1→E2→F3).
+
+The old manual routes (`/voiceover/{job_id}/choose`,
+`/voiceover/{job_id}/upload`, `/voiceover/{job_id}/align_uploaded`,
+`/voiceover/{job_id}/auto_tts`, `/review/{job_id}`, `/final/{job_id}`) are all
+kept and still work by direct URL (backward-compat; verified by the FA-E1
+audit), so the pre-FA manual flow remains available as an override.
+
+### What was added, and where
+
+- `pipeline/full_auto_chain.py` — **new**. Two pure-Python orchestration
+  wrappers:
+  - `run_auto_tts_chain(job_id, call_budget=None)` — D2→D4→E1→E2→F3 for the
+    `auto_tts` path.
+  - `run_user_upload_chain(job_id)` — D3→D4→E1→E2→F3 for the `user_upload`
+    path (precondition: `voiceover_hi.wav` already saved).
+  Both raise on failure (no silent swallow); mid-chain failure stops the
+  following steps.
+- `app.py` — new status **stage names** `auto_full_render` and
+  `user_audio_pipeline` (persisted in `uploads/<job_id>/job_status.json` and
+  polled via `GET /api/jobs/{job_id}/status`):
+  - `_run_upload_pipeline()` (FA-C1): after `upload_pipeline`/`done`, an
+    `auto_tts` job continues on the **same** thread through
+    `run_auto_tts_chain` (the inline logic is factored into
+    `_run_auto_full_render()`, which the `/upload` page also re-uses to resume
+    a chain that never started after a manual override — FA-E1 fix).
+  - `upload_voiceover()` (FA-D2): after the audio is saved, starts a daemon
+    thread (`_start_stage(..., "user_audio_pipeline", _run_user_audio_pipeline)`)
+    that runs `run_user_upload_chain` to the final video.
+  - `upload_status_page()` (FA-C2/D1/D2/E1): renders the final video directly
+    when `auto_full_render`/`user_audio_pipeline` is `done`, shows the audio
+    form for `user_upload`, and is gated on stage-history so manual overrides
+    never cause a redirect loop.
+- `app.py` home page (FA-A1): the upload form takes the `voice_source` choice
+  upfront (`auto_tts` default), persisted the moment the upload succeeds.
+- Tests: `pipeline/tests/test_full_auto_chain.py` (FA-B1/B2/B3), plus
+  `test_full_auto_upload.py`, `test_backward_compat_audit.py` (FA-E1) and
+  `test_full_auto_orchestration.py` (FA-E2) — permanent HTTP regression tests
+  for both paths.
+
+### These steps a sandboxed AI agent CANNOT do — the user must do them
+
+The automated suite (290 tests) proves the *wiring* end-to-end with mocked
+Gemini and synthetic media. The real-media confirmation below requires a real
+Gemini key, a real video, and human eyes/ears — it is intentionally not part
+of any sandboxed-agent run:
+
+(a) **auto_tts zero-click on real media** — with a real Gemini key and a real
+    video, upload with `auto_tts` and confirm in the browser that the final
+    video appears with **no extra clicks** (no `/choose`, `/align_uploaded` or
+    `/final` navigation).
+(b) **user_upload single-pause on real media** — upload with `user_upload`,
+    confirm the page stops at **only the audio upload**, then after posting
+    the audio confirm the final video appears with no further clicks.
+(c) **Output-quality spot-check** — confirm the final video's quality is the
+    same as the pre-FA U-series output (this update changed the UX/wiring
+    only; the pipeline's output quality is unchanged).
+
+---
+
 ## 6. How to run
 
 ```bash
