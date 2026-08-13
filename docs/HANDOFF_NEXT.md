@@ -14,38 +14,43 @@ FA-E1 → FA-E2 → FA-F1 → FA-F2। প্রতিটা চাংকের 
 `docs/FA_CHUNK_BATCH.md`। প্রতিটা চাংক শেষে `chunk-FA-<id>-done` ট্যাগ
 বসানো হবে।
 
-## স্ট্যাটাস: FA-C1 সম্পূর্ণ (auto_tts পাথ এখন end-to-end wired)
+## স্ট্যাটাস: গ্রুপ C (Auto-TTS পাথ) সম্পূর্ণ
 
-**গ্রুপ C-এর সবচেয়ে ঝুঁকিপূর্ণ চাংক (existing background-thread wiring
-বদলানো) সম্পূর্ণ ও fully tested।** `chunk-FA-C1-done` ট্যাগ বসানো হয়েছে।
+**গ্রুপ C সম্পূর্ণ — auto_tts বেছে নিয়ে আপলোড করলে ইউজার আর কোনো ক্লিক
+ছাড়াই সরাসরি ফাইনাল ভিডিও দেখেন।** `chunk-FA-C2-done` ট্যাগ বসানো হয়েছে।
 
 এই চাংকে যা হলো:
-- `app.py`-এর `_run_upload_pipeline(job_id)` — পুরনো B1→B2→C1 চেইন শেষে
-  `upload_pipeline`/`done` লেখার পরে, `voice_source == "auto_tts"` হলে **একই
-  থ্রেডেই** (নতুন থ্রেড নয়) `auto_full_render`/`running` →
-  `full_auto_chain.run_auto_tts_chain(job_id, call_budget)` →
-  `auto_full_render`/`done` (result attached) চলে; ব্যর্থ হলে
-  FileNotFoundError / ValueError / RuntimeError / `auto_cut.DraftValidationError`
-  → `auto_full_render`/`error` (friendly message), এবং শেষের `except Exception`
-  দিয়ে নিশ্চিত করা হয়েছে daemon thread কখনো uncaught exception-এ মরে না যায়।
-- `user_upload` পাথ (ও কোনো choice ছাড়া পুরনো job) স্পর্শ করা হয়নি —
-  এখনো `upload_pipeline`/`done`-এই থামে; গ্রুপ D সেটা wire করবে।
-- টেস্ট: `AutoFullRenderWireTest` (২টা HTTP TestClient টেস্ট) — auto_tts →
-  শুধু `/api/jobs/{id}/status` পোল করে `auto_full_render` done +
-  `outputs/<job_id>/final_video.mp4` তৈরি যাচাই; user_upload →
-  `upload_pipeline`/`done`-এই থামা + কোনো `auto_full_render` stage নেই +
-  final_video নেই। পুরো স্যুট এখন **২৮১টা টেস্ট OK** (২৭৯ + ২)।
+- `upload_status_page(job_id)` এখন `get_voice_source(job_id)` দেখে:
+  - `auto_tts`: `auto_full_render`/`done` না হওয়া পর্যন্ত existing
+    `_polling_page(...)` (শুধু target stage `auto_full_render`); শেষ হলে
+    সরাসরি ফাইনাল ভিডিও প্লেয়ার + ডাউনলোড লিংক — `_render_final_result()`
+    reuse (এখন optional `result` dict নেয়; chain-এর
+    `auto_full_render.result.final` payload adapter হিসেবে পাঠানো হয়)।
+  - `user_upload` / None (legacy): অপরিবর্তিত — পুরনো "Continue: choose
+    voiceover source" আচরণ অক্ষত (গ্রুপ D পরে বদলাবে)।
+- `_polling_page()`-এর error branch এখন polled stage অনুপস্থিত থাকলে current
+  stage-এর detail দেখায় (যেমন auto_tts পোলিং পেজে early B1/B2/C1 fail-এ
+  "Unknown error."-এর বদলে আসল error)।
+- `/voiceover/{job_id}/choose` ও `/final/{job_id}` রুট ডিলিট করা হয়নি —
+  সরাসরি URL-এ গেলে এখনো কাজ করে (manual override/backward-compat, গ্রুপ
+  E-তে verify হবে)।
+- টেস্ট: +২টা HTTP টেস্ট — auto_tts-এ `GET /upload/{job_id}` শেষে `<video>`
+  + download লিংক আছে, "choose voiceover source" লিংক নেই; user_upload-এ
+  পুরনো লিংক আছে + `<video>` নেই। পুরো স্যুট এখন **২৮৩টা টেস্ট OK**
+  (২৮১ + ২)।
 
 ## পরের কাজ
 
-**FA-C2 (auto_tts-এর upload status/polling পেজ পোলিশ)।** বিস্তারিত
-`docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-C2 ---` সেকশনে। FA-C1-এ
-`auto_full_render` stage এর data সঠিকভাবে লেখা হচ্ছে; FA-C2-এ:
-- `/upload/{job_id}/status` পেজ (polling page) চালু অবস্থায়
-  `auto_full_render` stage দেখাতে হবে; `done` হলে
-  `/job/{job_id}/result`-এ যাওয়ার নির্দেশ; `error` হলে friendly message।
-- টেস্ট: user_upload-এ কোনো `auto_full_render` UI না দেখানো,
-  auto_tts-এ `done`/`error` UI সঠিকভাবে দেখানো যাচাই।
+**গ্রুপ D (নিজের-অডিও পাথ, FA-D1 থেকে)।** বিস্তারিত
+`docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-D1 ---` সেকশনে:
+- `upload_status_page()`-এর user_upload ব্রাঞ্চে "Continue: choose
+  voiceover source" লিংকের বদলে সরাসরি অডিও-আপলোড ফর্ম বসানো
+  (`voiceover_choose()`-এর mode=="user_upload" HTML থেকে reuse: SRT/TXT
+  ডাউনলোড লিংক + `<form action="/voiceover/{job_id}/upload">`) — voice_source
+  তো FA-A1-তেই সেভ হয়ে গেছে, আলাদা ক্লিক লাগবে না।
+- Hard constraint: `/voiceover/{job_id}/choose` রুট ডিলিট করা যাবে না;
+  FA-D1-এ `/voiceover/{job_id}/upload` POST handler স্পর্শ করা যাবে না (ওটা
+  FA-D2)।
 
 পুরো data-flow/চলার নিয়ম: `docs/FINAL_SUMMARY.md`। চ্যাঞ্জলগ:
 `docs/CHANGELOG.md`।

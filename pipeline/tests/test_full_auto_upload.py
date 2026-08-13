@@ -282,6 +282,42 @@ class AutoFullRenderWireTest(unittest.TestCase):
             "user_upload path stops at upload_pipeline done",
         )
 
+    def test_auto_tts_status_page_shows_final_video_no_choose_link(self):
+        # FA-C2: GET /upload/{job_id} must eventually show the final video
+        # player + download link directly (no "choose voiceover source" link).
+        res = self.client.post(
+            "/upload",
+            data={"voice_source": "auto_tts"},
+            files={"file": ("sample.mp4", self.video_bytes, "video/mp4")},
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        job_id = res.json()["job_id"]
+        self._wait_for_stage(job_id, "auto_full_render")
+
+        page = self.client.get(f"/upload/{job_id}").text
+        self.assertIn("<video", page, "final video player present")
+        self.assertIn(f'href="/download/{job_id}"', page, "download link present")
+        self.assertNotIn(
+            "choose voiceover source", page,
+            "no manual voiceover-source click needed on auto_tts path",
+        )
+
+    def test_user_upload_status_page_keeps_choose_link(self):
+        # FA-C2: the user_upload page must keep the old "choose voiceover
+        # source" continue link (proof nothing broke on that path).
+        res = self.client.post(
+            "/upload",
+            data={"voice_source": "user_upload"},
+            files={"file": ("sample.mp4", self.video_bytes, "video/mp4")},
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        job_id = res.json()["job_id"]
+        self._wait_for_stage(job_id, "upload_pipeline")
+
+        page = self.client.get(f"/upload/{job_id}").text
+        self.assertIn("choose voiceover source", page)
+        self.assertNotIn("<video", page)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -354,7 +354,8 @@ def _polling_page(job_id, page_title, result_url, stage):
             document.getElementById('job-processing').hidden = true;
             var el = document.getElementById('job-error');
             el.hidden = false;
-            var stageInfo = (status.stages || {{}})[STAGE];
+            var stageInfo = (status.stages || {{}})[STAGE]
+              || (status.stages || {{}})[status.stage];
             var detail = stageInfo && stageInfo.detail
               ? stageInfo.detail : 'Unknown error.';
             var heading = document.createElement('p');
@@ -451,6 +452,31 @@ def upload_status_page(job_id: str) -> HTMLResponse:
     status = job_status_store.read_status(job_id)
     if status.get("stage") == "unknown":
         raise HTTPException(status_code=404, detail=f"unknown job {job_id}")
+
+    voice_source = voiceover_unify.get_voice_source(job_id)
+    if voice_source == "auto_tts":
+        # FA-C2: for the auto_tts path the upload thread continues (FA-C1)
+        # straight into the full-auto chain, so this page stays on the
+        # polling page until the auto_full_render stage is done and then shows
+        # the final video player + download link directly — no extra click.
+        if not (
+            status.get("stage") == "auto_full_render"
+            and status.get("state") == "done"
+        ):
+            return _polling_page(
+                job_id, "Uploading & Extracting", f"/upload/{job_id}",
+                "auto_full_render",
+            )
+        chain_result = (
+            status.get("stages", {}).get("auto_full_render", {}) or {}
+        ).get("result") or {}
+        final_result = (
+            chain_result.get("final")
+            if isinstance(chain_result, dict)
+            else None
+        )
+        return _render_final_result(job_id, result=final_result)
+
     if not (status.get("stage") == "upload_pipeline" and status.get("state") == "done"):
         return _polling_page(
             job_id, "Uploading & Extracting", f"/upload/{job_id}", "upload_pipeline"
@@ -957,11 +983,12 @@ def final_page(job_id: str) -> HTMLResponse:
     return _render_final_result(job_id)
 
 
-def _render_final_result(job_id: str) -> HTMLResponse:
-    stage = job_status_store.read_status(job_id).get("stages", {}).get(
-        "final_render"
-    )
-    result = (stage or {}).get("result")
+def _render_final_result(job_id: str, result=None) -> HTMLResponse:
+    if not isinstance(result, dict):
+        stage = job_status_store.read_status(job_id).get("stages", {}).get(
+            "final_render"
+        )
+        result = (stage or {}).get("result")
     if not isinstance(result, dict):
         result = render_final.finalize_video(job_id)
 

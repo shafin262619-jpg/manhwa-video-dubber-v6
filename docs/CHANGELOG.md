@@ -1,5 +1,32 @@
 # Manhwa Video Dubber — Changelog
 
+## [FA-C2] — 2026-08-13 — Upload status page shows final video directly for auto_tts (Full-Auto Pipeline)
+
+Group C done: an auto_tts upload now ends on the final video page with zero
+clicks.
+
+- `app.py` `upload_status_page()`: branches on
+  `voiceover_unify.get_voice_source(job_id)` —
+  - `auto_tts`: stays on the existing `_polling_page(...)` (only the target
+    stage changes to `auto_full_render`), then once that stage is `done`
+    renders the final video player + download link directly. Reuses
+    `_render_final_result()` (which now accepts an optional `result` dict —
+    the chain's `auto_full_render.result.final` payload is passed in as a
+    small adapter).
+  - `user_upload` / `None` (legacy): untouched — the old "Continue: choose
+    voiceover source" behavior stays intact (group D replaces it later).
+- `_polling_page()`: its error branch now falls back to the *current* stage's
+  detail when the polled stage is missing (e.g. an early B1/B2/C1 failure on
+  the auto_tts polling page shows the real error instead of "Unknown error.").
+- `/voiceover/{job_id}/choose` and `/final/{job_id}` routes are NOT deleted —
+  direct URL access still works (manual override / backward-compat; verified
+  in group E).
+- `pipeline/tests/test_full_auto_upload.py`: +2 HTTP tests —
+  auto_tts `GET /upload/{job_id}` eventually contains `<video>` + download
+  link and NO "choose voiceover source" link; user_upload keeps the old
+  continue link and no `<video>`.
+- Full suite: **283 tests OK** (281 prior + 2).
+
 ## [FA-C1] — 2026-08-13 — Wire auto_tts path end-to-end in app.py (Full-Auto Pipeline)
 
 Group C's first (riskiest) chunk: the existing upload thread now *continues*
