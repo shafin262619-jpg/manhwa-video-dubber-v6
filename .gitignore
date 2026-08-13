@@ -1,0 +1,33 @@
+# Environments
+.env
+.env.*
+!.env.example
+
+# Secrets - never commit real keys
+gemini_keys_store.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Uploads / processing artifacts
+uploads/
+output/
+outputs/
+tmp/
+*.mp4
+*.mkv
+*.mov

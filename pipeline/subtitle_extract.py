@@ -1,0 +1,457 @@
+"""Chinese subtitle extraction via Gemini video understanding.
+
+For each job, videos shorter than ``LONG_VIDEO_CHUNK_THRESHOLD_SEC`` are sent to
+Gemini in one shot. Longer videos are split into overlapping segments (see
+``SUBTITLE_OVERLAP_SEC``), each segment is sent separately with its absolute
+start offset added back to the timestamps, then overlap duplicates are
+de-duplicated into one continuous list.
+
+Resilience rules:
+
+- Gemini keys are taken from ``key_store.get_active_keys()`` and rotated
+  round-robin via :func:`call_with_rotation`, a thin wrapper over
+  ``gemini_rotation.call_with_rotation_v2``. Transient / unknown errors are
+  classified ``rotatable`` and rotate to the next key; content-safety blocks
+  are ``non_rotatable`` and stop immediately. A whole job run can share one
+  ``gemini_rotation.CallBudget`` (see ``config.MAX_API_CALLS_PER_JOB``).
+- Content-blocked responses (``prompt_feedback.block_reason`` /
+  ``FinishReason.SAFETY``) are key-independent: they are logged distinctly as
+  ``content_blocked`` and never retried or rotated.
+- If every key fails for a segment (or the response is malformed JSON), that
+  segment is flagged in ``failed_segments`` with the last exception message
+  recorded under ``errors``, logged, and processing continues.
+- ``extract_subtitles`` never raises on Gemini/parse failures. It returns a
+  result with status ``ok`` / ``partial`` / ``extraction_failed`` and writes
+  ``uploads/<job_id>/subtitles_zh_raw.json``.
+"""
+
+import json
+import logging
+import re
+import subprocess
+from pathlib import Path
+
+from google import genai
+from google.genai import types as genai_types
+
+from pipeline import config, job_logging, key_store, video_ingest
+from pipeline.gemini_rotation import (
+    AllKeysExhausted,
+    CallBudgetExceeded,
+    call_with_rotation_v2,
+)
+
+logger = logging.getLogger(__name__)
+
+SUBTITLE_EXTRACT_PROMPT = (
+    "Extract every subtitle and on-screen text shown in this video, verbatim "
+    "and in chronological order, with each one's accurate start and end "
+    "seconds. Respond with ONLY JSON, no commentary, in this exact structure: "
+    '{"subtitles": [{"text": "...", "start_sec": 0.0, "end_sec": 3.2}]}'
+)
+
+# ``FinishReason`` values that mean the request was blocked by safety/content
+# policy rather than failing transiently (Task 5).
+_CONTENT_BLOCK_FINISH_REASONS = (
+    "SAFETY",
+    "BLOCKLIST",
+    "PROHIBITED_CONTENT",
+    "IMAGE_SAFETY",
+    "IMAGE_PROHIBITED_CONTENT",
+    "RECITATION",
+)
+
+# Per-process cache of uploaded video files so a rate-limit retry reuses the
+# already-uploaded file instead of re-uploading it (Task 3). Keyed by
+# (api_key, path, size, mtime_ns): a file re-uploaded for a new job is a new
+# signature, and one key never references another key's upload.
+_UPLOAD_CACHE = {}
+
+
+class ContentBlockedError(RuntimeError):
+    """Raised when Gemini returns a content-blocked response.
+
+    Carries the blocking reason (e.g. ``SAFETY`` / ``BLOCKLIST``) so the
+    retry/rotation logic can treat it as key-independent: no retry, no rotate.
+    """
+
+    def __init__(self, reason, message=None):
+        self.reason = reason
+        self.message = message
+        detail = f" ({message})" if message else ""
+        super().__init__(f"content blocked ({reason}){detail}")
+
+
+def _block_reason_from_response(response):
+    """Extract ``prompt_feedback.block_reason`` as a dict or None."""
+    try:
+        feedback = response.prompt_feedback
+    except Exception:  # noqa: BLE001 - attribute may not exist on fakes
+        feedback = None
+    if feedback is None:
+        return None
+    reason = getattr(feedback, "block_reason", None)
+    if reason is None:
+        return None
+    name = getattr(reason, "name", None) or str(reason)
+    message = getattr(feedback, "block_reason_message", None)
+    return {"reason": name, "message": message or None}
+
+
+def _is_content_blocked(exc, response=None):
+    """Return a block-reason dict when Gemini blocked the request, else None."""
+    if response is not None:
+        reason = _block_reason_from_response(response)
+        if reason is not None:
+            return reason
+        for candidate in getattr(response, "candidates", None) or []:
+            finish_reason = getattr(candidate, "finish_reason", None)
+            if finish_reason is None:
+                continue
+            name = getattr(finish_reason, "name", None) or str(finish_reason)
+            if name in _CONTENT_BLOCK_FINISH_REASONS:
+                return {"reason": name, "message": None}
+    text = str(exc or "").lower()
+    markers = (
+        "blocked",
+        "block_reason",
+        "prompt_feedback",
+        "promptfeedback",
+        "prohibited_content",
+        "content_safety",
+        "safety_ratings",
+        "finish_reason.safety",
+        "blocklist",
+    )
+    if any(marker in text for marker in markers):
+        return {"reason": "content_blocked", "message": str(exc)}
+    return None
+
+
+def _normalize(text):
+    return re.sub(r"\s+", "", str(text or "")).strip()
+
+
+def _load_job_meta(job_dir):
+    path = job_dir / "job_meta.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _run_ffmpeg(args):
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=300)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise RuntimeError(f"ffmpeg failed: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg error: {result.stderr.strip()}")
+
+
+def _segment_video(job_dir, source, duration_sec):
+    """Split a long video into overlapping segments via ffmpeg."""
+    overlap = config.SUBTITLE_OVERLAP_SEC
+    seg_len = config.LONG_VIDEO_CHUNK_THRESHOLD_SEC
+    seg_dir = job_dir / "segments"
+    seg_dir.mkdir(exist_ok=True)
+
+    segments = []
+    idx = 0
+    start = 0.0
+    while start < duration_sec - 1e-6:
+        end = min(start + seg_len, duration_sec)
+        out = seg_dir / f"seg_{idx:03d}.mp4"
+        _run_ffmpeg(
+            [
+                "ffmpeg", "-y", "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+                "-i", str(source), "-c", "copy", str(out),
+            ]
+        )
+        segments.append({"index": idx, "start": start, "end": end, "path": out})
+        idx += 1
+        if end >= duration_sec - 1e-6:
+            break
+        start = max(end - overlap, start + 0.5)
+    return segments
+
+
+def _extract_json(text):
+    """Parse a Gemini text response into a dict, tolerating fences/noise."""
+    text = str(text or "").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if fence:
+        return json.loads(fence.group(1))
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        return json.loads(text[start:end + 1])
+    raise ValueError("malformed JSON from Gemini")
+
+
+def _parse_subtitles(text, offset_sec):
+    """Parse Gemini output into absolute subtitle dicts (offset applied)."""
+    data = _extract_json(text)
+    raw = data.get("subtitles", []) if isinstance(data, dict) else []
+    if not isinstance(raw, list):
+        raise ValueError("malformed subtitles payload")
+    subtitles = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = float(item.get("start_sec", 0.0)) + offset_sec
+            end = float(item.get("end_sec", 0.0)) + offset_sec
+        except (TypeError, ValueError):
+            continue
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+        subtitles.append(
+            {"text": text, "start_sec": start, "end_sec": end}
+        )
+    return subtitles
+
+
+def _upload_signature(video_path):
+    try:
+        stat = video_path.stat()
+        return stat.st_size, stat.st_mtime_ns
+    except OSError:
+        return None, None
+
+
+def _get_or_upload(client, key, video_path):
+    """Upload a segment once and reuse the uploaded file on retries (Task 3)."""
+    signature = (key, str(video_path)) + tuple(_upload_signature(video_path))
+    uploaded = _UPLOAD_CACHE.get(signature)
+    if uploaded is None:
+        uploaded = client.files.upload(file=str(video_path))
+        _UPLOAD_CACHE[signature] = uploaded
+    return uploaded
+
+
+def _call_gemini(key, prompt, video_path, offset_sec):
+    """Send one video (or segment) to Gemini and return parsed subtitles."""
+    client = genai.Client(api_key=key)
+    uploaded = _get_or_upload(client, key, video_path)
+    response = client.models.generate_content(
+        model=config.GEMINI_MODEL,
+        contents=[
+            genai_types.Part.from_uri(
+                file_uri=uploaded.uri, mime_type=uploaded.mime_type
+            ),
+            prompt,
+        ],
+    )
+    blocked = _is_content_blocked(None, response)
+    if blocked is not None:
+        raise ContentBlockedError(blocked["reason"], blocked["message"])
+    return _parse_subtitles(response.text, offset_sec)
+
+
+def _failure_type(reason):
+    """Map a failure message to the pre-U2b error type taxonomy.
+
+    Used to keep the error dict ``type`` field meaningful for callers that read
+    it (e.g. the extraction result JSON): a ``429`` is a rate limit, a timeout /
+    connection / 5xx message is transient, anything else is permanent.
+    """
+    text = str(reason).lower()
+    if "429" in text:
+        return "rate_limit"
+    if any(
+        marker in text
+        for marker in ("408", "500", "502", "503", "504", "timeout", "connection")
+    ):
+        return "transient"
+    return "permanent"
+
+
+def call_with_rotation(keys, rotation, callable_, *args, call_budget=None, logger_=None):
+    """Round-robin Gemini key rotation (thin wrapper over v2, U2b).
+
+    Shared helper (used by B1 extraction and later chunks). The public
+    contract is unchanged from before U2b so callers keep working:
+
+    - On success returns ``(result, next_rotation, None)``.
+    - On failure returns ``(None, rotation, error_dict)`` where ``error_dict``
+      is ``{"type", "message", ...}``; callers treat a ``None`` result as a
+      failure and apply their existing fallback/flagging. Never raises on a
+      Gemini failure.
+
+    Internally delegates to ``gemini_rotation.call_with_rotation_v2``:
+    rotatable failures (rate limits, timeouts, unknown errors) rotate to the
+    next key, non-rotatable failures (content-safety blocks, invalid requests)
+    stop immediately, and the whole job run can share one
+    ``gemini_rotation.CallBudget`` via ``call_budget`` (a ``None`` budget means
+    unlimited, so existing callers are unaffected). The per-key failure log
+    that v1 used to swallow is now recorded in the error dict's ``attempts``
+    list and logged here.
+
+    ``logger_`` (optional) is a per-job logger (see ``job_logging``) used
+    instead of the module logger when the call happens inside a job pipeline,
+    so Gemini failures land in ``uploads/<job_id>/logs/pipeline.log``.
+    """
+    log = logger_ or logger
+    try:
+        result, next_rotation = call_with_rotation_v2(
+            keys, rotation, callable_, *args, call_budget=call_budget
+        )
+        return result, next_rotation, None
+    except AllKeysExhausted as exc:
+        attempts = list(exc.attempts)
+        log.error("All %d active key(s) failed: %s", len(keys), attempts)
+        reason = attempts[-1][1] if attempts else ""
+        return None, rotation, {
+            "type": _failure_type(reason),
+            "message": reason,
+            "attempts": attempts,
+        }
+    except CallBudgetExceeded as exc:
+        log.error("Gemini call budget exceeded: %s", exc)
+        return None, rotation, {
+            "type": "call_budget_exceeded",
+            "message": str(exc),
+            "used": exc.used,
+            "max_calls": exc.max_calls,
+        }
+    except Exception as exc:  # noqa: BLE001 - non-rotatable failures re-raised
+        block = _is_content_blocked(exc)
+        ftype = "content_blocked" if block is not None else "non_rotatable"
+        log.error("Gemini call non-rotatable (%s): %s", ftype, exc)
+        return None, rotation, {"type": ftype, "message": str(exc)}
+
+
+def _generate_with_rotation(
+    keys, rotation, prompt, video_path, offset_sec, call_budget=None, logger_=None
+):
+    """Try keys round-robin; return (subtitles, next_rotation, error)."""
+    return call_with_rotation(
+        keys, rotation, _call_gemini, prompt, video_path, offset_sec,
+        call_budget=call_budget, logger_=logger_,
+    )
+
+
+def _span(sub):
+    return float(sub.get("end_sec", 0.0)) - float(sub.get("start_sec", 0.0))
+
+
+def _dedup_merge(segment_results):
+    """Merge per-segment subtitle lists, dropping overlap duplicates."""
+    all_subs = []
+    for subs in segment_results:
+        all_subs.extend(subs)
+    all_subs.sort(key=lambda s: float(s.get("start_sec", 0.0)))
+
+    merged = []
+    for sub in all_subs:
+        start = float(sub.get("start_sec", 0.0))
+        text = _normalize(sub.get("text"))
+        if not text:
+            merged.append(sub)
+            continue
+        duplicated = False
+        idx = len(merged) - 1
+        while idx >= 0 and float(merged[idx].get("start_sec", 0.0)) >= start - config.SUBTITLE_DEDUP_TOLERANCE_SEC:
+            if _normalize(merged[idx].get("text")) == text:
+                duplicated = True
+                if _span(sub) > _span(merged[idx]):
+                    merged[idx] = sub
+                break
+            idx -= 1
+        if not duplicated:
+            merged.append(sub)
+    return merged
+
+
+def _build_result(job_id, status, chunked, segments_count, failed_segments, errors, subtitles):
+    return {
+        "job_id": job_id,
+        "status": status,
+        "chunked": chunked,
+        "segments_count": segments_count,
+        "failed_segments": list(failed_segments),
+        "errors": {str(idx): info for idx, info in sorted(errors.items())},
+        "subtitles": subtitles,
+    }
+
+
+def _save(job_dir, result):
+    path = job_dir / "subtitles_zh_raw.json"
+    path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
+def extract_subtitles(job_id, upload_root=None, call_budget=None):
+    """Extract Chinese subtitles for a job. Never raises on Gemini failures."""
+    upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
+    job_dir = upload_root / job_id
+    source = job_dir / "source.mp4"
+    if not source.exists():
+        raise FileNotFoundError(f"no source.mp4 for job {job_id}")
+
+    job_logger = job_logging.get_job_logger(job_id, upload_root)
+    meta = _load_job_meta(job_dir)
+    duration = meta.get("duration_sec")
+    if duration is None:
+        duration = video_ingest.probe_video(source).get("duration_sec")
+
+    keys = key_store.get_active_keys()
+    if not keys:
+        job_logger.error("extraction cannot start for job %s: no active Gemini keys", job_id)
+        result = _build_result(
+            job_id, "extraction_failed", False, 0, [], {}, []
+        )
+        return _save(job_dir, result)
+
+    threshold = config.LONG_VIDEO_CHUNK_THRESHOLD_SEC
+    chunked = duration is not None and duration > threshold
+    rotation = 0
+    segment_results = []
+    failed_segments = []
+    errors = {}
+
+    if not chunked:
+        subs, rotation, error = _generate_with_rotation(
+            keys, rotation, SUBTITLE_EXTRACT_PROMPT, source, 0.0,
+            call_budget=call_budget, logger_=job_logger,
+        )
+        segments_count = 1
+        if subs is None:
+            failed_segments.append(0)
+            errors[0] = error
+        else:
+            segment_results.append(subs)
+    else:
+        segments = _segment_video(job_dir, source, duration)
+        segments_count = len(segments)
+        for seg in segments:
+            subs, rotation, error = _generate_with_rotation(
+                keys, rotation, SUBTITLE_EXTRACT_PROMPT, seg["path"], seg["start"],
+                call_budget=call_budget, logger_=job_logger,
+            )
+            if subs is None:
+                failed_segments.append(seg["index"])
+                errors[seg["index"]] = error
+            else:
+                segment_results.append(subs)
+
+    if len(failed_segments) == segments_count:
+        status = "extraction_failed"
+    elif failed_segments:
+        status = "partial"
+    else:
+        status = "ok"
+
+    subtitles = _dedup_merge(segment_results) if segment_results else []
+    result = _build_result(
+        job_id, status, chunked, segments_count, failed_segments, errors, subtitles
+    )
+    return _save(job_dir, result)

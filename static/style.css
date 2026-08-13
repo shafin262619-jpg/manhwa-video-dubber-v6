@@ -1,0 +1,414 @@
+/* ===========================================================
+   Manhwa Video Dubber — shared UI stylesheet
+   Unified with BlueprintTube's design system so the two sibling
+   pipelines read as one product family.
+   Palette: dark editing-suite charcoal + amber tally-light accent
+   Type: Baloo Da 2 (display) / Hind Siliguri (body/UI) / IBM Plex Mono (data)
+=========================================================== */
+
+:root {
+  --bg:            #131110;
+  --surface:       #1c1815;
+  --surface-2:     #241f1b;
+  --surface-3:     #2c261f;
+  --hairline:      #3a322a;
+  --text:          #f2ece1;
+  --text-muted:    #a89a89;
+  --amber:         #e8a33d;
+  --amber-dim:     #8a651f;
+  --teal:          #3fa796;
+  --red:           #e5484d;
+  --font-display:  'Baloo Da 2', 'Hind Siliguri', sans-serif;
+  --font-body:     'Hind Siliguri', sans-serif;
+  --font-mono:     'IBM Plex Mono', monospace;
+  --radius:        14px;
+  --card-shadow:   0 1px 3px rgba(0, 0, 0, .35), 0 1px 2px rgba(0, 0, 0, .25);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  min-height: 100vh;
+  font-family: var(--font-body);
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  background-image:
+    radial-gradient(ellipse at 20% -10%, rgba(232, 163, 61, 0.10), transparent 55%),
+    radial-gradient(ellipse at 90% 0%, rgba(63, 167, 150, 0.08), transparent 45%);
+}
+
+/* Faint film-grain overlay, matches BlueprintTube's texture */
+.grain {
+  position: fixed; inset: 0; pointer-events: none; z-index: 1;
+  opacity: .035; mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+a {
+  color: var(--amber);
+  text-decoration: underline;
+  text-decoration-color: rgba(232, 163, 61, .4);
+  text-underline-offset: 2px;
+}
+
+a:hover {
+  color: #f0af52;
+  text-decoration-color: #f0af52;
+}
+
+/* Shared header / nav (sticky topbar) */
+.site-header {
+  position: sticky; top: 0; z-index: 5;
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  padding: 1.1rem 1.6rem;
+  background: linear-gradient(to bottom, rgba(19, 17, 16, .96), rgba(19, 17, 16, .75));
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--hairline);
+}
+
+.site-header .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 1.15rem;
+  letter-spacing: .01em;
+  text-decoration: none;
+  color: var(--text);
+}
+
+.site-header .brand::before {
+  content: '';
+  width: 10px; height: 10px; border-radius: 3px; flex: none;
+  background: var(--amber);
+  box-shadow: 0 0 12px 2px rgba(232, 163, 61, .6);
+}
+
+.site-header .brand:hover {
+  color: var(--amber);
+}
+
+.site-header .page-title {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  letter-spacing: .04em;
+}
+
+main.site-content {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 5rem;
+  position: relative;
+  z-index: 2;
+}
+
+h1 {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 1.9rem;
+  line-height: 1.2;
+  margin: 0.25rem 0 1.25rem;
+  color: var(--text);
+}
+
+h2 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 1.25rem;
+  margin: 1.75rem 0 0.75rem;
+  color: var(--text);
+}
+
+p {
+  margin: 0.6rem 0;
+  color: var(--text);
+}
+
+/* Buttons */
+button,
+input[type="submit"] {
+  font: inherit;
+  font-family: var(--font-body);
+  font-weight: 600;
+  padding: 0.7rem 1.3rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--amber);
+  color: #1a1410;
+  cursor: pointer;
+  transition: transform .12s ease, background-color .15s ease, opacity .15s ease;
+}
+
+button:hover,
+input[type="submit"]:hover {
+  background: #f0af52;
+}
+
+button:active,
+input[type="submit"]:active {
+  transform: scale(.97);
+}
+
+/* Form inputs */
+input[type="text"],
+input[type="password"],
+input[type="number"],
+input[type="file"],
+textarea,
+select {
+  font: inherit;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+textarea {
+  width: 100%;
+  max-width: 34rem;
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  outline: 2px solid var(--amber);
+  outline-offset: 1px;
+  border-color: var(--amber);
+}
+
+form label {
+  display: block;
+  margin: 0.7rem 0 0.35rem;
+  color: var(--text-muted);
+  font-size: 0.88rem;
+}
+
+form {
+  margin: 1.25rem 0;
+}
+
+/* Generic <video> (final page, etc. — outside .review-box) */
+video {
+  max-width: 100%;
+  display: block;
+  margin: 1rem 0;
+  background: #000;
+  border-radius: var(--radius);
+  border: 1px solid var(--hairline);
+}
+
+/* Review page: one card per serial */
+.review-box {
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 1.2rem 1.4rem;
+  margin-bottom: 1.5rem;
+  box-shadow: var(--card-shadow);
+}
+
+.review-box h2 {
+  margin-top: 0;
+  font-size: 1.1rem;
+}
+
+.review-box video {
+  max-width: 480px;
+  width: 100%;
+  margin: 0.5rem 0;
+}
+
+.review-box .subtitle {
+  color: var(--text);
+}
+
+.review-box .duration {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+
+/* Flagged serials: clearly distinct, must be easy to spot */
+section.flagged {
+  border: 1px solid var(--red);
+  background: rgba(229, 72, 77, .08);
+}
+
+.flag-note {
+  display: inline-block;
+  color: #ffb3b5;
+  font-weight: 700;
+  font-size: 0.78rem;
+  background: rgba(229, 72, 77, .12);
+  border: 1px solid var(--red);
+  border-radius: 999px;
+  padding: 0.2rem 0.75rem;
+}
+
+.flagged-banner {
+  border: 1px solid var(--red);
+  background: rgba(229, 72, 77, .08);
+  color: #ffb3b5;
+  border-radius: 10px;
+  padding: 0.85rem 1.1rem;
+  margin-bottom: 1.5rem;
+}
+
+.flagged-banner a {
+  color: #ffb3b5;
+}
+
+.trim-form {
+  margin-top: 0.9rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.1rem;
+  align-items: flex-end;
+}
+
+.trim-form label {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin: 0;
+  font-size: 0.85rem;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+/* Settings: stored-keys table */
+.keys-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.keys-table th,
+.keys-table td {
+  text-align: left;
+  padding: 0.7rem 0.9rem;
+  border-bottom: 1px solid var(--hairline);
+  vertical-align: middle;
+}
+
+.keys-table th {
+  background: var(--surface-3);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+
+.keys-table tr:last-child td {
+  border-bottom: none;
+}
+
+.keys-table code {
+  background: var(--surface-3);
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--surface-3);
+  color: var(--amber);
+  padding: 1px 6px;
+  border-radius: 5px;
+}
+
+/* Job processing / error banners (polling page) */
+.processing-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  border: 1px solid var(--hairline);
+  background: var(--surface);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 1rem 1.2rem;
+}
+
+.spinner {
+  width: 1.2rem;
+  height: 1.2rem;
+  flex: none;
+  border: 2px solid var(--hairline);
+  border-top-color: var(--amber);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.error-banner {
+  border: 1px solid var(--red);
+  background: rgba(229, 72, 77, .08);
+  color: #ffb3b5;
+  border-radius: var(--radius);
+  padding: 1.1rem 1.2rem;
+}
+
+.error-banner-title {
+  margin: 0 0 0.5rem;
+  font-weight: 700;
+  color: #ffb3b5;
+}
+
+.error-banner p {
+  margin: 0 0 0.7rem;
+  word-break: break-word;
+  color: #ffd9da;
+}
+
+.error-banner-retry {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border-radius: 999px;
+  background: var(--red);
+  color: #1a1410;
+  text-decoration: none;
+  font-weight: 700;
+}
+
+.error-banner-retry:hover {
+  background: #ff6a6e;
+  color: #1a1410;
+}
+
+/* Misc */
+.meta {
+  color: var(--text-muted);
+}
+
+@media (max-width: 560px) {
+  h1 { font-size: 1.5rem; }
+  main.site-content { padding: 1.5rem 1.1rem 3rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}

@@ -1,0 +1,8 @@
+{
+  "api_keys": [
+    {
+      "name": "my-key",
+      "key": "YOUR_GEMINI_API_KEY_HERE"
+    }
+  ]
+}

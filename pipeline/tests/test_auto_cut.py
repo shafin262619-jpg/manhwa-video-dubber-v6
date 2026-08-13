@@ -1,0 +1,268 @@
+"""Tests for pipeline.auto_cut (E2 FFmpeg draft video rendering).
+
+All ffmpeg/ffprobe calls are mocked: we assert the exact command sequence that
+would run (clip extract + speed-adjust -> concat -> mux) and that the
+validation logic passes/fails correctly, without rendering anything.
+"""
+
+import json
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from pipeline import auto_cut, video_ingest
+
+
+def _ok_result(stdout=""):
+    return types.SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+
+
+def _entry(serial, start, end, mult):
+    return {
+        "serial": serial,
+        "source_start_sec": start,
+        "source_end_sec": end,
+        "target_start_sec": 0.0,
+        "target_end_sec": 0.0,
+        "pts_multiplier": mult,
+        "flagged": False,
+        "flag_reason": None,
+    }
+
+
+class AutoCutBase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.upload_root = Path(self._tmp) / "uploads"
+        self.job_id = "job-e2"
+        self.job_dir = self.upload_root / self.job_id
+        self.job_dir.mkdir(parents=True)
+
+    def _write_inputs(self):
+        (self.job_dir / "source.mp4").write_bytes(b"fake-source")
+        (self.job_dir / "voiceover_hi.wav").write_bytes(b"fake-audio")
+
+    def _write_guideline(self, entries):
+        (self.job_dir / "edit_guideline.json").write_text(
+            json.dumps(entries, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def _probe_for(self, path):
+        """Return the ffprobe JSON dict the mock should emit for a path."""
+        name = Path(path).name
+        if name == "voiceover_hi.wav":
+            return {"format": {"duration": "12.0"}, "streams": []}
+        if name == "source.mp4":
+            return {
+                "format": {"duration": "60.0"},
+                "streams": [{"codec_type": "video", "r_frame_rate": "25/1"}],
+            }
+        if name == "draft_final_video.mp4":
+            return {
+                "format": {"duration": "12.1"},
+                "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
+            }
+        return {"format": {}, "streams": []}
+
+    def _run_with(self, probe_override=None):
+        """Patch auto_cut._run, record commands, return (result, calls)."""
+        calls = []
+
+        def fake_run(cmd, timeout=None):
+            calls.append(cmd)
+            if cmd and cmd[0] == "ffprobe":
+                path = cmd[-1]
+                data = (
+                    probe_override(path)
+                    if probe_override
+                    else self._probe_for(path)
+                )
+                return _ok_result(json.dumps(data))
+            return _ok_result()
+
+        with mock.patch.object(auto_cut, "_run", side_effect=fake_run):
+            result = auto_cut.build_draft_video(self.job_id, upload_root=self.upload_root)
+        return result, calls
+
+
+class CommandBuildingTest(AutoCutBase):
+    def test_builds_clip_concat_mux_commands_in_order(self):
+        self._write_inputs()
+        self._write_guideline(
+            [
+                _entry(1, 0.0, 6.0, 8.0 / 6.0),
+                _entry(2, 6.0, 10.0, 0.8),
+            ]
+        )
+        result, calls = self._run_with()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["clip_count"], 2)
+        self.assertTrue(result["draft_path"].endswith("draft_final_video.mp4"))
+
+        ffmpeg_cmds = [c for c in calls if c[0] == "ffmpeg"]
+        self.assertEqual(len(ffmpeg_cmds), 4)  # 2 clips + concat + mux
+
+        clip1 = ffmpeg_cmds[0]
+        self.assertIn("-ss", clip1)
+        self.assertIn("0.000", clip1)
+        self.assertIn("6.000", clip1)
+        self.assertIn("-an", clip1)
+        self.assertTrue(any(arg == "setpts=1.333333*PTS" for arg in clip1))
+        self.assertIn(str(self.job_dir / "source.mp4"), clip1)
+        self.assertTrue(any(arg.endswith("serial_00000.mp4") for arg in clip1))
+
+        clip2 = ffmpeg_cmds[1]
+        self.assertTrue(any(arg == "setpts=0.800000*PTS" for arg in clip2))
+        self.assertTrue(any(arg.endswith("serial_00001.mp4") for arg in clip2))
+
+        concat = ffmpeg_cmds[2]
+        self.assertIn("-f", concat)
+        self.assertIn("concat", concat)
+        self.assertIn("copy", concat)
+        self.assertTrue(any(arg.endswith("concat.txt") for arg in concat))
+        self.assertTrue(any(arg.endswith("concat_video.mp4") for arg in concat))
+
+        mux = ffmpeg_cmds[3]
+        self.assertIn(str(self.job_dir / "voiceover_hi.wav"), mux)
+        self.assertIn(str(self.job_dir / "auto_cut_clips" / "concat_video.mp4"), mux)
+        self.assertIn("0:v", mux)
+        self.assertIn("1:a", mux)
+        self.assertTrue(any(arg == auto_cut.config.RENDER_AUDIO_CODEC for arg in mux))
+        self.assertTrue(any(arg.endswith("draft_final_video.mp4") for arg in mux))
+
+    def test_clip_uses_guideline_cut_range(self):
+        self._write_inputs()
+        self._write_guideline([_entry(1, 12.5, 18.25, 1.0)])
+        _, calls = self._run_with()
+        clip = [c for c in calls if c[0] == "ffmpeg"][0]
+        self.assertIn("12.500", clip)
+        self.assertIn("18.250", clip)
+
+    def test_ffmpeg_failure_raises_runtime_error(self):
+        self._write_inputs()
+        self._write_guideline([_entry(1, 0.0, 6.0, 1.0)])
+
+        def fake_run(cmd, timeout=None):
+            if cmd and cmd[0] == "ffprobe":
+                return _ok_result(json.dumps(self._probe_for(cmd[-1])))
+            # simulate the real _run raising on a failed ffmpeg invocation
+            raise RuntimeError("ffmpeg/ffprobe error: boom")
+
+        with mock.patch.object(auto_cut, "_run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError):
+                auto_cut.build_draft_video(self.job_id, upload_root=self.upload_root)
+
+
+class EmptyGuidelineTest(AutoCutBase):
+    def test_empty_guideline_does_not_render(self):
+        self._write_inputs()
+        self._write_guideline([])
+        result, calls = self._run_with()
+        self.assertEqual(result["status"], "no_serials")
+        self.assertIsNone(result["draft_path"])
+        self.assertEqual(calls, [])
+
+
+class ValidationUnitTest(AutoCutBase):
+    def test_pass_when_video_audio_and_duration_close(self):
+        probe = {
+            "format": {"duration": "12.1"},
+            "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
+        }
+        ok, details = auto_cut._validate_draft(probe, 12.0, 0.2)
+        self.assertTrue(ok)
+        self.assertTrue(details["has_video"])
+        self.assertTrue(details["has_audio"])
+        self.assertTrue(details["duration_ok"])
+
+    def test_fail_when_audio_stream_missing(self):
+        probe = {"format": {"duration": "12.0"}, "streams": [{"codec_type": "video"}]}
+        ok, details = auto_cut._validate_draft(probe, 12.0, 0.2)
+        self.assertFalse(ok)
+        self.assertFalse(details["has_audio"])
+
+    def test_fail_when_video_stream_missing(self):
+        probe = {"format": {"duration": "12.0"}, "streams": [{"codec_type": "audio"}]}
+        ok, _ = auto_cut._validate_draft(probe, 12.0, 0.2)
+        self.assertFalse(ok)
+
+    def test_fail_when_duration_out_of_tolerance(self):
+        probe = {
+            "format": {"duration": "20.0"},
+            "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
+        }
+        ok, details = auto_cut._validate_draft(probe, 12.0, 0.2)
+        self.assertFalse(ok)
+        self.assertFalse(details["duration_ok"])
+
+    def test_fail_when_duration_missing(self):
+        probe = {
+            "format": {},
+            "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
+        }
+        ok, _ = auto_cut._validate_draft(probe, 12.0, 0.2)
+        self.assertFalse(ok)
+
+
+class ValidationInBuildTest(AutoCutBase):
+    def test_validation_failure_raises_draft_validation_error(self):
+        self._write_inputs()
+        self._write_guideline([_entry(1, 0.0, 6.0, 1.0)])
+
+        def probe_override(path):
+            if Path(path).name == "draft_final_video.mp4":
+                # grossly longer than the voiceover -> validation must fail
+                return {
+                    "format": {"duration": "30.0"},
+                    "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
+                }
+            return self._probe_for(path)
+
+        with self.assertRaises(auto_cut.DraftValidationError):
+            self._run_with(probe_override=probe_override)
+
+    def test_validation_pass_reports_durations(self):
+        self._write_inputs()
+        self._write_guideline([_entry(1, 0.0, 6.0, 2.0)])
+        result, _ = self._run_with()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["voiceover_duration_sec"], 12.0)
+        self.assertEqual(result["duration_sec"], 12.1)
+        # 3 frames at 25fps -> 0.12s tolerance
+        self.assertAlmostEqual(result["tolerance_sec"], 0.12, places=2)
+
+
+class InputErrorTest(AutoCutBase):
+    def test_missing_job_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            auto_cut.build_draft_video("nope", upload_root=self.upload_root)
+
+    def test_missing_guideline_raises(self):
+        self._write_inputs()
+        with self.assertRaises(FileNotFoundError):
+            auto_cut.build_draft_video(self.job_id, upload_root=self.upload_root)
+
+    def test_missing_source_raises(self):
+        (self.job_dir / "voiceover_hi.wav").write_bytes(b"fake-audio")
+        self._write_guideline([_entry(1, 0.0, 6.0, 1.0)])
+        with self.assertRaises(FileNotFoundError):
+            auto_cut.build_draft_video(self.job_id, upload_root=self.upload_root)
+
+    def test_missing_voiceover_raises(self):
+        (self.job_dir / "source.mp4").write_bytes(b"fake-source")
+        self._write_guideline([_entry(1, 0.0, 6.0, 1.0)])
+        with self.assertRaises(FileNotFoundError):
+            auto_cut.build_draft_video(self.job_id, upload_root=self.upload_root)
+
+    def test_malformed_guideline_raises(self):
+        self._write_inputs()
+        (self.job_dir / "edit_guideline.json").write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            auto_cut.build_draft_video(self.job_id, upload_root=self.upload_root)
+
+
+if __name__ == "__main__":
+    unittest.main()
