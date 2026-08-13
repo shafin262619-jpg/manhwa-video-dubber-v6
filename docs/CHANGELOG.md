@@ -1,5 +1,47 @@
 # Manhwa Video Dubber — Changelog
 
+## [FA-E1] — 2026-08-13 — Backward-compat audit + fixes (Full-Auto Pipeline)
+
+Verification chunk: confirms the old manual routes still coexist with the new
+full-auto pipeline, and fixes the one real bug the audit found.
+
+- Audit result (documented in `docs/HANDOFF_NEXT.md`, checklist item by item):
+  1. Manual voice-source override is resumable/idempotent — **fixed a bug**.
+     `upload_status_page()` used to gate on the flat `stage`/`state` fields,
+     which caused an infinite redirect loop after an override in two cases:
+     (a) auto_tts chain already ran (`auto_full_render`/`done`), then the user
+     overrode to `user_upload` — the page polled `upload_pipeline` forever;
+     (b) a job that stopped at `upload_pipeline`/`done` was overridden to
+     `auto_tts` — the page polled `auto_full_render`, a stage that never
+     starts. The polling JS redirects whenever the *overall* state is `done`,
+     so both looped.
+  2. All old manual routes still work by direct URL — passed (covered by the
+     existing G1 orchestration test + `test_voiceover_upload` +
+     `test_voiceover_auto` + `test_render_final` + `test_review`).
+  3. Entire existing test suite (U0-U5) passes unchanged — passed.
+  4. `pipeline/dry_run_check.py` (U5) works with the new flow — passed
+     (artifact names/locations unchanged; a fixture job exits 0).
+- `app.py` `upload_status_page()` fixes:
+  - Branch decisions now use the per-stage history (`stages.<stage>.state`)
+    instead of the flat `stage`/`state` fields, so the page never polls a
+    stage that is already done or was superseded by a later one.
+  - For `voice_source == "auto_tts"`: when `auto_full_render` never started
+    but `upload_pipeline` finished (a manual override to auto_tts after
+    upload), the page resumes the chain itself via
+    `_start_stage(job_id, "auto_full_render", _run_auto_full_render)` so it
+    converges to the final video instead of looping.
+- `app.py` refactor: the FA-C1 same-thread chain block is factored into
+  `_run_auto_full_render(job_id)` (still runs on the upload thread — no new
+  spawn, the FA-C1 hard constraint is preserved) so the upload path and the
+  resume path share one implementation.
+- New `pipeline/tests/test_backward_compat_audit.py`: +4 HTTP tests locking in
+  the audit findings — override-to-user_upload after auto render shows the
+  audio form directly and re-renders on audio upload; re-override to auto_tts
+  is idempotent (no extra F3 render, final video preserved); override from
+  user_upload to auto_tts resumes to a downloadable final video; the old
+  manual routes still work end-to-end by direct URL.
+- Full suite: **288 tests OK** (284 prior + 4 new).
+
 ## [FA-D2] — 2026-08-13 — Audio upload auto-continues to final video (single pause point complete, Full-Auto Pipeline)
 
 Group D done — the PRD's core requirement is now fully implemented: the

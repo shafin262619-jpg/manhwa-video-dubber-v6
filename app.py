@@ -210,34 +210,7 @@ def _run_upload_pipeline(job_id):
         # old behavior and stops here — group D handles that path.
         voice_source = voiceover_unify.get_voice_source(job_id)
         if voice_source == "auto_tts":
-            job_status_store.write_status(job_id, "auto_full_render", "running")
-            try:
-                budget = gemini_rotation.CallBudget(config.MAX_API_CALLS_PER_JOB)
-                result = full_auto_chain.run_auto_tts_chain(
-                    job_id, call_budget=budget
-                )
-                job_status_store.write_status(
-                    job_id, "auto_full_render", "done", extra={"result": result}
-                )
-            except (
-                FileNotFoundError,
-                ValueError,
-                RuntimeError,
-                auto_cut.DraftValidationError,
-            ) as exc:
-                logger.error("auto full render failed for job %s: %s", job_id, exc)
-                job_status_store.write_status(
-                    job_id, "auto_full_render", "error",
-                    extra={"detail": _friendly_error(exc)},
-                )
-            except Exception as exc:  # noqa: BLE001 — daemon thread must never die
-                logger.exception(
-                    "unexpected auto full render failure for job %s", job_id
-                )
-                job_status_store.write_status(
-                    job_id, "auto_full_render", "error",
-                    extra={"detail": _friendly_error(exc)},
-                )
+            _run_auto_full_render(job_id)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         logger.error("post-upload pipeline failed for job %s: %s", job_id, exc)
         job_status_store.write_status(
@@ -353,6 +326,43 @@ def _run_user_audio_pipeline(job_id):
             job_id,
             "user_audio_pipeline",
             "error",
+            extra={"detail": _friendly_error(exc)},
+        )
+
+
+def _run_auto_full_render(job_id):
+    """Run the auto_tts full-auto chain D2 -> D4 -> E1 -> E2 -> F3.
+
+    Persists ``auto_full_render`` status (running/done/error). FA-C1 calls
+    this from inside the upload thread (same thread, no new spawn); the
+    ``/upload`` page also re-uses it via ``_start_stage`` to resume a job
+    whose chain never started (a manual override to auto_tts via
+    ``/voiceover/{job_id}/choose`` after upload). Never lets an exception
+    escape the thread; failures are persisted as ``error`` status.
+    """
+    try:
+        budget = gemini_rotation.CallBudget(config.MAX_API_CALLS_PER_JOB)
+        result = full_auto_chain.run_auto_tts_chain(job_id, call_budget=budget)
+        job_status_store.write_status(
+            job_id, "auto_full_render", "done", extra={"result": result}
+        )
+    except (
+        FileNotFoundError,
+        ValueError,
+        RuntimeError,
+        auto_cut.DraftValidationError,
+    ) as exc:
+        logger.error("auto full render failed for job %s: %s", job_id, exc)
+        job_status_store.write_status(
+            job_id, "auto_full_render", "error",
+            extra={"detail": _friendly_error(exc)},
+        )
+    except Exception as exc:  # noqa: BLE001 — daemon thread must never die
+        logger.exception(
+            "unexpected auto full render failure for job %s", job_id
+        )
+        job_status_store.write_status(
+            job_id, "auto_full_render", "error",
             extra={"detail": _friendly_error(exc)},
         )
 
@@ -508,39 +518,50 @@ def upload_status_page(job_id: str) -> HTMLResponse:
     if status.get("stage") == "unknown":
         raise HTTPException(status_code=404, detail=f"unknown job {job_id}")
 
+    stages = status.get("stages") or {}
     voice_source = voiceover_unify.get_voice_source(job_id)
     if voice_source == "auto_tts":
         # FA-C2: for the auto_tts path the upload thread continues (FA-C1)
         # straight into the full-auto chain, so this page stays on the
         # polling page until the auto_full_render stage is done and then shows
         # the final video player + download link directly — no extra click.
-        if not (
-            status.get("stage") == "auto_full_render"
-            and status.get("state") == "done"
-        ):
-            return _polling_page(
-                job_id, "Uploading & Extracting", f"/upload/{job_id}",
-                "auto_full_render",
-            )
-        return _render_chain_final_result(job_id, "auto_full_render")
+        auto_stage = stages.get("auto_full_render") or {}
+        if auto_stage.get("state") == "done":
+            return _render_chain_final_result(job_id, "auto_full_render")
+        if not auto_stage and (stages.get("upload_pipeline") or {}).get("state") == "done":
+            # FA-E1: the chain never started — the upload thread either was
+            # still in B1/B2/C1 when this page loaded (FA-C1 starts it right
+            # after) or stopped at upload_pipeline done (a manual override to
+            # auto_tts via /voiceover/{job_id}/choose after upload). Resume
+            # it so the page converges to the final video instead of polling a
+            # stage that would otherwise never run.
+            _start_stage(job_id, "auto_full_render", _run_auto_full_render)
+        return _polling_page(
+            job_id, "Uploading & Extracting", f"/upload/{job_id}",
+            "auto_full_render",
+        )
 
     # FA-D2: after the user uploads their own audio the job continues (same
     # page as the entry point): while user_audio_pipeline runs, stay on the
     # polling page; once done, show the final video directly.
-    if status.get("stage") == "user_audio_pipeline":
-        if status.get("state") == "done":
+    if stages.get("user_audio_pipeline"):
+        if stages["user_audio_pipeline"].get("state") == "done":
             return _render_chain_final_result(job_id, "user_audio_pipeline")
         return _polling_page(
             job_id, "Processing your audio", f"/upload/{job_id}",
             "user_audio_pipeline",
         )
 
-    if not (status.get("stage") == "upload_pipeline" and status.get("state") == "done"):
+    # FA-D1: once the upload chain has completed (upload_pipeline done in the
+    # stage history — the flat stage/state fields may have moved on to a later
+    # stage, e.g. after a manual voice-source override), the user_upload path
+    # drops straight into the audio-upload form — no extra "choose" click.
+    if (stages.get("upload_pipeline") or {}).get("state") != "done":
         return _polling_page(
             job_id, "Uploading & Extracting", f"/upload/{job_id}", "upload_pipeline"
         )
 
-    result = status.get("stages", {}).get("upload_pipeline", {}) or {}
+    result = stages.get("upload_pipeline") or {}
     extraction_status = result.get("extraction_status", "ok")
     serials = result.get("serials")
     errors = result.get("errors") or []
