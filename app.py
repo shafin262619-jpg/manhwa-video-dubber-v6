@@ -351,6 +351,13 @@ def home() -> HTMLResponse:
     <label for="file">Video (mp4/mkv/mov/avi/webm/flv/wmv/m4v)</label>
     <input type="file" id="file" name="file"
            accept=".mp4,.mkv,.mov,.avi,.webm,.flv,.wmv,.m4v" required>
+    <fieldset>
+      <legend>Voiceover source</legend>
+      <label><input type="radio" name="voice_source" value="auto_tts" checked>
+        সিস্টেম নিজেই ভয়েসওভার বানাক (Gemini TTS)</label>
+      <label><input type="radio" name="voice_source" value="user_upload">
+        আমি নিজের/অন্য AI দিয়ে বানানো অডিও দেব</label>
+    </fieldset>
     <button type="submit" id="upload-submit">System Start</button>
   </form>
   <div id="upload-error" class="error-banner" hidden></div>
@@ -534,11 +541,23 @@ def delete_key(key_id: str) -> dict:
 
 
 @app.post("/upload")
-async def upload_video(file: UploadFile = File(...)) -> dict:
+async def upload_video(
+    file: UploadFile = File(...),
+    voice_source: str = Form("auto_tts"),
+) -> dict:
     try:
         video_ingest.ensure_active_key(key_store.get_active_keys())
     except video_ingest.NoActiveKeyError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    if voice_source not in voiceover_unify.ALLOWED_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"invalid voice source: {voice_source!r} "
+                f"(allowed: {', '.join(voiceover_unify.ALLOWED_MODES)})"
+            ),
+        )
 
     try:
         video_ingest.validate_file_type(file.filename)
@@ -560,6 +579,12 @@ async def upload_video(file: UploadFile = File(...)) -> dict:
         job_meta = video_ingest.finalize_job(job_id, file.filename)
     except video_ingest.VideoProbeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    # FA-A1: the voice-source choice is taken on the upload form (default
+    # "auto_tts"); persist it immediately so the full-auto chain never needs a
+    # separate /voiceover/{job_id}/choose click. set_voice_source validates the
+    # mode, so a bad value would have already been rejected above.
+    voiceover_unify.set_voice_source(job_id, voice_source)
 
     # G1 wiring (U1b): the heavy B1 -> B2 -> C1 chain now runs on a daemon
     # background thread so the upload returns immediately with

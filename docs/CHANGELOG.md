@@ -1,5 +1,32 @@
 # Manhwa Video Dubber — Changelog
 
+## [FA-A1] — 2026-08-13 — Upfront voice-source input on /upload (Full-Auto Pipeline)
+
+The voice-source question (auto TTS vs own audio) is now taken on the upload
+form itself, so the choice is persisted the moment the upload succeeds and the
+full-auto chain never depends on a later `/voiceover/{job_id}/choose` click.
+
+- `app.py` `home()`: the upload form now has a radio-group:
+  - "সিস্টেম নিজেই ভয়েসওভার বানাক (Gemini TTS)" — `value="auto_tts"`,
+    **default checked**.
+  - "আমি নিজের/অন্য AI দিয়ে বানানো অডিও দেব" — `value="user_upload"`.
+  - The existing inline `<script>` already builds `FormData(form)`, so the
+    field rides along with the file automatically — no JS change needed.
+- `app.py` `upload_video()`: new optional `voice_source: str = Form("auto_tts")`
+  param. Values outside `voiceover_unify.ALLOWED_MODES` are rejected with a
+  400 (same pattern as the existing `InvalidVoiceSourceError`). A valid value
+  is persisted via `voiceover_unify.set_voice_source(job_id, voice_source)`
+  synchronously, right before the B1→B2→C1 background thread starts — the
+  choice is always known from the upload moment onward.
+- Hard constraints honored: `_run_upload_pipeline`, `voiceover_choose` and the
+  `/voiceover/{job_id}/choose` route behavior are unchanged; the old manual
+  choose page still works (backward-compat, verified again in FA-E1).
+- `pipeline/tests/test_full_auto_upload.py` (new, 3 tests): voice_source=
+  "user_upload" is persisted to `voice_source_choice.json` immediately (before
+  the background thread finishes), the default is "auto_tts" when omitted, and
+  an invalid value returns 400.
+- Full suite: **273 tests OK** (270 prior + 3 new).
+
 ## [UI2] — 2026-08-13 — Visual redesign, unified with BlueprintTube (CSS/head only)
 
 UI1 (below) intentionally kept `static/style.css` minimal — "light and
