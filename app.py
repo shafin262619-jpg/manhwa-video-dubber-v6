@@ -18,6 +18,7 @@ from pipeline import (
     auto_cut,
     config,
     edit_guideline,
+    full_auto_chain,
     gemini_rotation,
     job_status as job_status_store,
     key_store,
@@ -201,6 +202,42 @@ def _run_upload_pipeline(job_id):
         job_status_store.write_status(
             job_id, "upload_pipeline", "done", extra=extra
         )
+
+        # FA-C1: for the auto_tts path the upload chain now continues, on the
+        # SAME thread, straight through the full-auto chain down to the final
+        # video (D2 -> D4 -> E1 -> E2 -> F3), so the user gets a zero-click
+        # result. The user_upload path (or a job with no choice yet) keeps the
+        # old behavior and stops here — group D handles that path.
+        voice_source = voiceover_unify.get_voice_source(job_id)
+        if voice_source == "auto_tts":
+            job_status_store.write_status(job_id, "auto_full_render", "running")
+            try:
+                budget = gemini_rotation.CallBudget(config.MAX_API_CALLS_PER_JOB)
+                result = full_auto_chain.run_auto_tts_chain(
+                    job_id, call_budget=budget
+                )
+                job_status_store.write_status(
+                    job_id, "auto_full_render", "done", extra={"result": result}
+                )
+            except (
+                FileNotFoundError,
+                ValueError,
+                RuntimeError,
+                auto_cut.DraftValidationError,
+            ) as exc:
+                logger.error("auto full render failed for job %s: %s", job_id, exc)
+                job_status_store.write_status(
+                    job_id, "auto_full_render", "error",
+                    extra={"detail": _friendly_error(exc)},
+                )
+            except Exception as exc:  # noqa: BLE001 — daemon thread must never die
+                logger.exception(
+                    "unexpected auto full render failure for job %s", job_id
+                )
+                job_status_store.write_status(
+                    job_id, "auto_full_render", "error",
+                    extra={"detail": _friendly_error(exc)},
+                )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         logger.error("post-upload pipeline failed for job %s: %s", job_id, exc)
         job_status_store.write_status(

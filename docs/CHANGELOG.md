@@ -1,5 +1,30 @@
 # Manhwa Video Dubber — Changelog
 
+## [FA-C1] — 2026-08-13 — Wire auto_tts path end-to-end in app.py (Full-Auto Pipeline)
+
+Group C's first (riskiest) chunk: the existing upload thread now *continues*
+straight into the full-auto chain for auto_tts jobs, so a zero-click upload
+produces the final video with no other endpoint needed.
+
+- `app.py`: `_run_upload_pipeline()` — after writing `upload_pipeline`/`done`
+  (the existing B1→B2→C1 chain), if `voice_source == "auto_tts"` the SAME
+  thread keeps going: `auto_full_render`/`running` →
+  `full_auto_chain.run_auto_tts_chain(job_id, call_budget)` →
+  `auto_full_render`/`done` (with the result attached), or `/error` with a
+  friendly message on FileNotFoundError / ValueError / RuntimeError /
+  `auto_cut.DraftValidationError` (plus a final `except Exception` so the
+  daemon thread never dies on unexpected errors). No new thread is spawned.
+- The `user_upload` path (and legacy jobs with no choice) is untouched — it
+  still stops at `upload_pipeline`/`done`; group D wires that path.
+- `pipeline/tests/test_full_auto_upload.py`: new `AutoFullRenderWireTest`
+  (2 HTTP tests using TestClient):
+  - POST /upload (auto_tts) → only the status endpoint is polled →
+    `auto_full_render` reaches `done`, `outputs/<job_id>/final_video.mp4`
+    exists, result carries voiceover+final;
+  - POST /upload (user_upload) → stays at `upload_pipeline`/`done`, no
+    `auto_full_render` stage, no `final_video.mp4`.
+- Full suite: **281 tests OK** (279 prior + 2).
+
 ## [FA-B3] — 2026-08-13 — Error-handling polish + complete failure-case suite for full_auto_chain (Full-Auto Pipeline)
 
 Group B's last chunk: robustness + tests only, no new feature. The two chain

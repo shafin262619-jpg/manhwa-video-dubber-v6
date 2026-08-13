@@ -14,37 +14,38 @@ FA-E1 → FA-E2 → FA-F1 → FA-F2। প্রতিটা চাংকের 
 `docs/FA_CHUNK_BATCH.md`। প্রতিটা চাংক শেষে `chunk-FA-<id>-done` ট্যাগ
 বসানো হবে।
 
-## স্ট্যাটাস: FA-B3 সম্পূর্ণ (গ্রুপ B সম্পূর্ণ)
+## স্ট্যাটাস: FA-C1 সম্পূর্ণ (auto_tts পাথ এখন end-to-end wired)
 
-**গ্রুপ B (orchestration wrapper, F3 সহ, দুটো পাথ) সম্পূর্ণ ও fully tested,
-standalone (app.py এখনো অপরিবর্তিত)।** `chunk-FA-B3-done` ট্যাগ বসানো
-হয়েছে।
+**গ্রুপ C-এর সবচেয়ে ঝুঁকিপূর্ণ চাংক (existing background-thread wiring
+বদলানো) সম্পূর্ণ ও fully tested।** `chunk-FA-C1-done` ট্যাগ বসানো হয়েছে।
 
-এই চাংকে যা হলো (শুধু robustness + টেস্ট, নতুন ফিচার না):
-- `run_auto_tts_chain()` / `run_user_upload_chain()` — দুটোতেই ভেতরের
-  প্রতিটা ধাপ থেকে আসা exception (FileNotFoundError, ValueError,
-  RuntimeError, `auto_cut.DraftValidationError`) caller পর্যন্ত propagate
-  হয়; কোনো silent swallow / bare `except: pass` নেই; মাঝ-চেইনে কোনো ধাপ
-  ব্যর্থ হলে পরের ধাপ চালানো হয় না।
-- `pipeline/full_auto_chain.py`-এ কোনো TODO/placeholder নেই।
-- `test_full_auto_chain.py` এখন সম্পূর্ণ failure-case টেস্ট স্যুট (৬টা):
-  happy path (দুটো), TTS total fail, draft validation fail, final render
-  fail, D3 align fail — প্রতিটাতে exception propagate + `final_video.mp4`
-  তৈরি না হওয়া যাচাই করা হয়। পুরো স্যুট এখন **২৭৯টা টেস্ট OK**
-  (২৭৫ + ৪)।
+এই চাংকে যা হলো:
+- `app.py`-এর `_run_upload_pipeline(job_id)` — পুরনো B1→B2→C1 চেইন শেষে
+  `upload_pipeline`/`done` লেখার পরে, `voice_source == "auto_tts"` হলে **একই
+  থ্রেডেই** (নতুন থ্রেড নয়) `auto_full_render`/`running` →
+  `full_auto_chain.run_auto_tts_chain(job_id, call_budget)` →
+  `auto_full_render`/`done` (result attached) চলে; ব্যর্থ হলে
+  FileNotFoundError / ValueError / RuntimeError / `auto_cut.DraftValidationError`
+  → `auto_full_render`/`error` (friendly message), এবং শেষের `except Exception`
+  দিয়ে নিশ্চিত করা হয়েছে daemon thread কখনো uncaught exception-এ মরে না যায়।
+- `user_upload` পাথ (ও কোনো choice ছাড়া পুরনো job) স্পর্শ করা হয়নি —
+  এখনো `upload_pipeline`/`done`-এই থামে; গ্রুপ D সেটা wire করবে।
+- টেস্ট: `AutoFullRenderWireTest` (২টা HTTP TestClient টেস্ট) — auto_tts →
+  শুধু `/api/jobs/{id}/status` পোল করে `auto_full_render` done +
+  `outputs/<job_id>/final_video.mp4` তৈরি যাচাই; user_upload →
+  `upload_pipeline`/`done`-এই থামা + কোনো `auto_full_render` stage নেই +
+  final_video নেই। পুরো স্যুট এখন **২৮১টা টেস্ট OK** (২৭৯ + ২)।
 
 ## পরের কাজ
 
-**গ্রুপ C (auto_tts পাথ HTTP-ওয়্যারিং, FA-C1 থেকে)।** বিস্তারিত
-`docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-C1 ---` সেকশনে। সবচেয়ে ঝুঁকিপূর্ণ
-চাংক — existing background-thread wiring বদলাচ্ছে:
-- `_run_upload_pipeline(job_id)`-এর একদম শেষে (upload_pipeline done লেখার
-  ঠিক পরে) `voice_source == "auto_tts"` হলে একই থ্রেডে (নতুন থ্রেড নয়)
-  `full_auto_chain.run_auto_tts_chain()` চালিয়ে `auto_full_render` stage-এ
-  running/done/error লিখতে হবে; `user_upload` পাথ স্পর্শ করা যাবে না।
-- টেস্ট: HTTP TestClient দিয়ে POST /upload (auto_tts) → শুধু status পোল →
-  `outputs/<job_id>/final_video.mp4` তৈরি; user_upload কেসে
-  `upload_pipeline`/`done`-এই থামা যাচাই।
+**FA-C2 (auto_tts-এর upload status/polling পেজ পোলিশ)।** বিস্তারিত
+`docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-C2 ---` সেকশনে। FA-C1-এ
+`auto_full_render` stage এর data সঠিকভাবে লেখা হচ্ছে; FA-C2-এ:
+- `/upload/{job_id}/status` পেজ (polling page) চালু অবস্থায়
+  `auto_full_render` stage দেখাতে হবে; `done` হলে
+  `/job/{job_id}/result`-এ যাওয়ার নির্দেশ; `error` হলে friendly message।
+- টেস্ট: user_upload-এ কোনো `auto_full_render` UI না দেখানো,
+  auto_tts-এ `done`/`error` UI সঠিকভাবে দেখানো যাচাই।
 
 পুরো data-flow/চলার নিয়ম: `docs/FINAL_SUMMARY.md`। চ্যাঞ্জলগ:
 `docs/CHANGELOG.md`।
