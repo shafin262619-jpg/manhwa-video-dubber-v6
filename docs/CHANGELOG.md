@@ -1,5 +1,27 @@
 # Manhwa Video Dubber — Changelog
 
+## [FA-B3] — 2026-08-13 — Error-handling polish + complete failure-case suite for full_auto_chain (Full-Auto Pipeline)
+
+Group B's last chunk: robustness + tests only, no new feature. The two chain
+functions already contained no try/except, so every stage's
+`FileNotFoundError` / `ValueError` / `RuntimeError` /
+`auto_cut.DraftValidationError` propagates straight to the caller (the group
+C/D wiring catches and persists them via job_status) — verified explicitly.
+
+- `pipeline/full_auto_chain.py`: confirmed no bare `except` / `pass` /
+  TODO / placeholder; a mid-chain failure stops the following steps
+  immediately (exception propagates, no partial/silent state).
+- `pipeline/tests/test_full_auto_chain.py`: now the complete final test
+  suite (6 tests):
+  - happy path for both chains (existing FA-B1/B2 tests);
+  - TTS complete failure (auto_tts chain) -> `RuntimeError` propagates, no
+    ffmpeg work runs, no `final_video.mp4`;
+  - draft validation failure -> `auto_cut.DraftValidationError` propagates,
+    `render_final.finalize_video` never called;
+  - final render (F3) failure -> propagates, no `final_video.mp4`;
+  - user_upload chain D3 align failure -> propagates, F3 never runs.
+- Full suite: **279 tests OK** (275 prior + 4).
+
 ## [FA-B2] — 2026-08-13 — run_user_upload_chain() — D3 to F3 in one function (Full-Auto Pipeline)
 
 The own-audio path used to require several manual clicks after the audio was

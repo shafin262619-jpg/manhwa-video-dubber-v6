@@ -203,5 +203,93 @@ class UserUploadChainTest(FullAutoChainBase):
             self.assertTrue((self.job_dir / name).exists(), f"missing {name}")
 
 
+class FailureCaseTest(FullAutoChainBase):
+    """FA-B3: every stage's exceptions propagate out of the chain uncaught.
+
+    A mid-chain failure must stop the following steps (no partial/silent
+    state), and nothing may be swallowed with a bare ``except: pass`` — the
+    caller (group C/D) is responsible for catching and reporting.
+    """
+
+    def _write_auto_inputs(self):
+        self._write_subtitles()
+        self._write_choice("auto_tts")
+        (self.job_dir / "source.mp4").write_bytes(b"fake-source")
+
+    def _write_user_inputs(self):
+        self._write_subtitles()
+        self._write_choice("user_upload")
+        (self.job_dir / "source.mp4").write_bytes(b"fake-source")
+        (self.job_dir / "voiceover_hi.wav").write_bytes(_wav_bytes(2.0))
+
+    def _assert_no_final_video(self):
+        self.assertFalse(
+            (self.output_root / self.job_id / "final_video.mp4").exists(),
+            "final_video.mp4 must NOT be produced when the chain fails",
+        )
+
+    def test_auto_tts_total_failure_propagates_and_stops_chain(self):
+        # D2 (TTS) completely fails -> the exception propagates out of the
+        # chain, no later stage runs and no final_video.mp4 is created.
+        self._write_auto_inputs()
+        with mock.patch.object(
+            voiceover_auto,
+            "generate_auto_voiceover",
+            side_effect=RuntimeError("all TTS keys exhausted"),
+        ), mock.patch.object(
+            auto_cut, "_run", side_effect=self._mock_auto_run([])
+        ) as run_mock:
+            with self.assertRaises(RuntimeError):
+                full_auto_chain.run_auto_tts_chain(self.job_id)
+        self._assert_no_final_video()
+        run_mock.assert_not_called()  # no ffmpeg work ran -> chain stopped
+
+    def test_draft_validation_failure_propagates_and_stops_chain(self):
+        # E2 (draft render) fails validation -> DraftValidationError
+        # propagates, F3 (finalize) is never called, no final video.
+        self._write_auto_inputs()
+        with mock.patch.object(
+            voiceover_auto, "_call_tts", return_value=_wav_bytes(1.0)
+        ), mock.patch.object(
+            auto_cut,
+            "build_draft_video",
+            side_effect=auto_cut.DraftValidationError("draft validation failed"),
+        ), mock.patch.object(render_final, "finalize_video") as finalize_mock:
+            with self.assertRaises(auto_cut.DraftValidationError):
+                full_auto_chain.run_auto_tts_chain(self.job_id)
+        self._assert_no_final_video()
+        finalize_mock.assert_not_called()
+
+    def test_final_render_failure_propagates_and_stops_chain(self):
+        # F3 (final render) fails (e.g. ffprobe duration mismatch) -> the
+        # RuntimeError propagates, no final_video.mp4 is produced.
+        self._write_auto_inputs()
+        with mock.patch.object(
+            voiceover_auto, "_call_tts", return_value=_wav_bytes(1.0)
+        ), mock.patch.object(
+            auto_cut, "_run", side_effect=self._mock_auto_run([])
+        ), mock.patch.object(
+            render_final,
+            "finalize_video",
+            side_effect=RuntimeError("ffprobe duration mismatch"),
+        ):
+            with self.assertRaises(RuntimeError):
+                full_auto_chain.run_auto_tts_chain(self.job_id)
+        self._assert_no_final_video()
+
+    def test_user_upload_align_failure_propagates_and_stops_chain(self):
+        # D3 (align) fails -> the exception propagates, F3 never runs.
+        self._write_user_inputs()
+        with mock.patch.object(
+            voiceover_upload,
+            "align_uploaded_voiceover",
+            side_effect=FileNotFoundError("no voiceover_hi.wav"),
+        ), mock.patch.object(render_final, "finalize_video") as finalize_mock:
+            with self.assertRaises(FileNotFoundError):
+                full_auto_chain.run_user_upload_chain(self.job_id)
+        self._assert_no_final_video()
+        finalize_mock.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

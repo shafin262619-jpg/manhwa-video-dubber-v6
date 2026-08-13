@@ -14,35 +14,37 @@ FA-E1 → FA-E2 → FA-F1 → FA-F2। প্রতিটা চাংকের 
 `docs/FA_CHUNK_BATCH.md`। প্রতিটা চাংক শেষে `chunk-FA-<id>-done` ট্যাগ
 বসানো হবে।
 
-## স্ট্যাটাস: FA-B2 সম্পূর্ণ
+## স্ট্যাটাস: FA-B3 সম্পূর্ণ (গ্রুপ B সম্পূর্ণ)
 
-**FA-B2 সম্পূর্ণ।** `chunk-FA-B2-done` ট্যাগ বসানো হয়েছে।
+**গ্রুপ B (orchestration wrapper, F3 সহ, দুটো পাথ) সম্পূর্ণ ও fully tested,
+standalone (app.py এখনো অপরিবর্তিত)।** `chunk-FA-B3-done` ট্যাগ বসানো
+হয়েছে।
 
-এই চাংকে যা হলো:
-- `pipeline/full_auto_chain.py`-তে `run_user_upload_chain(job_id)` ফাংশন —
-  D3 (`voiceover_upload.align_uploaded_voiceover`) → D4 → E1 → E2 → F3 —
-  রিটার্ন `{"alignment": <D3 result>, "final": <F3 result>}`।
-- Hard constraint: ফাংশন **অডিও সেভ করে না** — সেটা
-  `voiceover_upload.save_uploaded_voiceover()`-এর কাজ (গ্রুপ D-তে wire হবে),
-  শুধু ধরে নেয় `voiceover_hi.wav` ডিস্কে আছে। app.py স্পর্শ করা হয়নি।
-- টেস্ট: `test_full_auto_chain.py`-এ +১টা — আগে fake `voiceover_hi.wav` সেভ
-  করে, Gemini align mock করে `run_user_upload_chain(job_id)` সরাসরি কল,
-  `outputs/<job_id>/final_video.mp4` তৈরি হয় যাচাই করা। পুরো স্যুট এখন
-  **২৭৫টা টেস্ট OK** (২৭৪ + ১)।
+এই চাংকে যা হলো (শুধু robustness + টেস্ট, নতুন ফিচার না):
+- `run_auto_tts_chain()` / `run_user_upload_chain()` — দুটোতেই ভেতরের
+  প্রতিটা ধাপ থেকে আসা exception (FileNotFoundError, ValueError,
+  RuntimeError, `auto_cut.DraftValidationError`) caller পর্যন্ত propagate
+  হয়; কোনো silent swallow / bare `except: pass` নেই; মাঝ-চেইনে কোনো ধাপ
+  ব্যর্থ হলে পরের ধাপ চালানো হয় না।
+- `pipeline/full_auto_chain.py`-এ কোনো TODO/placeholder নেই।
+- `test_full_auto_chain.py` এখন সম্পূর্ণ failure-case টেস্ট স্যুট (৬টা):
+  happy path (দুটো), TTS total fail, draft validation fail, final render
+  fail, D3 align fail — প্রতিটাতে exception propagate + `final_video.mp4`
+  তৈরি না হওয়া যাচাই করা হয়। পুরো স্যুট এখন **২৭৯টা টেস্ট OK**
+  (২৭৫ + ৪)।
 
 ## পরের কাজ
 
-**FA-B3 (দুটো wrapper-এর error-handling + failure-case টেস্ট পলিশ, এখনো
-wiring না)।** বিস্তারিত `docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-B3 ---`
-সেকশনে। এই চাংক শুধু robustness + টেস্ট — নতুন ফিচার না:
-- `run_auto_tts_chain()` / `run_user_upload_chain()` — দুটোতেই
-  FileNotFoundError / ValueError / RuntimeError / `auto_cut.DraftValidationError`
-  caller পর্যন্ত propagate হয় (কোনো silent swallow / `except: pass` না)।
-- মাঝ-চেইনে কোনো ধাপ ব্যর্থ হলে পরের ধাপ চালানো হবে না (exception সাথে
-  সাথে propagate)।
-- `test_full_auto_chain.py`-কে সম্পূর্ণ failure-case টেস্ট স্যুট বানানো
-  (TTS fail, draft validation fail, final render fail, D3 align fail)। শেষে
-  `pipeline/full_auto_chain.py`-তে কোনো TODO/placeholder থাকবে না।
+**গ্রুপ C (auto_tts পাথ HTTP-ওয়্যারিং, FA-C1 থেকে)।** বিস্তারিত
+`docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-C1 ---` সেকশনে। সবচেয়ে ঝুঁকিপূর্ণ
+চাংক — existing background-thread wiring বদলাচ্ছে:
+- `_run_upload_pipeline(job_id)`-এর একদম শেষে (upload_pipeline done লেখার
+  ঠিক পরে) `voice_source == "auto_tts"` হলে একই থ্রেডে (নতুন থ্রেড নয়)
+  `full_auto_chain.run_auto_tts_chain()` চালিয়ে `auto_full_render` stage-এ
+  running/done/error লিখতে হবে; `user_upload` পাথ স্পর্শ করা যাবে না।
+- টেস্ট: HTTP TestClient দিয়ে POST /upload (auto_tts) → শুধু status পোল →
+  `outputs/<job_id>/final_video.mp4` তৈরি; user_upload কেসে
+  `upload_pipeline`/`done`-এই থামা যাচাই।
 
 পুরো data-flow/চলার নিয়ম: `docs/FINAL_SUMMARY.md`। চ্যাঞ্জলগ:
 `docs/CHANGELOG.md`।
