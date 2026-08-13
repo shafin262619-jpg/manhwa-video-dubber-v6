@@ -14,34 +14,35 @@ FA-E1 → FA-E2 → FA-F1 → FA-F2। প্রতিটা চাংকের 
 `docs/FA_CHUNK_BATCH.md`। প্রতিটা চাংক শেষে `chunk-FA-<id>-done` ট্যাগ
 বসানো হবে।
 
-## স্ট্যাটাস: FA-B1 সম্পূর্ণ
+## স্ট্যাটাস: FA-B2 সম্পূর্ণ
 
-**FA-B1 (auto_tts orchestration wrapper, F3 সহ) সম্পূর্ণ, standalone, এখনো
-app.py-তে wire হয়নি।** `chunk-FA-B1-done` ট্যাগ বসানো হয়েছে।
+**FA-B2 সম্পূর্ণ।** `chunk-FA-B2-done` ট্যাগ বসানো হয়েছে।
 
 এই চাংকে যা হলো:
-- নতুন ফাইল `pipeline/full_auto_chain.py`-এ `run_auto_tts_chain(job_id,
-  call_budget=None)` ফাংশন — D2 (`voiceover_auto.generate_auto_voiceover`)
-  → D4 (`voiceover_unify.unify_voiceover_timestamps`) → E1
-  (`edit_guideline.build_edit_guideline`) → E2 (`auto_cut.build_draft_video`)
-  → **F3 (`render_final.finalize_video`)** — এক ফাংশনে, রিটার্ন
-  `{"voiceover": <D2 result>, "final": <F3 result>}`।
-- Hard constraint: app.py স্পর্শ করা হয়নি — `_process_auto_tts` /
-  `_continue_from_voiceover` অপরিবর্তিত (backward-compat, FA-E1-এ ভেরিফাই
-  হবে)। নতুন ফাংশন এখনো কোনো route-এ কল হয়নি।
-- টেস্ট: `pipeline/tests/test_full_auto_chain.py` — Gemini TTS + ffmpeg mock
-  করে সরাসরি কল, `outputs/<job_id>/final_video.mp4` তৈরি হয় যাচাই করা।
-  পুরো স্যুট এখন **২৭৪টা টেস্ট OK** (২৭৩ + ১)।
+- `pipeline/full_auto_chain.py`-তে `run_user_upload_chain(job_id)` ফাংশন —
+  D3 (`voiceover_upload.align_uploaded_voiceover`) → D4 → E1 → E2 → F3 —
+  রিটার্ন `{"alignment": <D3 result>, "final": <F3 result>}`।
+- Hard constraint: ফাংশন **অডিও সেভ করে না** — সেটা
+  `voiceover_upload.save_uploaded_voiceover()`-এর কাজ (গ্রুপ D-তে wire হবে),
+  শুধু ধরে নেয় `voiceover_hi.wav` ডিস্কে আছে। app.py স্পর্শ করা হয়নি।
+- টেস্ট: `test_full_auto_chain.py`-এ +১টা — আগে fake `voiceover_hi.wav` সেভ
+  করে, Gemini align mock করে `run_user_upload_chain(job_id)` সরাসরি কল,
+  `outputs/<job_id>/final_video.mp4` তৈরি হয় যাচাই করা। পুরো স্যুট এখন
+  **২৭৫টা টেস্ট OK** (২৭৪ + ১)।
 
 ## পরের কাজ
 
-**FA-B2 (user_upload-এর জন্য একই প্যাটার্নের wrapper)।** বিস্তারিত
-`docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-B2 ---` সেকশনে।
-`pipeline/full_auto_chain.py`-তে `run_user_upload_chain(job_id)` যোগ করতে
-হবে — D3 (`voiceover_upload.align_uploaded_voiceover`) → D4 → E1 → E2 → F3,
-রিটার্ন `{"alignment": <D3 result>, "final": <F3 result>}`; অডিও সেভ এই
-ফাংশনের কাজ না (গ্রুপ D-তে wire হবে); app.py স্পর্শ করা যাবে না; টেস্ট +
-commit + push + `chunk-FA-B2-done` ট্যাগ।
+**FA-B3 (দুটো wrapper-এর error-handling + failure-case টেস্ট পলিশ, এখনো
+wiring না)।** বিস্তারিত `docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-B3 ---`
+সেকশনে। এই চাংক শুধু robustness + টেস্ট — নতুন ফিচার না:
+- `run_auto_tts_chain()` / `run_user_upload_chain()` — দুটোতেই
+  FileNotFoundError / ValueError / RuntimeError / `auto_cut.DraftValidationError`
+  caller পর্যন্ত propagate হয় (কোনো silent swallow / `except: pass` না)।
+- মাঝ-চেইনে কোনো ধাপ ব্যর্থ হলে পরের ধাপ চালানো হবে না (exception সাথে
+  সাথে propagate)।
+- `test_full_auto_chain.py`-কে সম্পূর্ণ failure-case টেস্ট স্যুট বানানো
+  (TTS fail, draft validation fail, final render fail, D3 align fail)। শেষে
+  `pipeline/full_auto_chain.py`-তে কোনো TODO/placeholder থাকবে না।
 
 পুরো data-flow/চলার নিয়ম: `docs/FINAL_SUMMARY.md`। চ্যাঞ্জলগ:
 `docs/CHANGELOG.md`।

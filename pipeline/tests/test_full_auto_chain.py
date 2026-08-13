@@ -21,6 +21,7 @@ from pipeline import (
     render_final,
     video_ingest,
     voiceover_auto,
+    voiceover_upload,
 )
 
 
@@ -157,6 +158,49 @@ class AutoTtsChainTest(FullAutoChainBase):
             any(arg.endswith("final_video.mp4") for cmd in ffmpeg_cmds for arg in cmd),
             "final render ffmpeg step ran",
         )
+
+
+class UserUploadChainTest(FullAutoChainBase):
+    def test_run_user_upload_chain_reaches_final_video(self):
+        # Precondition: voiceover_hi.wav is already saved (D3 alignment step
+        # reads it). We save a real silence wav, mock the Gemini align call,
+        # then run the whole D3 -> F3 chain directly.
+        self._write_subtitles()
+        self._write_choice("user_upload")
+        (self.job_dir / "source.mp4").write_bytes(b"fake-source")
+        (self.job_dir / "voiceover_hi.wav").write_bytes(_wav_bytes(2.0))
+
+        align_timestamps = [
+            {
+                "serial": 1, "start_sec": 0.0, "end_sec": 1.0,
+                "alignment_fallback": False, "alignment_source": "gemini",
+            },
+            {
+                "serial": 2, "start_sec": 1.0, "end_sec": 2.0,
+                "alignment_fallback": False, "alignment_source": "gemini",
+            },
+        ]
+        calls = []
+        with mock.patch.object(
+            voiceover_upload, "_gemini_align", return_value=align_timestamps
+        ), mock.patch.object(auto_cut, "_run", side_effect=self._mock_auto_run(calls)):
+            result = full_auto_chain.run_user_upload_chain(self.job_id)
+
+        self.assertIn("alignment", result)
+        self.assertIn("final", result)
+        self.assertEqual(result["alignment"]["status"], "ok")
+        self.assertEqual(result["final"]["status"], "ok")
+
+        final = self.output_root / self.job_id / "final_video.mp4"
+        self.assertTrue(final.exists(), "outputs/<job_id>/final_video.mp4 created")
+
+        for name in (
+            "timestamps_hi_upload.json",
+            "timestamps_hi_final.json",
+            "edit_guideline.json",
+            "draft_final_video.mp4",
+        ):
+            self.assertTrue((self.job_dir / name).exists(), f"missing {name}")
 
 
 if __name__ == "__main__":

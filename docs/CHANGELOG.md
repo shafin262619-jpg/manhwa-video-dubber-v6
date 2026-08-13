@@ -1,5 +1,26 @@
 # Manhwa Video Dubber — Changelog
 
+## [FA-B2] — 2026-08-13 — run_user_upload_chain() — D3 to F3 in one function (Full-Auto Pipeline)
+
+The own-audio path used to require several manual clicks after the audio was
+saved (align, then final). This chunk puts the whole post-save chain into one
+function (HTTP wiring comes in group D).
+
+- `pipeline/full_auto_chain.py`: new `run_user_upload_chain(job_id)` runs D3
+  (`voiceover_upload.align_uploaded_voiceover`) -> D4
+  (`voiceover_unify.unify_voiceover_timestamps`) -> E1
+  (`edit_guideline.build_edit_guideline`) -> E2 (`auto_cut.build_draft_video`)
+  -> F3 (`render_final.finalize_video`) and returns
+  `{"alignment": <D3 result>, "final": <F3 result>}`.
+- Hard constraints honored: the function does **not** save the audio (that
+  stays `voiceover_upload.save_uploaded_voiceover`'s job, wired in group D);
+  it only assumes `voiceover_hi.wav` is already on disk. `app.py` untouched.
+- `pipeline/tests/test_full_auto_chain.py`: +1 test — a fake
+  `voiceover_hi.wav` is saved first, the Gemini align call is mocked, then
+  `run_user_upload_chain(job_id)` is called directly and
+  `outputs/<job_id>/final_video.mp4` is asserted.
+- Full suite: **275 tests OK** (274 prior + 1).
+
 ## [FA-B1] — 2026-08-13 — run_auto_tts_chain() — D2 to F3 in one function (Full-Auto Pipeline)
 
 The F3 (final render) used to run only when the user manually visited
