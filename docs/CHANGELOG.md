@@ -1,5 +1,30 @@
 # Manhwa Video Dubber — Changelog
 
+## [FA-E2] — 2026-08-13 — Permanent E2E regression tests for both full-auto paths (Full-Auto Pipeline)
+
+Adds two permanent end-to-end regression tests that lock in the PRD's core
+claim (zero-click auto path, single-pause upload path) and prove the old
+manual routes are never needed on either path.
+
+- New `pipeline/tests/test_full_auto_orchestration.py` — HTTP-only
+  (`TestClient`), mocked Gemini/ffmpeg, D2 real-ffmpeg-silence pattern (same
+  deterministic setup as the G1 orchestration test):
+  - `test_auto_tts_zero_click_end_to_end` — POST /upload (auto_tts) → only
+    `GET /api/jobs/{id}/status` is polled (no other endpoint) → asserts the
+    stage-through `upload_pipeline → auto_full_render` → `GET /download/{job_id}`
+    serves the final video. A recording client proves `/choose`,
+    `/align_uploaded` and `/final` are never requested.
+  - `test_user_upload_single_pause_end_to_end` — POST /upload (user_upload)
+    → stops at `upload_pipeline`/`done` (no auto-continue, no final video) →
+    POST `/voiceover/{job_id}/upload` (fake wav) → `user_audio_pipeline`
+    done → final video downloadable. The same recording client proves
+    `/choose`, `/align_uploaded` and `/final` are never requested — the only
+    pause is the audio upload.
+- Hard constraint honored: the old `test_app_orchestration.py` (G1) is not
+  modified at all — it still passes on its own alongside the new E2E tests as
+  the backward-compat proof.
+- Full suite: **290 tests OK** (288 prior + 2 new).
+
 ## [FA-E1] — 2026-08-13 — Backward-compat audit + fixes (Full-Auto Pipeline)
 
 Verification chunk: confirms the old manual routes still coexist with the new

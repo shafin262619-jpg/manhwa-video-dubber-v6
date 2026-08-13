@@ -12,16 +12,16 @@ https://github.com/shafin262619-jpg/manhwa-video-dubber — অক্ষত র�
 FA-A1 → FA-B1 → FA-B2 → FA-B3 → FA-C1 → FA-C2 → FA-D1 → FA-D2 →
 FA-E1 → FA-E2 → FA-F1 → FA-F2। প্রতিটা চাংকের বিস্তারিত প্রম্পট:
 `docs/FA_CHUNK_BATCH.md`। প্রতিটা চাংক শেষে `chunk-FA-<id>-done` ট্যাগ
-বসানো হবে।
+বসানো হয়েছে।
 
-## স্ট্যাটাস: FA-E1 ব্যাকওয়ার্ড-কম্প্যাট অডিট সম্পূর্ণ — একটা বাগ পাওয়া ও ফিক্স করা হয়েছে
+## স্ট্যাটাস: গ্রুপ E সম্পূর্ণ — FA-E1 (ব্যাকওয়ার্ড-কম্প্যাট অডিট + ফিক্স) ও FA-E2 (permanent E2E টেস্ট)
 
-**`chunk-FA-E1-done` ট্যাগ বসানো হয়েছে।** গত সেশন FA-D2-এর ঠিক পরে
-থেমেছিল (FA-E1-এর মাঝখানে, docs আপডেটের সময়)। এই সেশনে tag history
-থেকে নিশ্চিত হয়েছি: `chunk-FA-D2-done` আছে, `chunk-FA-E1-done` নেই →
-FA-E1 শুরু থেকে সম্পূর্ণ করেছি।
+**`chunk-FA-E1-done` ও `chunk-FA-E2-done` ট্যাগ বসানো হয়েছে।** গত সেশন
+FA-D2-এর ঠিক পরে থেমেছিল (FA-E1-এর মাঝখানে, docs আপডেটের সময়) — এই
+সেশনে tag history থেকে নিশ্চিত হয়ে FA-E1 শুরু থেকে সম্পূর্ণ করেছি, তারপর
+FA-E2-ও। পুরো স্যুট এখন **২৯০টা টেস্ট OK**।
 
-### FA-E1 checklist ফলাফল (ডকুমেন্টেড)
+### FA-E1 (ব্যাকওয়ার্ড-কম্প্যাট অডিট) — checklist ফলাফল
 
 1. **Manual voice-source override resumable/idempotent** — ✓ (বাগ পাওয়া
    ও ফিক্স করা হয়েছে)। আগের কোডে `upload_status_page()` flat
@@ -57,23 +57,38 @@ FA-E1 শুরু থেকে সম্পূর্ণ করেছি।
 
 নতুন regression টেস্ট: `pipeline/tests/test_backward_compat_audit.py`
 (+৪টা HTTP টেস্ট — override-এর প্রতিটা কেস + পুরনো routes direct-URL
-flow)। পুরো স্যুট এখন **২৮৮টা টেস্ট OK** (২৮৪ পুরনো + ৪ নতুন)।
+flow)।
+
+### FA-E2 (permanent E2E regression টেস্ট)
+
+নতুন `pipeline/tests/test_full_auto_orchestration.py` (G1-এর মতোই
+HTTP-only, mocked Gemini/ffmpeg, D2 real-ffmpeg-silence প্যাটার্নে) —
+দুটো permanent end-to-end টেস্ট:
+
+- `test_auto_tts_zero_click_end_to_end` — POST /upload (auto_tts) → শুধু
+  `GET /api/jobs/{id}/status` পোল (অন্য কোনো endpoint কল না) → stage-through
+  `upload_pipeline → auto_full_render` যাচাই → `GET /download/{job_id}`
+  ফাইনাল ভিডিও ফেরায়। `/choose`, `/align_uploaded`, `/final` — কোনোটাই
+  কল হয়নি (recording client দিয়ে যাচাই করা)।
+- `test_user_upload_single_pause_end_to_end` — POST /upload (user_upload) →
+  `upload_pipeline` done-এই থামে (auto-continue না, final_video নেই) → POST
+  `/voiceover/{id}/upload` (fake wav) → `user_audio_pipeline` done → final
+  video downloadable। `/choose`, `/align_uploaded`, `/final` — কোনোটাই কল
+  হয়নি (single-pause claim-এর প্রমাণ)।
+- Hard constraint মেনে চলা হয়েছে: পুরনো `test_app_orchestration.py` এক
+  লাইনও বদলায়নি, এখনো আলাদাভাবে পাশ করে (ব্যাকওয়ার্ড-কম্প্যাট প্রমাণ)।
 
 ## পরের কাজ
 
-**গ্রুপ E-এর শেষ চাংক FA-E2 (permanent E2E regression টেস্ট স্যুট)।**
-বিস্তারিত `docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-E2 ---` সেকশনে:
-- FA-E2: নতুন `pipeline/tests/test_full_auto_orchestration.py` —
-  দুটো permanent end-to-end টেস্ট: (ক) auto_tts zero-click পাথ
-  (upload → শুধু status পোল → final video downloadable, stage-through
-  `upload_pipeline → auto_full_render` যাচাই); (খ) user_upload
-  single-pause পাথ (upload → upload_pipeline done-এ থামে → audio POST →
-  `user_audio_pipeline` done → final video downloadable, আর
-  `/choose`/`/align_uploaded`/`/final` — কোনোটাই কল হয়নি যাচাই)।
-  Hard constraint: পুরনো `test_app_orchestration.py` এক লাইনও বদলাবে না।
-- FA-F1: পুরো regression pass + `dry_run_check` CLI রান + py_compile।
+**গ্রুপ F (ফুল রিগ্রেশন + ফাইনাল wrap-up)।** বিস্তারিত
+`docs/FA_CHUNK_BATCH.md`-এর `--- CHUNK FA-F1 ---` এবং `--- CHUNK FA-F2 ---`
+সেকশনে:
+- FA-F1: পুরো test suite-এর regression pass + `python3 -m py_compile`
+  touched ফাইলগুলোতে + `python3 -m pipeline.dry_run_check --job-id <id>`
+  একটা fixture job-এ + চূড়ান্ত টেস্ট কাউন্ট ডকুমেন্ট।
 - FA-F2: ফাইনাল wrap-up — `docs/FINAL_SUMMARY.md`-এ "## Full-Auto
-  Pipeline (FA1-F2)" সেকশন + ব্যবহারকারীর নিজের real-media QA নোট।
+  Pipeline (FA1-F2)" সেকশন + ব্যবহারকারীর নিজের real-media QA নোট (তিনটা
+  point) + `manhwa-video-dubber-v6-full-auto-final` ট্যাগ।
 
 পুরো data-flow/চলার নিয়ম: `docs/FINAL_SUMMARY.md`। চ্যাঞ্জলগ:
 `docs/CHANGELOG.md`।
