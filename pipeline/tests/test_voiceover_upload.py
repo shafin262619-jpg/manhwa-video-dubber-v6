@@ -330,14 +330,20 @@ class VoiceoverUploadEndpointTest(VoiceoverUploadBase):
             _make_audio(path, duration_sec)
             return path.read_bytes()
 
-    def test_upload_endpoint_saves_and_links_alignment(self):
+    def test_upload_endpoint_saves_and_auto_continues(self):
+        # FA-D2: the upload POST now saves the audio and immediately shows the
+        # auto-continue polling page (user_audio_pipeline) — the old
+        # "Voiceover saved — Align subtitles" page is gone. The align route is
+        # still available manually (covered by test_align_page_*).
         res = self.client.post(
             f"/voiceover/{self.job_id}/upload",
             files={"audio": ("voice.wav", self.audio_bytes, "audio/wav")},
         )
         self.assertEqual(res.status_code, 200)
-        self.assertIn(f"/voiceover/{self.job_id}/align_uploaded", res.text)
         self.assertTrue((self.job_dir / "voiceover_hi.wav").exists())
+        self.assertIn("Processing your audio", res.text)
+        self.assertIn("user_audio_pipeline", res.text)
+        self.assertNotIn(f"/voiceover/{self.job_id}/align_uploaded", res.text)
 
     def test_upload_unsupported_format_400(self):
         res = self.client.post(

@@ -26,6 +26,7 @@ from pipeline import (
     translator,
     video_ingest,
     voiceover_auto,
+    voiceover_upload,
 )
 
 
@@ -190,6 +191,20 @@ class AutoFullRenderWireTest(unittest.TestCase):
                 voiceover_auto, "_call_tts", return_value=self.silence_bytes
             ),
             mock.patch.object(auto_cut, "_run", side_effect=self._fake_auto_run),
+            mock.patch.object(
+                voiceover_upload,
+                "_gemini_align",
+                return_value=[
+                    {
+                        "serial": 1, "start_sec": 0.0, "end_sec": 1.0,
+                        "alignment_fallback": False, "alignment_source": "gemini",
+                    },
+                    {
+                        "serial": 2, "start_sec": 1.0, "end_sec": 2.0,
+                        "alignment_fallback": False, "alignment_source": "gemini",
+                    },
+                ],
+            ),
         ]
         for patch in self._mocks:
             patch.start()
@@ -281,6 +296,33 @@ class AutoFullRenderWireTest(unittest.TestCase):
             (self.output_root / job_id / "final_video.mp4").exists(),
             "user_upload path stops at upload_pipeline done",
         )
+
+    def test_user_upload_audio_auto_continues_to_final_video(self):
+        # FA-D2: full end-to-end on the user_upload path — POST /upload, wait
+        # for B1/B2/C1, POST the audio, poll user_audio_pipeline, then the
+        # final video must be downloadable. Only /upload, the voiceover-upload
+        # POST, the status poll and /download are used.
+        res = self.client.post(
+            "/upload",
+            data={"voice_source": "user_upload"},
+            files={"file": ("sample.mp4", self.video_bytes, "video/mp4")},
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        job_id = res.json()["job_id"]
+        self._wait_for_stage(job_id, "upload_pipeline")
+
+        res = self.client.post(
+            f"/voiceover/{job_id}/upload",
+            files={"audio": ("voice.wav", self.silence_bytes, "audio/wav")},
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+
+        self._wait_for_stage(job_id, "user_audio_pipeline")
+
+        dl = self.client.get(f"/download/{job_id}")
+        self.assertEqual(dl.status_code, 200, "final video downloadable")
+        self.assertGreater(len(dl.content), 0, "download has content")
+        self.assertTrue((self.output_root / job_id / "final_video.mp4").exists())
 
     def test_auto_tts_status_page_shows_final_video_no_choose_link(self):
         # FA-C2: GET /upload/{job_id} must eventually show the final video

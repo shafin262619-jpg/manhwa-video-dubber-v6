@@ -321,6 +321,42 @@ def _run_final_render(job_id):
         )
 
 
+def _run_user_audio_pipeline(job_id):
+    """Run D3 -> D4 -> E1 -> E2 -> F3 on a background thread (FA-D2).
+
+    After the user uploads their own audio, this continues on its own daemon
+    thread so the job reaches the final video with no further clicks. Never
+    lets an exception escape the thread; failures are persisted as ``error``
+    status so the polling page can surface them.
+    """
+    try:
+        result = full_auto_chain.run_user_upload_chain(job_id)
+        job_status_store.write_status(
+            job_id, "user_audio_pipeline", "done", extra={"result": result}
+        )
+    except (
+        FileNotFoundError,
+        ValueError,
+        RuntimeError,
+        auto_cut.DraftValidationError,
+    ) as exc:
+        logger.error("user audio pipeline failed for job %s: %s", job_id, exc)
+        job_status_store.write_status(
+            job_id,
+            "user_audio_pipeline",
+            "error",
+            extra={"detail": _friendly_error(exc)},
+        )
+    except Exception as exc:  # noqa: BLE001 — daemon thread must never die
+        logger.exception("unexpected user-audio-pipeline failure for job %s", job_id)
+        job_status_store.write_status(
+            job_id,
+            "user_audio_pipeline",
+            "error",
+            extra={"detail": _friendly_error(exc)},
+        )
+
+
 def _polling_page(job_id, page_title, result_url, stage):
     """Intermediate HTML shown while a background stage runs (U1c).
 
@@ -440,6 +476,25 @@ def home() -> HTMLResponse:
     return HTMLResponse(ui.page("Manhwa Video Dubber", body))
 
 
+def _render_chain_final_result(job_id: str, stage: str) -> HTMLResponse:
+    """Render the final-video page from a full-auto chain stage's result.
+
+    Small adapter shared by the auto_tts (FA-C2) and user_audio (FA-D2)
+    paths: each chain stage stores ``{"result": {"voiceover"/"alignment": ...,
+    "final": <F3 result>}}``; this passes ``result.final`` into
+    :func:`_render_final_result`.
+    """
+    chain_result = (
+        job_status_store.read_status(job_id).get("stages", {}).get(stage, {}) or {}
+    ).get("result") or {}
+    final_result = (
+        chain_result.get("final")
+        if isinstance(chain_result, dict)
+        else None
+    )
+    return _render_final_result(job_id, result=final_result)
+
+
 @app.get("/upload/{job_id}", response_class=HTMLResponse)
 def upload_status_page(job_id: str) -> HTMLResponse:
     """Status/result page for the upload_pipeline stage (fixes UI2: the home
@@ -467,15 +522,18 @@ def upload_status_page(job_id: str) -> HTMLResponse:
                 job_id, "Uploading & Extracting", f"/upload/{job_id}",
                 "auto_full_render",
             )
-        chain_result = (
-            status.get("stages", {}).get("auto_full_render", {}) or {}
-        ).get("result") or {}
-        final_result = (
-            chain_result.get("final")
-            if isinstance(chain_result, dict)
-            else None
+        return _render_chain_final_result(job_id, "auto_full_render")
+
+    # FA-D2: after the user uploads their own audio the job continues (same
+    # page as the entry point): while user_audio_pipeline runs, stay on the
+    # polling page; once done, show the final video directly.
+    if status.get("stage") == "user_audio_pipeline":
+        if status.get("state") == "done":
+            return _render_chain_final_result(job_id, "user_audio_pipeline")
+        return _polling_page(
+            job_id, "Processing your audio", f"/upload/{job_id}",
+            "user_audio_pipeline",
         )
-        return _render_final_result(job_id, result=final_result)
 
     if not (status.get("stage") == "upload_pipeline" and status.get("state") == "done"):
         return _polling_page(
@@ -740,7 +798,7 @@ def download_voiceover_upload(job_id: str, format: str = Query("timestamps")) ->
 async def upload_voiceover(job_id: str, audio: UploadFile = File(...)) -> HTMLResponse:
     audio_bytes = await audio.read()
     try:
-        path = voiceover_upload.save_uploaded_voiceover(
+        voiceover_upload.save_uploaded_voiceover(
             job_id, audio_bytes, audio.filename
         )
     except FileNotFoundError as exc:
@@ -748,12 +806,14 @@ async def upload_voiceover(job_id: str, audio: UploadFile = File(...)) -> HTMLRe
     except (voiceover_upload.UnsupportedAudioError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    body = f"""<h1>Voiceover saved — job {job_id}</h1>
-  <p>Saved to <code>{path.name}</code>.</p>
-  <p><a href="/voiceover/{job_id}/align_uploaded">Align subtitles to this audio (D3)</a></p>
-  <p><a href="/voiceover/{job_id}/choose">Change voice source</a></p>
-  <p><a href="/">Back to home</a></p>"""
-    return HTMLResponse(ui.page(f"Voiceover Uploaded — Manhwa Video Dubber", body))
+    # FA-D2: the job auto-continues (D3 -> D4 -> E1 -> E2 -> F3) on a
+    # background thread, so the user just watches /upload/{job_id} land on the
+    # final video — no extra click. The /voiceover/{job_id}/align_uploaded
+    # route is kept for manual re-alignment (backward-compat).
+    _start_stage(job_id, "user_audio_pipeline", _run_user_audio_pipeline)
+    return _polling_page(
+        job_id, "Processing your audio", f"/upload/{job_id}", "user_audio_pipeline"
+    )
 
 
 @app.get("/voiceover/{job_id}/align_uploaded", response_class=HTMLResponse)

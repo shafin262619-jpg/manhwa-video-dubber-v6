@@ -1,5 +1,35 @@
 # Manhwa Video Dubber — Changelog
 
+## [FA-D2] — 2026-08-13 — Audio upload auto-continues to final video (single pause point complete, Full-Auto Pipeline)
+
+Group D done — the PRD's core requirement is now fully implemented: the
+user_upload path has exactly one stop (the audio upload), after which the job
+auto-continues to the final video.
+
+- `app.py` `upload_voiceover()`: after `save_uploaded_voiceover(...)` succeeds,
+  instead of the old "Voiceover saved — Align subtitles" page it now writes
+  `user_audio_pipeline`/`running` and starts a daemon thread
+  (`_start_stage(job_id, "user_audio_pipeline", _run_user_audio_pipeline)`)
+  that runs `full_auto_chain.run_user_upload_chain(job_id)` (D3 → D4 → E1 →
+  E2 → F3) and persists `done` (with the result) or `error` (friendly detail).
+  It returns the existing `_polling_page(..., "user_audio_pipeline")`.
+- `app.py` `upload_status_page()`: for the user_upload path, when
+  `user_audio_pipeline` is `done` it renders the final video player +
+  download link via the shared `_render_chain_final_result()` adapter (the
+  same one FA-C2 uses for `auto_full_render`); while `running` it shows the
+  polling page.
+- Hard constraints honored: `/voiceover/{job_id}/align_uploaded` route is NOT
+  deleted (manual re-align still works, verified by the existing
+  `test_align_page_*` tests); the thread never dies on uncaught exceptions
+  (try/except + `except Exception` per daemon-thread convention); the existing
+  `UnsupportedAudioError` format/size validation is unchanged.
+- Tests: +1 HTTP end-to-end in `test_full_auto_upload.py` — POST /upload
+  (user_upload) → poll B1/B2/C1 → POST /voiceover/{id}/upload (fake wav) →
+  poll `user_audio_pipeline` → `GET /download/{job_id}` returns content. Only
+  those endpoints are used. The old `test_voiceover_upload.py` upload-page
+  test now asserts the auto-continue polling page.
+- Full suite: **284 tests OK** (283 prior + 1 new; 1 updated).
+
 ## [FA-D1] — 2026-08-13 — Post-upload page shows audio-upload form directly for user_upload (Full-Auto Pipeline)
 
 Removes the redundant "choose voiceover source" click on the user_upload path
