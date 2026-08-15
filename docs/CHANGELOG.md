@@ -1,5 +1,26 @@
 # Manhwa Video Dubber — Changelog
 
+## [E3] — 2026-08-15 — full regression pass across groups A-E + fixes
+
+Third chunk of group E (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`).
+Verification-only — no new features, no production code changes.
+
+- **Full suite** (`python3 -m unittest discover -s pipeline/tests`): **356
+  tests OK** across groups A→E (A1/B1/B2/B3/B4/C1/C2/D1/D2/D3/E1/E2 plus the
+  whole pre-existing S1–F3 suite). Ran the full suite 3× total in this chunk's
+  verification window — every run 100% pass, no order-dependency/flakiness.
+  No regressions were found, so no bugfix was required.
+- `python3 -m py_compile` passed for every touched file: `app.py`,
+  `pipeline/config.py`, `pipeline/subtitle_builder.py`,
+  `pipeline/subtitle_extract.py`, `pipeline/subtitle_verify.py`,
+  `pipeline/subtitle_qa.py`.
+- **End-to-end sanity** (mocked Gemini/Whisper/ffmpeg, existing
+  `test_full_auto_orchestration.py` style) confirmed both headline user paths
+  still work: `test_auto_tts_zero_click_end_to_end` (upload → auto TTS → draft
+  → final, no clicks) and `test_user_upload_single_pause_end_to_end` (upload →
+  one pause at voice-source choice → user upload → final) both pass unchanged.
+- Final test count: **356 tests OK** (was 290 before groups A–E began).
+
 ## [E2] — 2026-08-15 — wire QA summary banner into `/voiceover/{id}/choose` (non-blocking) + `subtitle_qa.json` download route
 
 Second chunk of group E (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`).

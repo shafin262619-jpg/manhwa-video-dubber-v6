@@ -1,3 +1,3 @@
 # HANDOFF NEXT
 
-E2 (QA banner /voiceover/{id}/choose পেজে, /download/{id}/subtitle_qa রুট) সম্পূর্ণ। পরের কাজ: E3 (সম্পূর্ণ regression পাস, গ্রুপ A-D সব মিলিয়ে)।
+গ্রুপ A-E (subtitle-QA-fix) রিগ্রেশন-ভেরিফায়েড, টেস্ট কাউন্ট 356, ১০০% পাস। পরের কাজ: E4 (final wrap-up — FINAL_SUMMARY.md সেকশন + চূড়ান্ত ট্যাগ manhwa-video-dubber-v6-qa-final)।
