@@ -351,5 +351,96 @@ class InputErrorTest(AutoCutBase):
             auto_cut.build_draft_video(self.job_id, upload_root=self.upload_root)
 
 
+class FfmpegErrorExtractionTest(unittest.TestCase):
+    """E7 Fix C: the user-facing message must carry the real ffmpeg error
+    line, not the version banner."""
+
+    def _banner(self):
+        return (
+            "ffmpeg version 5.1.9-0+deb12u1 Copyright (c) 2000-2023 FFmpeg developers\n"
+            "  built with gcc 12 (Debian 12.2.0-14)\n"
+            "  configuration: --prefix=/usr --enable-gpl --enable-nonfree\n"
+            "  libavutil 57.28.100 / 57.28.100\n"
+            "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'source.mp4':\n"
+            "  Duration: 00:01:00.00, start: 0.000000, bitrate: 100 kb/s\n"
+            "  Stream #0:0[0x1](und): Video: h264 (High), yuv420p\n"
+        )
+
+    def test_returns_real_error_line_not_banner(self):
+        stderr = self._banner() + "-to value smaller than -ss; aborting\n"
+        self.assertEqual(
+            auto_cut._extract_ffmpeg_error(stderr),
+            "-to value smaller than -ss; aborting",
+        )
+
+    def test_error_hint_line_picked_over_plain_last_line(self):
+        stderr = self._banner() + "some informational line\n"
+        self.assertEqual(
+            auto_cut._extract_ffmpeg_error(stderr), "some informational line"
+        )
+
+    def test_last_line_fallback_for_empty_hint(self):
+        self.assertEqual(
+            auto_cut._extract_ffmpeg_error(""), "unknown ffmpeg error"
+        )
+        self.assertEqual(
+            auto_cut._extract_ffmpeg_error("  \n \n"), "unknown ffmpeg error"
+        )
+
+
+class DegenerateSegmentTest(AutoCutBase):
+    """E7 Fix A: a zero/negative source window must never reach ffmpeg's
+    ``-ss``/``-to`` (which aborts with "-to value smaller than -ss"); it is
+    replaced by a minimal real window stretched to the target duration."""
+
+    def _degenerate_entry(self, start=100.0, end=100.0, target=2.0):
+        return {
+            "serial": 1,
+            "source_start_sec": start,
+            "source_end_sec": end,
+            "target_start_sec": 0.0,
+            "target_end_sec": target,
+            "pts_multiplier": 1.0,
+            "flagged": True,
+            "flag_reason": "invalid_duration",
+        }
+
+    def test_degenerate_segment_uses_minimal_window(self):
+        self._write_inputs()
+        self._write_guideline([self._degenerate_entry()])
+
+        with self.assertLogs("pipeline.auto_cut", level="WARNING") as cm:
+            result, calls = self._run_with()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["clip_count"], 1)
+        self.assertTrue(
+            any("degenerate source segment" in line for line in cm.output)
+        )
+        clip = [c for c in calls if c[0] == "ffmpeg"][0]
+        # Source duration is 12.0 in the mock: the minimal window is clamped
+        # inside the source and stretched to the 2.0s target.
+        self.assertIn("11.950", clip)
+        self.assertIn("12.000", clip)
+        self.assertTrue(any(arg == "setpts=40.000000*PTS" for arg in clip))
+
+    def test_zero_target_degenerate_segment_still_renders(self):
+        self._write_inputs()
+        self._write_guideline([self._degenerate_entry(target=0.0)])
+        result, calls = self._run_with()
+        self.assertEqual(result["status"], "ok")
+        clip = [c for c in calls if c[0] == "ffmpeg"][0]
+        self.assertTrue(any(arg == "setpts=1.000000*PTS" for arg in clip))
+
+    def test_healthy_segment_unaffected(self):
+        self._write_inputs()
+        self._write_guideline([_entry(1, 0.0, 6.0, 1.0)])
+        _, calls = self._run_with()
+        clip = [c for c in calls if c[0] == "ffmpeg"][0]
+        self.assertIn("0.000", clip)
+        self.assertIn("6.000", clip)
+        self.assertTrue(any(arg == "setpts=1.000000*PTS" for arg in clip))
+
+
 if __name__ == "__main__":
     unittest.main()

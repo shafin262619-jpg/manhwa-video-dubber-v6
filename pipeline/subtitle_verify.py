@@ -31,7 +31,7 @@ def _write_result(job_dir, result):
         pass
 
 
-def _skipped_result(reason, covered_sec):
+def _skipped_result(reason, covered_sec, collision_clusters=None):
     return {
         "status": "skipped",
         "reason": reason,
@@ -39,6 +39,7 @@ def _skipped_result(reason, covered_sec):
         "extracted_covered_sec": round(float(covered_sec), 3),
         "coverage_ratio": None,
         "mismatch": False,
+        "collision_clusters": collision_clusters or [],
     }
 
 
@@ -61,6 +62,8 @@ def whisper_cross_check(job_id, upload_root=None, logger_=None):
                                (None when whisper_spoken_sec is zero),
             "mismatch": bool,   # True when the ratio is below
                                 # config.SUBTITLE_COVERAGE_MISMATCH_RATIO
+            "collision_clusters": <3+ collision clusters flagged by
+                                   subtitle_builder, or []> (E7),
         }
 
     Whisper missing or transcription failing (import/runtime error) returns
@@ -78,10 +81,12 @@ def whisper_cross_check(job_id, upload_root=None, logger_=None):
         covered_sec = float(qa.get("covered_duration_sec", 0.0))
     except (TypeError, ValueError):
         covered_sec = 0.0
+    collision_clusters = qa.get("collision_clusters") or []
 
     if not source_path.exists():
         log.warning("job %s: no source.mp4; skipping whisper cross-check", job_id)
-        result = _skipped_result("transcription_failed", covered_sec)
+        result = _skipped_result("transcription_failed", covered_sec,
+                                 collision_clusters)
         _write_result(job_dir, result)
         return result
 
@@ -90,7 +95,8 @@ def whisper_cross_check(job_id, upload_root=None, logger_=None):
         _convert_to_wav(source_path, wav_path)
     except Exception as exc:  # noqa: BLE001 - never raise
         log.error("job %s: whisper cross-check audio extraction failed: %s", job_id, exc)
-        result = _skipped_result("transcription_failed", covered_sec)
+        result = _skipped_result("transcription_failed", covered_sec,
+                                 collision_clusters)
         _write_result(job_dir, result)
         return result
 
@@ -98,7 +104,8 @@ def whisper_cross_check(job_id, upload_root=None, logger_=None):
         import whisper  # lazy: heavy optional dependency
     except ImportError as exc:
         log.error("job %s: whisper not installed; skipping cross-check: %s", job_id, exc)
-        result = _skipped_result("whisper_not_installed", covered_sec)
+        result = _skipped_result("whisper_not_installed", covered_sec,
+                                 collision_clusters)
         _write_result(job_dir, result)
         return result
 
@@ -107,7 +114,8 @@ def whisper_cross_check(job_id, upload_root=None, logger_=None):
         transcribed = model.transcribe(str(wav_path))
     except Exception as exc:  # noqa: BLE001 - never raise
         log.error("job %s: whisper transcription failed: %s", job_id, exc)
-        result = _skipped_result("transcription_failed", covered_sec)
+        result = _skipped_result("transcription_failed", covered_sec,
+                                 collision_clusters)
         _write_result(job_dir, result)
         return result
 
@@ -142,6 +150,7 @@ def whisper_cross_check(job_id, upload_root=None, logger_=None):
             round(coverage_ratio, 4) if coverage_ratio is not None else None
         ),
         "mismatch": mismatch,
+        "collision_clusters": collision_clusters,
     }
     log.info(
         "job %s: whisper cross-check %s (covered %.3f / spoken %.3f = %s)",

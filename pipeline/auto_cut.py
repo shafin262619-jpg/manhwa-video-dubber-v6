@@ -36,13 +36,50 @@ class DraftValidationError(Exception):
     """Raised when the rendered draft fails ffprobe validation."""
 
 
+_ERROR_HINTS = (
+    "error", "abort", "invalid", "failed", "no such", "cannot",
+    "not found", "unable", "does not", "unsupported",
+)
+
+
+def _extract_ffmpeg_error(stderr):
+    """Pull the meaningful error line out of an ffmpeg/ffprobe stderr dump.
+
+    ffmpeg prints a long version banner (``ffmpeg version ...``,
+    ``configuration: ...``) ahead of the actual failure. Taking the last
+    non-banner line that mentions a failure gives the user a readable message
+    (e.g. ``-to value smaller than -ss; aborting``) instead of the banner.
+    """
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    if not lines:
+        return "unknown ffmpeg error"
+    hits = []
+    for line in lines:
+        low = line.lower()
+        if (
+            low.startswith("ffmpeg version")
+            or low.startswith("configuration:")
+            or "built with" in low
+            or low.startswith("libavutil")
+            or low.startswith("libavcodec")
+        ):
+            continue
+        if any(hint in low for hint in _ERROR_HINTS):
+            hits.append(line)
+    if hits:
+        return hits[-1]
+    return lines[-1]
+
+
 def _run(cmd, timeout=config.RENDER_TIMEOUT_SEC):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, OSError) as exc:
         raise RuntimeError(f"ffmpeg/ffprobe failed: {exc}") from exc
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg/ffprobe error: {result.stderr.strip()}")
+        raise RuntimeError(
+            f"ffmpeg error: {_extract_ffmpeg_error(result.stderr)}"
+        )
     return result
 
 
@@ -271,8 +308,32 @@ def build_draft_video(job_id, upload_root=None):
         serial = entry.get("serial")
         start_sec = float(entry.get("source_start_sec", 0.0))
         end_sec = float(entry.get("source_end_sec", 0.0))
+        target_start_sec = float(entry.get("target_start_sec", 0.0))
+        target_end_sec = float(entry.get("target_end_sec", 0.0))
         pts_multiplier = float(entry.get("pts_multiplier", 1.0))
         out_path = clips_dir / f"serial_{index:05d}.mp4"
+
+        seg_duration = end_sec - start_sec
+        if seg_duration <= config.RENDER_MIN_SEGMENT_DURATION_SEC:
+            target_duration = target_end_sec - target_start_sec
+            logger.warning(
+                "job %s: serial %s degenerate source segment [%.3f..%.3f] "
+                "(%.4fs <= %.4fs); cutting minimal window and stretching to "
+                "target %.3fs so ffmpeg does not abort",
+                job_id, serial, start_sec, end_sec, seg_duration,
+                config.RENDER_MIN_SEGMENT_DURATION_SEC, target_duration,
+            )
+            min_window = config.RENDER_MIN_SEGMENT_DURATION_SEC
+            if expected_duration_sec > min_window:
+                cut_start = min(start_sec, expected_duration_sec - min_window)
+                cut_end = cut_start + min_window
+            else:
+                cut_start = 0.0
+                cut_end = expected_duration_sec
+            start_sec, end_sec = cut_start, cut_end
+            if target_duration > min_window:
+                pts_multiplier = target_duration / min_window
+
         logger.info(
             "job %s: cutting serial %s [%.3f..%.3f] pts x%.4f",
             job_id, serial, start_sec, end_sec, pts_multiplier,

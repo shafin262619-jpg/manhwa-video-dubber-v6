@@ -122,6 +122,13 @@ USER_UPLOAD_DURATION_TOLERANCE_RATIO = 0.05
 # Timeout (seconds) for each ffmpeg render step: clip / concat / mux (E2).
 RENDER_TIMEOUT_SEC = 600
 
+# A source segment shorter than this (seconds) is degenerate: ffmpeg aborts
+# with "-to value smaller than -ss" on a zero/negative window, which used to
+# crash the whole job after a subtitle zero-duration pile-up (E7). auto_cut
+# falls back to cutting a minimal real window and stretching it to the target
+# duration so the draft timeline stays intact instead of failing the job.
+RENDER_MIN_SEGMENT_DURATION_SEC = 0.05
+
 # Per-job cap on real Gemini API calls (extraction + translation + auto TTS
 # share one CallBudget for the whole job run, U2b). None = unlimited, which is
 # also the default when no call_budget is passed (existing callers unchanged).
@@ -140,6 +147,21 @@ SUBTITLE_GAP_FLAG_THRESHOLD_SEC = 6.0
 # they are never valid and must reach the repair pass (B2) so they cannot
 # leak into the final SRT.
 SUBTITLE_DUP_CLUSTER_MIN_COUNT = 3
+
+# Min consecutive raw subtitle entries whose timestamps collide with the
+# running end cursor (each start_sec < previous end_sec) to be treated as a
+# degenerate collision cluster (E7). Such runs are no longer clamped one-by-one
+# to the same timestamp (which collapsed them into a zero-duration pile-up and
+# later crashed the ffmpeg cut); they are redistributed with non-zero,
+# text-length-weighted durations during serialization instead.
+SUBTITLE_COLLISION_CLUSTER_MIN_COUNT = 3
+
+# Per-entry minimum duration (seconds) each entry of a redistributed collision
+# cluster is guaranteed (E7). Used both as the weighting floor when the next
+# anchor entry leaves enough room, and as the fallback duration when it does
+# not (0.8s is comfortably above the ffmpeg min-window guard so the rendered
+# clips are never degenerate).
+SUBTITLE_MIN_SERIAL_DURATION_SEC = 0.8
 
 # Max number of targeted re-extraction (Gemini) calls a single job's repair
 # pass may make, largest-flagged-range-first (QA repair, B2). Protects the

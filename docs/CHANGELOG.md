@@ -1,5 +1,75 @@
 # Manhwa Video Dubber — Changelog
 
+## [E7] — 2026-08-15 — cascade-crash fix: subtitle collision clusters are redistributed (no more zero-length ffmpeg cuts)
+
+Real-media QA whole-job crash, reported from job
+`97a9b90e-71f4-4d64-931d-b1b5cd194ce2`:
+
+```
+subtitle serial 44 overlap: start 60.000s clamped to previous end 100.000s
+subtitle serial 44 zero/negative duration after clamp (start 100.000s, original end 61.000s)
+... (serial 45-70 the same)
+edit_guideline: serial 44 invalid duration (source 0.000s, target X.Xs); using pts_multiplier 1.0
+auto_cut: cutting serial 44 [100.000..100.000] pts x1.0000
+ffmpeg: -to value smaller than -ss; aborting
+ERROR app: user audio pipeline failed for job ...
+```
+
+A long raw subtitle entry ending at 100s followed by 27+ entries whose raw
+starts (60..86s) all collided with it. `subtitle_builder._serialize` clamped
+each one to `prev_end` one at a time, so every entry collapsed to the same
+zero-length `[100.000..100.000]` timestamp. That leaked through to
+`edit_guideline.json` as `source_duration = 0` and to `auto_cut`, where ffmpeg
+aborted on the zero/negative `-to` window and the whole job died (the user only
+saw "Something went wrong" plus the ffmpeg version banner).
+
+Three fixes:
+
+- **Fix B (root cause) — `pipeline/subtitle_builder.py`**: runs of
+  `SUBTITLE_COLLISION_CLUSTER_MIN_COUNT`+ (default 3) consecutive raw entries
+  that collide with the running end cursor are now detected during
+  serialization and redistributed as one cluster via
+  `_redistribute_collision_cluster` — each entry gets a **non-zero** duration,
+  text-length-weighted, inside `[window_start, next_anchor]` when there is
+  room, otherwise a per-entry fallback minimum
+  (`SUBTITLE_MIN_SERIAL_DURATION_SEC = 0.8s`). Small 1-2 entry overlaps keep
+  the legacy clamp. New `detect_collision_clusters()` flags 3+ collision runs
+  as a distinct QA diagnostic (`reason: "collision_cluster"`) in
+  `subtitle_qa.json` (and surfaced in `subtitle_verify.py`'s whisper
+  cross-check result), separate from `duplicate_clusters`.
+- **Fix A (crash guard) — `pipeline/auto_cut.py`**: before invoking ffmpeg,
+  a source segment whose duration is `<= RENDER_MIN_SEGMENT_DURATION_SEC`
+  (0.05s) is replaced by a minimal real window clamped inside the source and
+  stretched (`setpts`) to the target duration, so `-to value smaller than -ss`
+  can never happen and the draft timeline stays intact.
+- **Fix C (readable errors) — `pipeline/auto_cut.py`**: `_extract_ffmpeg_error`
+  pulls the actual error line out of the ffmpeg stderr dump (skipping the
+  `ffmpeg version`/`configuration` banner) so the user-facing message is e.g.
+  `ffmpeg error: -to value smaller than -ss; aborting` instead of the banner.
+- **Files**: `pipeline/subtitle_builder.py`, `pipeline/auto_cut.py`,
+  `pipeline/subtitle_verify.py`, `pipeline/config.py` (new
+  `RENDER_MIN_SEGMENT_DURATION_SEC`, `SUBTITLE_COLLISION_CLUSTER_MIN_COUNT`,
+  `SUBTITLE_MIN_SERIAL_DURATION_SEC`).
+- **Regression tests** (+16):
+  - `pipeline/tests/test_cascade_crash_regression.py` drives the exact
+    reported pattern (a 100s-spanning entry + 27 colliding entries) through
+    subtitle_builder → edit_guideline → auto_cut (ffmpeg mocked) and asserts
+    (ক) no zero/negative-duration entry in subtitle_builder output, (খ)
+    auto_cut never throws, (গ) the job completes `status: "ok"` with every
+    clip cut using a strictly positive `[start, end)` window.
+  - `pipeline/tests/test_subtitle_builder.py`
+    (`CollisionClusterRedistributionTest`): 27-entry run redistributed over
+    `[100, 121.6]` with the 0.8s minimum each; text-length-weighted
+    redistribution into an anchor window; 2-entry overlaps keep the legacy
+    clamp; `DetectCollisionClustersTest` (flag/floor/config);
+    `CollisionClusterQaTest` (QA artifact carries `collision_clusters`).
+  - `pipeline/tests/test_auto_cut.py`: `FfmpegErrorExtractionTest`
+    (banner-free error line); `DegenerateSegmentTest` (zero-window segment is
+    cut as a minimal real window stretched to the target, healthy segments
+    unaffected).
+- Full suite: **382 tests OK** (was 366; +16).
+- Tag: `manhwa-video-dubber-v6-cascade-crash-fix`.
+
 ## [E6] — 2026-08-15 — draft duration-validation fix: validate against the source video (single source of truth) + loose user_upload tolerance
 
 Real-media QA audio-upload validation bug, reported from job

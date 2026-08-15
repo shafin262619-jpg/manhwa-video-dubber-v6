@@ -966,5 +966,202 @@ class RepairSrtWritebackRegressionTest(SubtitleBuilderBase):
             )
 
 
+class CollisionClusterRedistributionTest(unittest.TestCase):
+    """E7: a 3+ consecutive overlap run must be redistributed with non-zero
+    durations instead of collapsing into a zero-duration pile-up (the source
+    of the ffmpeg "-to value smaller than -ss" job crash)."""
+
+    def _entry(self, start, end, text="x"):
+        return {"text_zh": text, "status": "ok", "start_sec": start, "end_sec": end}
+
+    def _assert_valid_timeline(self, result):
+        serials = [e["serial"] for e in result]
+        self.assertEqual(serials, list(range(1, len(result) + 1)))
+        for e in result:
+            self.assertGreater(
+                e["end_sec"], e["start_sec"],
+                f"zero/negative-duration entry leaked: {e}",
+            )
+        for prev, nxt in zip(result, result[1:]):
+            self.assertGreaterEqual(nxt["start_sec"], prev["end_sec"])
+
+    def test_twenty_seven_entry_collision_run_redistributed(self):
+        # Replicates the reported QA log: a long entry ending at 100s followed
+        # by 27 entries whose raw starts (60..86s) all collide with it.
+        entries = [self._entry(0.0, 2.0, "a"), self._entry(3.0, 100.0, "b")]
+        for k in range(27):
+            s = 60.0 + k
+            entries.append(self._entry(s, s + 1.0, f"line-{k}"))
+
+        with self.assertLogs("pipeline.subtitle_builder", level="WARNING") as cm:
+            result = subtitle_builder._serialize(entries)
+
+        self.assertEqual(len(result), 29)
+        self._assert_valid_timeline(result)
+        self.assertTrue(
+            any("collision cluster" in line for line in cm.output)
+        )
+        # First cluster entry starts exactly at the previous end; every entry
+        # gets the per-entry fallback minimum (no anchor after the run).
+        self.assertEqual(result[2]["start_sec"], 100.0)
+        self.assertAlmostEqual(
+            result[2]["end_sec"] - result[2]["start_sec"],
+            subtitle_builder.config.SUBTITLE_MIN_SERIAL_DURATION_SEC,
+            places=2,
+        )
+        self.assertAlmostEqual(result[-1]["end_sec"], 121.6, places=2)
+
+    def test_weighted_redistribution_fits_anchor_window(self):
+        # 3 colliding entries sit between a previous entry ending at 100 and an
+        # anchor at 150: the cluster is redistributed across [100, 150] with
+        # text-length-weighted durations.
+        entries = [
+            self._entry(0.0, 2.0, "a"),
+            self._entry(50.0, 100.0, "b"),
+            self._entry(60.0, 61.0, "c"),
+            self._entry(61.0, 62.0, "dd"),
+            self._entry(62.0, 63.0, "eee"),
+            self._entry(150.0, 160.0, "f"),
+        ]
+        result = subtitle_builder._serialize(entries)
+
+        self.assertEqual(len(result), 6)
+        self._assert_valid_timeline(result)
+        self.assertEqual(result[2]["start_sec"], 100.0)
+        self.assertAlmostEqual(result[4]["end_sec"], 150.0, places=2)
+        # Longer text gets a longer duration: "eee" > "dd" > "c".
+        dur = [round(e["end_sec"] - e["start_sec"], 3) for e in result[2:5]]
+        self.assertGreater(dur[2], dur[1])
+        self.assertGreater(dur[1], dur[0])
+
+    def test_small_overlap_keeps_old_clamp(self):
+        # A 2-entry overlap (below the cluster floor) keeps the legacy
+        # clamp-to-prev-end behaviour, including the induced zero-duration.
+        entries = [
+            self._entry(0.0, 2.0, "a"),
+            self._entry(1.5, 1.2, "b"),
+            self._entry(2.5, 3.0, "c"),
+        ]
+        with self.assertLogs("pipeline.subtitle_builder", level="WARNING") as cm:
+            result = subtitle_builder._serialize(entries)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[1]["start_sec"], 2.0)
+        self.assertEqual(result[1]["end_sec"], 2.0)
+        self.assertTrue(
+            any("zero/negative duration after clamp" in line for line in cm.output)
+        )
+
+
+class DetectCollisionClustersTest(unittest.TestCase):
+    def _entry(self, start, end):
+        return {"text_zh": "x", "status": "ok", "start_sec": start, "end_sec": end}
+
+    def test_three_plus_colliding_run_flagged(self):
+        entries = [
+            self._entry(0.0, 2.0),
+            self._entry(50.0, 100.0),
+            self._entry(60.0, 61.0),
+            self._entry(61.0, 62.0),
+            self._entry(62.0, 63.0),
+        ]
+        clusters = subtitle_builder.detect_collision_clusters(entries)
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(
+            clusters[0],
+            {
+                "start_serial": 3,
+                "end_serial": 5,
+                "start_sec": 60.0,
+                "count": 3,
+                "reason": "collision_cluster",
+            },
+        )
+
+    def test_clean_input_not_flagged(self):
+        entries = [
+            self._entry(0.0, 2.0),
+            self._entry(3.0, 5.0),
+            self._entry(5.2, 7.0),
+        ]
+        self.assertEqual(subtitle_builder.detect_collision_clusters(entries), [])
+
+    def test_below_min_count_not_flagged(self):
+        entries = [
+            self._entry(0.0, 2.0),
+            self._entry(50.0, 100.0),
+            self._entry(60.0, 61.0),
+            self._entry(61.0, 62.0),
+        ]
+        self.assertEqual(subtitle_builder.detect_collision_clusters(entries), [])
+
+    def test_custom_min_count_override(self):
+        entries = [
+            self._entry(0.0, 2.0),
+            self._entry(50.0, 100.0),
+            self._entry(60.0, 61.0),
+            self._entry(61.0, 62.0),
+        ]
+        self.assertEqual(
+            subtitle_builder.detect_collision_clusters(entries, min_count=2)[0]["count"],
+            2,
+        )
+        self.assertEqual(
+            subtitle_builder.detect_collision_clusters(entries, min_count=4), []
+        )
+
+    def test_default_min_count_reads_config(self):
+        entries = [
+            self._entry(0.0, 2.0),
+            self._entry(50.0, 100.0),
+            self._entry(60.0, 61.0),
+            self._entry(61.0, 62.0),
+        ]
+        with mock.patch(
+            "pipeline.config.SUBTITLE_COLLISION_CLUSTER_MIN_COUNT", 2
+        ):
+            self.assertEqual(
+                len(subtitle_builder.detect_collision_clusters(entries)), 1
+            )
+
+
+class CollisionClusterQaTest(SubtitleBuilderBase):
+    def _read_qa(self):
+        return json.loads(
+            (self.job_dir / "subtitle_qa.json").read_text(encoding="utf-8")
+        )
+
+    def test_qa_flags_collision_cluster_and_output_is_clean(self):
+        self._write_meta(130.0)
+        raw_subs = [
+            {"text": "a", "start_sec": 0.0, "end_sec": 2.0},
+            {"text": "b", "start_sec": 3.0, "end_sec": 100.0},
+        ]
+        for k in range(27):
+            s = 60.0 + k
+            raw_subs.append({"text": f"line-{k}", "start_sec": s, "end_sec": s + 1.0})
+        self._write_raw(
+            {
+                "job_id": self.job_id,
+                "status": "ok",
+                "chunked": False,
+                "segments_count": 1,
+                "failed_segments": [],
+                "subtitles": raw_subs,
+            }
+        )
+        result = subtitle_builder.build_subtitle_list(
+            self.job_id, upload_root=self.upload_root, auto_repair=False
+        )
+
+        for e in result:
+            self.assertGreater(e["end_sec"], e["start_sec"])
+        qa = self._read_qa()
+        self.assertEqual(qa["duplicate_clusters"], [])
+        self.assertTrue(
+            any(c["reason"] == "collision_cluster" for c in qa["collision_clusters"])
+        )
+        self.assertEqual(len(qa["collision_clusters"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

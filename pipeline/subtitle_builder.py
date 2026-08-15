@@ -113,43 +113,135 @@ def _build_entries(raw, duration):
     return entries
 
 
+def _redistribute_collision_cluster(entries, window_start, anchor_start,
+                                    first_serial):
+    """Give a 3+ collision cluster non-zero, text-length-weighted durations.
+
+    ``window_start`` is the running end cursor the raw entries collided with.
+    When the next non-colliding entry (``anchor_start``, or ``None`` at end of
+    list) leaves enough room for every entry to get at least
+    ``SUBTITLE_MIN_SERIAL_DURATION_SEC``, the window is
+    ``[window_start, anchor_start]`` and each entry gets a duration weighted by
+    its text length (floored at the minimum). Otherwise the window is
+    ``[window_start, window_start + n * min_duration]`` and every entry gets
+    exactly the per-entry minimum fallback.
+
+    This replaces the old behaviour of clamping every entry to ``prev_end``,
+    which collapsed 20+ consecutive subtitles onto a single zero-length
+    timestamp (the ffmpeg "-to value smaller than -ss" crash, E7).
+
+    Returns ``(new_entries, next_serial, window_end)`` where ``new_entries``
+    carry fresh serials starting at ``first_serial``.
+    """
+    n = len(entries)
+    min_dur = config.SUBTITLE_MIN_SERIAL_DURATION_SEC
+    if anchor_start is not None and (anchor_start - window_start) >= n * min_dur:
+        window_end = anchor_start
+        weights = [
+            max(1.0, float(len(str(e.get("text_zh", "")).strip())))
+            for e in entries
+        ]
+        total = sum(weights)
+        width = window_end - window_start
+        durations = [max(min_dur, width * w / total) for w in weights]
+        total_dur = sum(durations)
+        above_floor = total_dur - n * min_dur
+        if total_dur > width and above_floor > 1e-9:
+            scale = (width - n * min_dur) / above_floor
+            durations = [min_dur + (d - min_dur) * scale for d in durations]
+    else:
+        window_end = window_start + n * min_dur
+        durations = [min_dur] * n
+
+    logger.warning(
+        "subtitle collision cluster: serials %d-%d (%d entries) at %.3fs "
+        "redistributed across [%.3fs, %.3fs] (min %.3fs each)",
+        first_serial, first_serial + n - 1, n, window_start,
+        window_start, window_end, min_dur,
+    )
+
+    cursor = window_start
+    out = []
+    for entry, dur in zip(entries, durations):
+        end = cursor + dur
+        out.append(
+            {
+                "serial": first_serial,
+                "text_zh": entry["text_zh"],
+                "start_sec": round(cursor, 3),
+                "end_sec": round(end, 3),
+                "status": entry["status"],
+            }
+        )
+        first_serial += 1
+        cursor = end
+    return out, first_serial, cursor
+
+
 def _serialize(entries):
-    """Sort chronologically, assign serials, clamp overlaps, log fixes."""
+    """Sort chronologically, assign serials, clamp overlaps, log fixes.
+
+    Runs of ``SUBTITLE_COLLISION_CLUSTER_MIN_COUNT``+ consecutive raw entries
+    that collide with the running end cursor are redistributed as one cluster
+    (see :func:`_redistribute_collision_cluster`) so they never collapse into
+    a zero-duration pile-up. Smaller overlaps keep the original clamp.
+    """
+    min_cluster = config.SUBTITLE_COLLISION_CLUSTER_MIN_COUNT
     entries = sorted(entries, key=lambda e: (e["start_sec"], e["end_sec"]))
     out = []
     prev_end = None
-    for index, entry in enumerate(entries, start=1):
+    serial = 1
+    i = 0
+    n = len(entries)
+    while i < n:
+        entry = entries[i]
         start = float(entry["start_sec"])
         end = float(entry["end_sec"])
         raw_zero_duration = start == end
         if prev_end is not None and start < prev_end:
+            j = i + 1
+            while j < n and float(entries[j]["start_sec"]) < prev_end:
+                j += 1
+            cluster = entries[i:j]
+            if len(cluster) >= min_cluster:
+                anchor_start = (
+                    float(entries[j]["start_sec"]) if j < n else None
+                )
+                new_entries, serial, prev_end = _redistribute_collision_cluster(
+                    cluster, prev_end, anchor_start, serial,
+                )
+                out.extend(new_entries)
+                i = j
+                continue
             logger.warning(
                 "subtitle serial %d overlap: start %.3fs clamped to previous end %.3fs",
-                index, start, prev_end,
+                serial, start, prev_end,
             )
             start = prev_end
         if end < start:
             logger.warning(
                 "subtitle serial %d zero/negative duration after clamp "
                 "(start %.3fs, original end %.3fs)",
-                index, start, entry["end_sec"],
+                serial, start, entry["end_sec"],
             )
             end = start
         elif raw_zero_duration:
             logger.warning(
                 "subtitle serial %d zero-duration entry (start %.3fs, end %.3fs)",
-                index, start, end,
+                serial, start, end,
             )
         prev_end = end
         out.append(
             {
-                "serial": index,
+                "serial": serial,
                 "text_zh": entry["text_zh"],
                 "start_sec": round(start, 3),
                 "end_sec": round(end, 3),
                 "status": entry["status"],
             }
         )
+        serial += 1
+        i += 1
     return out
 
 
@@ -212,6 +304,58 @@ def detect_duplicate_clusters(serialized_entries, min_count=None):
                 }
             )
         i = j
+    return clusters
+
+
+def detect_collision_clusters(entries, min_count=None):
+    """Flag runs of 3+ raw entries colliding with the running end cursor.
+
+    Operates on PRE-serialization raw entries (each dict needs ``text_zh``,
+    ``start_sec``, ``end_sec``). A collision run is consecutive sorted entries
+    whose ``start_sec < running end`` — the pattern that used to pile up into
+    a zero-duration cluster during serialization (E7). After serialization the
+    overlap is already resolved by :func:`_redistribute_collision_cluster`, so
+    this is a distinct QA diagnostic (reason ``"collision_cluster"``) from
+    :func:`detect_duplicate_clusters`, which scans post-serialize output.
+
+    Returns clusters in serial order:
+        {"start_serial", "end_serial", "start_sec", "count",
+         "reason": "collision_cluster"}
+    ``min_count`` defaults to ``config.SUBTITLE_COLLISION_CLUSTER_MIN_COUNT``.
+    """
+    if min_count is None:
+        min_count = config.SUBTITLE_COLLISION_CLUSTER_MIN_COUNT
+
+    ordered = sorted(entries, key=lambda e: (e["start_sec"], e["end_sec"]))
+    clusters = []
+    prev_end = None
+    i = 0
+    n = len(ordered)
+    while i < n:
+        start = float(ordered[i]["start_sec"])
+        end = float(ordered[i]["end_sec"])
+        if prev_end is not None and start < prev_end:
+            j = i + 1
+            while j < n and float(ordered[j]["start_sec"]) < prev_end:
+                j += 1
+            if (j - i) >= min_count:
+                clusters.append(
+                    {
+                        "start_serial": i + 1,
+                        "end_serial": j,
+                        "start_sec": start,
+                        "count": j - i,
+                        "reason": "collision_cluster",
+                    }
+                )
+            cluster_max_end = max(
+                float(e["end_sec"]) for e in ordered[i:j]
+            )
+            prev_end = max(prev_end, cluster_max_end)
+            i = j
+            continue
+        prev_end = end
+        i += 1
     return clusters
 
 
@@ -397,6 +541,7 @@ def build_subtitle_list(job_id, upload_root=None, call_budget=None, auto_repair=
     meta = _load_json_optional(job_dir / "job_meta.json")
     duration = _duration_of(meta, raw.get("subtitles", []))
     entries = _build_entries(raw, duration)
+    collision_clusters = detect_collision_clusters(entries)
 
     repair_summary = None
     if auto_repair:
@@ -428,6 +573,7 @@ def build_subtitle_list(job_id, upload_root=None, call_budget=None, auto_repair=
         "entries_count": len(result),
         "gaps": gaps,
         "duplicate_clusters": duplicate_clusters,
+        "collision_clusters": collision_clusters,
     }
     if repair_summary is not None:
         diagnostics["repair"] = repair_summary
@@ -473,6 +619,7 @@ def load_subtitle_qa(job_id, upload_root=None):
             "entries_count": 0,
             "gaps": [],
             "duplicate_clusters": [],
+            "collision_clusters": [],
         }
     try:
         data = _load_json(path)
@@ -487,10 +634,13 @@ def load_subtitle_qa(job_id, upload_root=None):
         "entries_count": 0,
         "gaps": [],
         "duplicate_clusters": [],
+        "collision_clusters": [],
     }
     defaults.update(data)
     if not isinstance(defaults["gaps"], list):
         defaults["gaps"] = []
     if not isinstance(defaults["duplicate_clusters"], list):
         defaults["duplicate_clusters"] = []
+    if not isinstance(defaults["collision_clusters"], list):
+        defaults["collision_clusters"] = []
     return defaults
