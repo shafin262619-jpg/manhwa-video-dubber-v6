@@ -122,9 +122,12 @@ MAX_API_CALLS_PER_JOB = None
 # are flagged as possible missing content (QA diagnostics, A1).
 SUBTITLE_GAP_FLAG_THRESHOLD_SEC = 6.0
 
-# 3+ consecutive serialized subtitle entries sharing the same start_sec (or
-# zero-duration) are flagged as a degenerate extraction cluster (QA
-# diagnostics, A2).
+# Consecutive serialized subtitle entries sharing the same start_sec are
+# flagged as a degenerate extraction cluster only when at least this many
+# consecutive entries are involved (QA diagnostics, A2). Zero-duration
+# entries (start_sec == end_sec) are ALWAYS flagged, even a single one —
+# they are never valid and must reach the repair pass (B2) so they cannot
+# leak into the final SRT.
 SUBTITLE_DUP_CLUSTER_MIN_COUNT = 3
 
 # Max number of targeted re-extraction (Gemini) calls a single job's repair

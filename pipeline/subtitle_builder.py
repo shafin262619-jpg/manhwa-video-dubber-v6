@@ -161,7 +161,12 @@ def detect_duplicate_clusters(serialized_entries, min_count=None):
     zero-duration (``start_sec == end_sec``). When ``min_count`` is None,
     ``config.SUBTITLE_DUP_CLUSTER_MIN_COUNT`` is used (default 3).
 
-    Each flagged cluster (3+ consecutive entries) is returned in serial order:
+    A zero-duration run is flagged even when it is a single entry — a
+    zero-duration subtitle is always degenerate and would otherwise silently
+    leak through into the final SRT (QA repair, B2). Same-start-timestamp
+    runs still require ``min_count`` (default 3+) consecutive entries.
+
+    Each flagged cluster is returned in serial order:
         {"start_serial", "end_serial", "start_sec", "count",
          "reason": "same_start_timestamp" | "zero_duration"}
     A run that qualifies under both reasons is reported as "zero_duration"
@@ -196,7 +201,7 @@ def detect_duplicate_clusters(serialized_entries, min_count=None):
                 else:
                     break
         count = j - i
-        if count >= min_count:
+        if zero_duration or count >= min_count:
             clusters.append(
                 {
                     "start_serial": serialized_entries[i]["serial"],

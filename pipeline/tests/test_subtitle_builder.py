@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from pipeline import gemini_rotation, subtitle_builder, video_ingest
+from pipeline import gemini_rotation, key_store, subtitle_builder, translator, video_ingest
 
 
 class SubtitleBuilderBase(unittest.TestCase):
@@ -286,6 +286,30 @@ class DetectDuplicateClustersTest(unittest.TestCase):
     def test_below_min_count_not_flagged(self):
         entries = self._entries([(0.0, 2.0), (3.0, 5.0), (3.0, 5.0), (8.0, 9.0)])
         self.assertEqual(subtitle_builder.detect_duplicate_clusters(entries), [])
+
+    def test_single_zero_duration_entry_flagged(self):
+        entries = self._entries([(0.0, 2.0), (4.0, 4.0), (9.0, 10.0)])
+        clusters = subtitle_builder.detect_duplicate_clusters(entries)
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0]["reason"], "zero_duration")
+        self.assertEqual(clusters[0]["count"], 1)
+        self.assertEqual(clusters[0]["start_serial"], 2)
+
+    def test_pair_zero_duration_flagged(self):
+        entries = self._entries([(0.0, 2.0), (4.0, 4.0), (4.0, 4.0), (9.0, 10.0)])
+        clusters = subtitle_builder.detect_duplicate_clusters(entries)
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0]["reason"], "zero_duration")
+        self.assertEqual(clusters[0]["count"], 2)
+
+    def test_zero_duration_then_same_start_pair_flags_zero_duration_entry(self):
+        entries = self._entries([(0.0, 2.0), (4.0, 4.0), (4.0, 5.0), (9.0, 10.0)])
+        clusters = subtitle_builder.detect_duplicate_clusters(entries)
+        reasons = [c["reason"] for c in clusters]
+        self.assertIn("zero_duration", reasons)
+        zero = [c for c in clusters if c["reason"] == "zero_duration"][0]
+        self.assertEqual(zero["count"], 1)
+        self.assertEqual(zero["start_serial"], 2)
 
     def test_multiple_clusters_in_serial_order(self):
         entries = self._entries(
@@ -851,6 +875,95 @@ class BuildSubtitleListAutoRepairTest(SubtitleBuilderBase):
         texts = [e["text_zh"] for e in result]
         self.assertIn("fixed1", texts)
         self.assertIn("fixed2", texts)
+
+
+class RepairSrtWritebackRegressionTest(SubtitleBuilderBase):
+    """End-to-end: when repair reports success, the final written
+    ``subtitles_hi.srt`` must contain no zero/negative-duration or
+    duplicate-start-time blocks (regression for real job
+    edb1b1ef-5041-491e-bb3f-c8aa3617794a, where ``subtitle_qa.json`` claimed
+    ``repair.succeeded == 2`` yet the delivered SRT still had zero-duration
+    entries at serials 89 and 154)."""
+
+    def setUp(self):
+        super().setUp()
+        self.store_path = Path(self._tmp) / "gemini_keys_store.json"
+        self._orig_key_path = key_store.KEY_STORE_PATH
+        key_store.KEY_STORE_PATH = self.store_path
+        self.addCleanup(self._restore_key_path)
+
+    def _restore_key_path(self):
+        key_store.KEY_STORE_PATH = self._orig_key_path
+
+    @staticmethod
+    def _to_ms(timestamp):
+        h, m, rest = timestamp.split(":")
+        s, ms = rest.split(",")
+        return int(h) * 3600000 + int(m) * 60000 + int(s) * 1000 + int(ms)
+
+    def test_single_zero_duration_leaks_nothing_into_final_srt(self):
+        # Synthetic raw input reproducing the reported degenerate shapes with
+        # NO gaps (so only the zero-duration fix can trigger repair): a single
+        # zero-duration entry D (like serial 89/154) followed by a non-zero
+        # entry E sharing the same start timestamp (like serial 155). These
+        # fall below the old 3-entry cluster floor, so they were never
+        # flagged, never repaired, and leaked into the final SRT.
+        self._write_meta(20.0)
+        self._write_raw(
+            {
+                "status": "ok",
+                "chunked": False,
+                "segments_count": 1,
+                "failed_segments": [],
+                "subtitles": [
+                    {"text": "A", "start_sec": 0.0, "end_sec": 2.0},
+                    {"text": "B", "start_sec": 2.0, "end_sec": 4.0},
+                    {"text": "C", "start_sec": 4.0, "end_sec": 6.0},
+                    {"text": "D", "start_sec": 6.0, "end_sec": 6.0},
+                    {"text": "E", "start_sec": 6.0, "end_sec": 8.0},
+                    {"text": "F", "start_sec": 8.0, "end_sec": 10.0},
+                    {"text": "G", "start_sec": 10.0, "end_sec": 12.0},
+                    {"text": "H", "start_sec": 12.0, "end_sec": 14.0},
+                ],
+            }
+        )
+        with mock.patch.object(
+            subtitle_builder.subtitle_extract, "extract_window",
+            return_value=[{"text": "replaced", "start_sec": 6.0, "end_sec": 7.5}],
+        ) as fake:
+            result = self._build()
+
+        self.assertTrue(fake.called)
+
+        # Repair reported success and the intermediate subtitles_zh.json (the
+        # source of the final SRT timing) has no zero-duration entries.
+        qa = json.loads(
+            (self.job_dir / "subtitle_qa.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(qa["repair"]["succeeded"], 1)
+        for entry in self._read_output():
+            self.assertGreater(entry["end_sec"], entry["start_sec"])
+
+        # No Gemini keys configured: translator falls back to the original
+        # text but still writes the final SRT from subtitles_zh.json timing.
+        translator.translate_subtitles(self.job_id, upload_root=self.upload_root)
+        srt = (self.job_dir / "subtitles_hi.srt").read_text(encoding="utf-8")
+
+        starts = []
+        for block in srt.strip().split("\n\n"):
+            timeline = next(line for line in block.splitlines() if "-->" in line)
+            start, end = timeline.split("-->")
+            start_ms = self._to_ms(start.strip())
+            end_ms = self._to_ms(end.strip())
+            self.assertGreater(
+                end_ms, start_ms,
+                f"zero/negative-duration block leaked into final SRT: {timeline}",
+            )
+            starts.append(start_ms)
+        for a, b in zip(starts, starts[1:]):
+            self.assertNotEqual(
+                a, b, "duplicate start-time blocks leaked into final SRT"
+            )
 
 
 if __name__ == "__main__":

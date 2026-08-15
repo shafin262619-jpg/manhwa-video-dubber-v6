@@ -1,5 +1,42 @@
 # Manhwa Video Dubber — Changelog
 
+## [E5] — 2026-08-15 — real-media QA-writeback fix: single zero-duration subtitles now repaired instead of leaking into the final SRT
+
+Root-cause fix + regression tests. Real job
+`edb1b1ef-5041-491e-bb3f-c8aa3617794a` reported `subtitle_qa.json` with
+`"repair": {"attempted": 2, "succeeded": 2}` yet the delivered
+`subtitles_hi.srt` still contained zero-duration blocks (serial 89 at
+`00:01:59,000`, serial 154 at `00:03:30,000` sharing its start with serial 155).
+
+- **Root cause** (`pipeline/subtitle_builder.py`): `detect_duplicate_clusters`
+  only flagged runs of ≥ `SUBTITLE_DUP_CLUSTER_MIN_COUNT` (default 3)
+  degenerate entries. A *single* zero-duration entry (or a pair) was never
+  flagged, so `build_subtitle_list`'s auto-repair never re-extracted those
+  windows; the zero-duration timestamps flowed unchanged through
+  `subtitles_zh.json` → `translator.build_srt` → `subtitles_hi.srt`, while the
+  post-repair diagnostics (also ≥3-gated) misleadingly reported
+  `duplicate_clusters: []`. The reported repair success referred to *other*
+  flagged gaps/clusters, not the leaked zero-duration entries — so the QA
+  artifact claimed repaired entries the SRT never showed.
+- **Fix**: zero-duration runs are now flagged even as a single entry
+  (`if zero_duration or count >= min_count`). Same-start-timestamp runs keep
+  the ≥3 floor. `pipeline/config.py` comment updated to document the new
+  semantics.
+- **Regression tests** (`pipeline/tests/test_subtitle_builder.py`, +4):
+  - `DetectDuplicateClustersTest`: single zero-duration flagged (count 1);
+    pair flagged (count 2); zero-duration followed by same-start non-zero
+    flags the zero-duration entry.
+  - `RepairSrtWritebackRegressionTest.test_single_zero_duration_leaks_nothing_into_final_srt`:
+    end-to-end — synthetic gap-free raw input with a single zero-duration +
+    same-start pair, repair mocked to succeed, then the real
+    `translator.translate_subtitles` writes `subtitles_hi.srt`; asserts repair
+    reported success, the intermediate `subtitles_zh.json` has no zero-duration
+    entries, and the final `.srt` file has no zero/negative-duration and no
+    duplicate start-times. Verified it FAILS against the pre-fix code (repair
+    never triggered).
+- Full suite: **360 tests OK** (was 356; +4).
+- Tag: `manhwa-video-dubber-v6-qa-repair-writeback-fix`.
+
 ## [E4] — 2026-08-15 — final wrap-up + `FINAL_SUMMARY.md` subtitle-QA-fix section
 
 Final chunk of group E / of the whole subtitle-QA-fix plan (A1→E4,
