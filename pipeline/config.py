@@ -40,7 +40,18 @@ TTS_SAMPLE_RATE = 24000
 TTS_FAIL_SILENCE_SEC = 2.0
 
 # Videos longer than this (seconds) are chunked as B1 before processing.
-LONG_VIDEO_CHUNK_THRESHOLD_SEC = 600
+#
+# DELIBERATE (chunk C1, corrected after a real-world failure): originally
+# 600s. A real ~5-6 minute dialogue-dense manhwa-dub video came in UNDER
+# that threshold and was sent to Gemini in a single call — the model
+# dropped a ~50-second/37-line dialogue-heavy block entirely and mis-timed
+# several others into duplicate-timestamp clusters. Lowering this to 90s
+# means even short videos get segmented into smaller, easier-for-Gemini
+# chunks (with SUBTITLE_OVERLAP_SEC overlap + dedup, same as before), which
+# both improves per-segment timestamp accuracy and reduces missed dialogue.
+# The trade-off is more Gemini calls per job (still capped by
+# MAX_API_CALLS_PER_JOB) and more ffmpeg segment-cutting time.
+LONG_VIDEO_CHUNK_THRESHOLD_SEC = 90
 
 # Overlap (seconds) between consecutive B1 video segments when chunking.
 SUBTITLE_OVERLAP_SEC = 30.0

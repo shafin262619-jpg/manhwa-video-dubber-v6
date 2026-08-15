@@ -1,5 +1,28 @@
 # Manhwa Video Dubber — Changelog
 
+## [C1] — 2026-08-15 — `LONG_VIDEO_CHUNK_THRESHOLD_SEC` 600s → 90s (always sub-chunk dialogue-dense short videos)
+
+First chunk of group C (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`). A
+single config change, no production logic touched.
+
+- `pipeline/config.py` `LONG_VIDEO_CHUNK_THRESHOLD_SEC` lowered from `600`
+  to `90`, with a `DELIBERATE` comment (same style as `TTS_MODEL`) explaining
+  the real-world failure that drove it: a ~5-6 minute dialogue-dense
+  manhwa-dub video fell under the old 600s threshold, was sent to Gemini in
+  a single call, and the model dropped an entire ~50-second/37-line
+  dialogue-heavy block while mis-timing others into duplicate-timestamp
+  clusters. Lowering to 90s forces even short videos through B1
+  sub-chunking (with `SUBTITLE_OVERLAP_SEC` overlap + dedup), improving
+  per-segment timestamp accuracy and reducing missed dialogue at the cost of
+  more Gemini calls (still capped by `MAX_API_CALLS_PER_JOB`) and more
+  ffmpeg segment-cutting time.
+- Only the constant's value changed — `_segment_video()`,
+  `_segment_ranges()`, and the chunked-decision logic are untouched; they
+  read the constant at runtime. Confirmed via
+  `grep -rn LONG_VIDEO_CHUNK_THRESHOLD_SEC pipeline/` (read-sites only).
+- Full suite: **334 tests OK** (tests that exercise chunking already mock
+  the constant to `2.0`; none depend on the old default).
+
 ## [B4] — 2026-08-15 — repair edge-case coverage (budget exhaustion, total failure, single-pass limitation)
 
 Fourth and final chunk of group B (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`).

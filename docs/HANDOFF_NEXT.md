@@ -1,3 +1,3 @@
 # HANDOFF NEXT
 
-গ্রুপ B (targeted re-extraction repair, single-pass, bounded by SUBTITLE_MAX_REPAIR_ATTEMPTS + shared CallBudget) সম্পূর্ণ, edge-case টেস্টেড। পরের কাজ: গ্রুপ C (C1 থেকে — sub-chunking থ্রেশহোল্ড কমানো)।
+C1 (LONG_VIDEO_CHUNK_THRESHOLD_SEC 600→90) সম্পূর্ণ। পরের কাজ: C2 (এই বদলের ফলে যেসব real-fixture টেস্ট এখন ffmpeg segment-cutting পাথে গিয়ে পড়ছে সেগুলোর regression চেক)।
