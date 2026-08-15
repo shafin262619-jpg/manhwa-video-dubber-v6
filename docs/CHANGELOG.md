@@ -1,5 +1,35 @@
 # Manhwa Video Dubber — Changelog
 
+## [B4] — 2026-08-15 — repair edge-case coverage (budget exhaustion, total failure, single-pass limitation)
+
+Fourth and final chunk of group B (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`).
+Verification + edge-case coverage; no production code changes.
+
+- New tests in `pipeline/tests/test_subtitle_builder.py` (`RepairBudgetEdgeCaseTest`):
+  - Budget exhausted mid-repair: a `CallBudget(1)` with two flagged ranges —
+    the first repair consumes the only budget slot, the second
+    `extract_window()` returns `None`, repair continues gracefully (no
+    raise), and the summary reports `succeeded=1 / failed=1`.
+  - All repair calls fail: every `extract_window()` returns `None` →
+    `succeeded=0 / failed=N`, entries untouched, orchestration keeps running.
+- New tests in `BuildSubtitleListAutoRepairTest`:
+  - All-repair-failed end-to-end: `subtitle_qa.json` keeps the un-repaired
+    diagnostics plus `repair.failed`, `subtitles_zh.json` keeps the original
+    entries, and the pipeline never crashes.
+  - **Single-pass limitation**: when the repair response itself contains a
+    new duplicate timestamp cluster, the re-diagnose step surfaces it in
+    `subtitle_qa.json["duplicate_clusters"]` but repair is **not** re-run
+    (`extract_window` called exactly once). Recursive repair would be a
+    future chunk.
+- New test in `pipeline/tests/test_app_orchestration.py`: when
+  `subtitles_hi.json` already exists, `_run_upload_pipeline()` takes the
+  idempotent resume path and **does not** call `build_subtitle_list()`,
+  `extract_subtitles()`, or `translate_subtitles()` (B3 wiring confirmed
+  off the resume path).
+- Known limitation (noted for the future): repair is single-pass — a repair
+  that re-introduces flags is reported, not re-repaired.
+- Full suite: **334 tests OK** (329 prior + 5 new).
+
 ## [B3] — 2026-08-15 — auto-repair wired into `build_subtitle_list()` + `app.py` upload pipeline (end-to-end, Subtitle QA Fix)
 
 Third chunk of group B (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`). Wires

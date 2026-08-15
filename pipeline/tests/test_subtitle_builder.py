@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from pipeline import subtitle_builder, video_ingest
+from pipeline import gemini_rotation, subtitle_builder, video_ingest
 
 
 class SubtitleBuilderBase(unittest.TestCase):
@@ -635,6 +635,69 @@ class RepairFlaggedRegionsTest(unittest.TestCase):
         self.assertEqual(len(summary["skipped_budget"]), 3)
 
 
+class RepairBudgetEdgeCaseTest(SubtitleBuilderBase):
+    """B4: repair must never raise when the shared CallBudget runs out mid-way."""
+
+    def _raw_entries(self, pairs):
+        return [
+            {"text_zh": f"t{i}", "status": "ok", "start_sec": s, "end_sec": e}
+            for i, (s, e) in enumerate(pairs, start=1)
+        ]
+
+    def _diagnostics(self, entries):
+        serialized = subtitle_builder._serialize(entries)
+        return {
+            "gaps": subtitle_builder.detect_gaps(serialized),
+            "duplicate_clusters": subtitle_builder.detect_duplicate_clusters(
+                serialized
+            ),
+        }
+
+    def test_budget_exhausted_mid_repair_skips_gracefully(self):
+        entries = self._raw_entries([(0.0, 2.0), (10.0, 12.0), (30.0, 32.0)])
+        diag = self._diagnostics(entries)
+        budget = gemini_rotation.CallBudget(1)
+        calls = []
+
+        def fake_extract(*args, **kwargs):
+            try:
+                budget.consume()
+            except gemini_rotation.CallBudgetExceeded:
+                return None
+            calls.append(1)
+            return [{"text": "new", "start_sec": 5.0, "end_sec": 7.0}]
+
+        with mock.patch.object(
+            subtitle_builder.subtitle_extract, "extract_window",
+            side_effect=fake_extract,
+        ) as fake:
+            repaired, summary = subtitle_builder.repair_flagged_regions(
+                "job-x", entries, diag, call_budget=budget
+            )
+        self.assertEqual(fake.call_count, 2)
+        self.assertEqual(summary["attempted"], 2)
+        self.assertEqual(summary["succeeded"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["skipped_budget"], [])
+        self.assertEqual(len(calls), 1)
+
+    def test_all_repair_calls_fail_pipeline_continues(self):
+        entries = self._raw_entries([(0.0, 2.0), (10.0, 12.0), (30.0, 32.0)])
+        diag = self._diagnostics(entries)
+        with mock.patch.object(
+            subtitle_builder.subtitle_extract, "extract_window",
+            return_value=None,
+        ) as fake:
+            repaired, summary = subtitle_builder.repair_flagged_regions(
+                "job-x", entries, diag
+            )
+        self.assertEqual(fake.call_count, 2)
+        self.assertEqual(summary["succeeded"], 0)
+        self.assertEqual(summary["failed"], 2)
+        texts = [e["text_zh"] for e in repaired]
+        self.assertEqual(texts, ["t1", "t2", "t3"])
+
+
 class BuildSubtitleListAutoRepairTest(SubtitleBuilderBase):
     def _read_qa(self):
         return json.loads(
@@ -723,6 +786,71 @@ class BuildSubtitleListAutoRepairTest(SubtitleBuilderBase):
         fake.assert_not_called()
         qa = self._read_qa()
         self.assertNotIn("repair", qa)
+
+    def test_all_repair_calls_fail_keeps_old_entries_and_diagnostics(self):
+        self._write_meta(20.0)
+        self._write_raw(
+            {
+                "status": "ok",
+                "chunked": False,
+                "segments_count": 1,
+                "failed_segments": [],
+                "subtitles": [
+                    {"text": "a", "start_sec": 0.0, "end_sec": 2.0},
+                    {"text": "b", "start_sec": 3.0, "end_sec": 3.0},
+                    {"text": "c", "start_sec": 3.0, "end_sec": 3.0},
+                    {"text": "d", "start_sec": 3.0, "end_sec": 3.0},
+                    {"text": "e", "start_sec": 15.0, "end_sec": 16.0},
+                ],
+            }
+        )
+        with mock.patch.object(
+            subtitle_builder.subtitle_extract, "extract_window",
+            return_value=None,
+        ) as fake:
+            result = self._build()
+        fake.assert_called_once()
+        qa = self._read_qa()
+        self.assertEqual(qa["repair"]["attempted"], 1)
+        self.assertEqual(qa["repair"]["succeeded"], 0)
+        self.assertEqual(qa["repair"]["failed"], 1)
+        texts = [e["text_zh"] for e in result]
+        self.assertEqual(texts, ["a", "b", "c", "d", "e"])
+        self.assertEqual(qa["entries_count"], 5)
+
+    def test_single_pass_no_recursive_repair(self):
+        self._write_meta(20.0)
+        self._write_raw(
+            {
+                "status": "ok",
+                "chunked": False,
+                "segments_count": 1,
+                "failed_segments": [],
+                "subtitles": [
+                    {"text": "a", "start_sec": 0.0, "end_sec": 2.0},
+                    {"text": "b", "start_sec": 3.0, "end_sec": 3.0},
+                    {"text": "c", "start_sec": 3.0, "end_sec": 3.0},
+                    {"text": "d", "start_sec": 3.0, "end_sec": 3.0},
+                ],
+            }
+        )
+        fixed_subs = [
+            {"text": "fixed1", "start_sec": 3.0, "end_sec": 3.0},
+            {"text": "fixed2", "start_sec": 3.0, "end_sec": 3.0},
+            {"text": "fixed3", "start_sec": 3.0, "end_sec": 3.0},
+        ]
+        with mock.patch.object(
+            subtitle_builder.subtitle_extract, "extract_window",
+            return_value=fixed_subs,
+        ) as fake:
+            result = self._build()
+        fake.assert_called_once()
+        qa = self._read_qa()
+        self.assertEqual(qa["repair"]["succeeded"], 1)
+        self.assertTrue(qa["duplicate_clusters"])
+        texts = [e["text_zh"] for e in result]
+        self.assertIn("fixed1", texts)
+        self.assertIn("fixed2", texts)
 
 
 if __name__ == "__main__":

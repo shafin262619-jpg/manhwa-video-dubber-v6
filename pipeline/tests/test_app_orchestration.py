@@ -37,6 +37,7 @@ from fastapi.testclient import TestClient
 from app import app
 from pipeline import (
     auto_cut,
+    job_status as job_status_store,
     key_store,
     render_final,
     subtitle_extract,
@@ -287,6 +288,40 @@ class HttpWiringChainTest(unittest.TestCase):
         self._wait_for_upload_done(job_id)
         res = self.client.get(f"/review/{job_id}")
         self.assertEqual(res.status_code, 404)
+
+    def test_upload_pipeline_resume_skips_build_subtitle_list(self):
+        # B4: when subtitles_hi.json already exists, _run_upload_pipeline()
+        # takes the idempotent resume path and must NOT call
+        # build_subtitle_list() (B3 wiring stays off that path).
+        job_dir = self.upload_root / "resume-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "subtitles_zh_raw.json").write_text(
+            json.dumps(
+                {"status": "ok", "segments_count": 1, "failed_segments": [],
+                 "subtitles": []}
+            ),
+            encoding="utf-8",
+        )
+        (job_dir / "subtitles_hi.json").write_text(
+            json.dumps([{"serial": 1, "text_hi": "नमस्ते"}]), encoding="utf-8"
+        )
+        with mock.patch(
+            "pipeline.subtitle_builder.build_subtitle_list"
+        ) as build, mock.patch(
+            "pipeline.subtitle_extract.extract_subtitles"
+        ) as extract, mock.patch(
+            "pipeline.translator.translate_subtitles"
+        ) as translate:
+            import app as app_module
+
+            app_module._run_upload_pipeline("resume-job")
+        build.assert_not_called()
+        extract.assert_not_called()
+        translate.assert_not_called()
+        status = job_status_store.read_status("resume-job")
+        stage = status["stages"]["upload_pipeline"]
+        self.assertEqual(stage["state"], "done")
+        self.assertEqual(stage["serials"], 1)
 
 
 if __name__ == "__main__":
