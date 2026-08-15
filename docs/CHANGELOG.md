@@ -1,5 +1,28 @@
 # Manhwa Video Dubber — Changelog
 
+## [E4] — 2026-08-15 — final wrap-up + `FINAL_SUMMARY.md` subtitle-QA-fix section
+
+Final chunk of group E / of the whole subtitle-QA-fix plan (A1→E4,
+`docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`). Docs-only; no code changes.
+
+- `docs/FINAL_SUMMARY.md`: new "Subtitle QA Fixes (A1-E4)" section covering the
+  6 original bugs → group mapping (A/B/C/D/E), the new files
+  (`pipeline/subtitle_verify.py`, `pipeline/subtitle_qa.py`), the new config
+  constants (`SUBTITLE_GAP_FLAG_THRESHOLD_SEC`, `SUBTITLE_DUP_CLUSTER_MIN_COUNT`,
+  `SUBTITLE_MAX_REPAIR_ATTEMPTS`, `SUBTITLE_COVERAGE_MISMATCH_RATIO`,
+  `LONG_VIDEO_CHUNK_THRESHOLD_SEC` 600→90), the new artifacts
+  (`subtitle_qa.json`, `subtitle_qa_whisper.json`), the new route
+  `GET /download/{job_id}/subtitle_qa`, the known limitations (single-pass
+  repair; non-gap/cluster misplaced-content like hallucination-suspect sections
+  still need manual review; whisper optional), and the explicit "user must do
+  this" real-media QA run (real Gemini key + real ~5-6 min dialogue-dense
+  video, verifying the 90s chunking, the repair mechanism, and whisper
+  false-positives).
+- `docs/HANDOFF_NEXT.md`: groups A-E complete; only the user's own real-media
+  QA run remains.
+- Final suite: **356 tests OK** (no new tests — docs-only chunk).
+- Final tag: `manhwa-video-dubber-v6-qa-final`.
+
 ## [E3] — 2026-08-15 — full regression pass across groups A-E + fixes
 
 Third chunk of group E (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`).

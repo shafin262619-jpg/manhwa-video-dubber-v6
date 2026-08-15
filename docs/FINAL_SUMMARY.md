@@ -312,3 +312,85 @@ uvicorn app:app --host 0.0.0.0 --port 5000
 - Production concerns if this ever leaves local use: job queues/background
   tasks for long videos, storage cleanup policy, concurrency — none were in
   scope.
+
+---
+
+## Subtitle QA Fixes (A1-E4)
+
+The subtitle-QA-fix update (chunks A1→E4, plan:
+`docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`) fixed the six root-cause bugs found by
+comparing `subtitles_hi.srt` against a Turboscribe transcript in an earlier
+conversation. Everything below is automated and covered by the permanent test
+suite; the one thing it cannot do is the real-media QA run (see "The user must
+do this" at the end of this section).
+
+### The 6 bugs → which group fixed them
+
+| # | Bug | Fixed by |
+|---|---|---|
+| 1 | Zero-duration / duplicate-timestamp entry clusters (81 lines stuck at 3.000s, 48 at 4.000s, 43 at 5.000s) — no coverage-gap or duplicate-cluster detection existed | **A** (A1 gap detection, A2 duplicate-cluster detection, A3 QA diagnostics artifact) |
+| 2 | A ~50s / 37-line dialogue-dense block dropped entirely, plus mis-timed lines — the whole video was sent to Gemini in one call (`LONG_VIDEO_CHUNK_THRESHOLD_SEC = 600`s for a ~5-6 min video) | **C** (C1 lowered the threshold to 90s so even short videos are sub-chunked with overlap + dedup) |
+| 3 | No targeted re-extraction/repair mechanism — flagged regions sailed through to SRT/render untouched | **B** (B1–B4 bounded, budget-aware repair over flagged ranges, wiring into `build_subtitle_list`) |
+| 4 | `_serialize()` only logged forward-overlap clamps; zero-duration and large backward jumps were silent | **A** (A1/A3 surface gaps + clusters in `subtitle_qa.json` diagnostics) |
+| 5 | No independent cross-check of extraction (no audio-based Whisper verification pass) | **D** (D1–D3 `subtitle_verify.whisper_cross_check`, wired non-blocking into the upload pipeline) |
+| 6 | No coverage/QA report shown to the user before recording/uploading the voiceover — problems surfaced only after the whole voiceover was done | **E** (E1 combined `build_qa_summary`, E2 informational QA banner on `/voiceover/{job_id}/choose`) |
+
+### What was added
+
+- **New files**
+  - `pipeline/subtitle_verify.py` — `whisper_cross_check()`: extracts mono wav
+    from `source.mp4` (ffmpeg), transcribes with local Whisper, and compares
+    Whisper's measured spoken duration against Gemini-extracted coverage. Never
+    raises; missing whisper/ffmpeg/failure → `skipped`.
+  - `pipeline/subtitle_qa.py` — `build_qa_summary()`: pure aggregation merging
+    `subtitle_qa.json` (A3/B3) with `subtitle_qa_whisper.json` (D1) into one
+    human-readable `{qa_status, warnings[], ...}` summary. Never raises.
+- **New config constants** (`pipeline/config.py`)
+  - `SUBTITLE_GAP_FLAG_THRESHOLD_SEC = 6.0` (A1)
+  - `SUBTITLE_DUP_CLUSTER_MIN_COUNT = 3` (A2)
+  - `SUBTITLE_MAX_REPAIR_ATTEMPTS = 3` (B2)
+  - `SUBTITLE_COVERAGE_MISMATCH_RATIO = 0.75` (D1)
+  - `LONG_VIDEO_CHUNK_THRESHOLD_SEC` changed **600 → 90** (C1)
+- **New artifact files** (both under `uploads/<job_id>/`)
+  - `subtitle_qa.json` — coverage-gap + duplicate-cluster diagnostics (A3), with
+    the post-repair `repair` summary (B3).
+  - `subtitle_qa_whisper.json` — the whisper cross-check result dict (D1).
+- **New route**
+  - `GET /download/{job_id}/subtitle_qa` — serves `subtitle_qa.json` (E2).
+- **Other wiring**
+  - `build_subtitle_list()` auto-repair over flagged ranges (B3), sharing the
+    per-job `CallBudget`.
+  - `whisper_cross_check()` called non-blocking in `_run_upload_pipeline()`
+    (D2), with `whisper_check_status` recorded in the job-status extra.
+  - Informational `.flagged-banner` on `/voiceover/{job_id}/choose` when the QA
+    summary is `flagged` — never blocks the auto_tts / user_upload choice (E2).
+
+### Known limitations
+
+- The repair pass is **single-pass** (targeted ranges, capped at
+  `SUBTITLE_MAX_REPAIR_ATTEMPTS`) — it is not recursive, and it only acts on
+  ranges flagged by gap / duplicate-cluster diagnostics.
+- Misplaced-content problems other than gaps/duplicate-clusters — e.g. the
+  "hallucination-suspect" sections found in the earlier conversation (lines
+  present but mis-timed/relocated) — are **not** caught automatically. They
+  still need a human reading the SRT/QA output; the QA banner is a signal, not
+  a substitute for manual review.
+- Whisper is an optional, lazy dependency (not in `requirements.txt`): CI /
+  environments without it take the `skipped` cross-check path.
+
+### The user must do this (a sandboxed AI agent cannot)
+
+A real **Gemini API key** plus a real **~5–6 minute dialogue-dense video** are
+needed for a full real-media run that no sandboxed AI agent can perform. Do a
+complete run: upload → `subtitle_qa.json` / QA banner → (if flagged) manual
+review → voiceover upload, and verify specifically:
+
+1. **(ক)** the new 90-second chunking actually prevents the old "~50s of
+   dialogue dropped" failure on a real dialogue-dense video;
+2. **(খ)** the repair mechanism actually works on a real duplicate-timestamp
+   cluster (check the `repair` summary in `subtitle_qa.json`);
+3. **(গ)** the whisper cross-check does not false-positive on real audio
+   (compare its status against the actual `subtitle_qa.json` coverage on a
+   known-good video).
+
+See section 5 above for the broader real-media checklist.
