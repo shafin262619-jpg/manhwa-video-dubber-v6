@@ -1,5 +1,14 @@
 # Manhwa Video Dubber — Changelog
 
+## [A1] — 2026-08-15 — Coverage-gap diagnostics (Subtitle QA Fix)
+
+Introduces standalone coverage-gap diagnostics to detect consecutive subtitle timing gaps exceeding a threshold.
+
+- `pipeline/config.py`: Added `SUBTITLE_GAP_FLAG_THRESHOLD_SEC` config constant (default: `6.0`).
+- `pipeline/subtitle_builder.py`: Implemented `detect_gaps(serialized_entries, threshold_sec=None)` to chronologically list timing gaps between consecutive entries.
+- `pipeline/tests/test_subtitle_builder.py`: Added 5 unit tests verifying gap detection correctness, boundary conditions, custom threshold overrides, and chronological order under `SubtitleGapDetectionTest`.
+- Test suite: Expanded from 290 to 295 tests, 100% passing.
+
 ## [FA-F2] — 2026-08-13 — Final wrap-up: Full-Auto Pipeline complete (Full-Auto Pipeline)
 
 The final Full-Auto chunk — all 12 chunks (FA-A1 … FA-F2) are done,

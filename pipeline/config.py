@@ -106,3 +106,7 @@ RENDER_TIMEOUT_SEC = 600
 # Set to an int to give a job a hard quota so a runaway rotation can never burn
 # the whole key allowance.
 MAX_API_CALLS_PER_JOB = None
+
+# Consecutive serialized subtitle entries whose gap exceeds this (seconds)
+# are flagged as possible missing content (QA diagnostics, A1).
+SUBTITLE_GAP_FLAG_THRESHOLD_SEC = 6.0

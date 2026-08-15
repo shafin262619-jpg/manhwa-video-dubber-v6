@@ -142,6 +142,41 @@ def _serialize(entries):
     return out
 
 
+def detect_gaps(serialized_entries, threshold_sec=None):
+    """Serialized (post-_serialize) এন্ট্রির consecutive জোড়ার মধ্যে gap বের করে।
+
+    threshold_sec None হলে config.SUBTITLE_GAP_FLAG_THRESHOLD_SEC ব্যবহার করো
+    (এই চাংকেই config.py-তে নতুন যোগ করো, ডিফল্ট 6.0)।
+
+    প্রতিটা gap-এর জন্য (next.start_sec - prev.end_sec > threshold_sec):
+        {"after_serial": prev["serial"], "before_serial": next["serial"],
+         "gap_start_sec": prev["end_sec"], "gap_end_sec": next["start_sec"],
+         "gap_sec": round(next["start_sec"] - prev["end_sec"], 3)}
+    রিটার্ন করো লিস্ট, chronological order-এ। "status": "extraction_failed"
+    এন্ট্রি gap-চেকে অংশ নেবে (এদের নিজেদের মধ্যেও gap হতে পারে) — শুধু
+    এন্ট্রি-বাই-এন্ট্রি consecutive gap দেখো, ফিল্টার করার দরকার নেই।
+    """
+    if threshold_sec is None:
+        threshold_sec = config.SUBTITLE_GAP_FLAG_THRESHOLD_SEC
+
+    gaps = []
+    for i in range(len(serialized_entries) - 1):
+        prev = serialized_entries[i]
+        nxt = serialized_entries[i + 1]
+        prev_end = float(prev["end_sec"])
+        nxt_start = float(nxt["start_sec"])
+        gap_sec = nxt_start - prev_end
+        if gap_sec > threshold_sec:
+            gaps.append({
+                "after_serial": prev["serial"],
+                "before_serial": nxt["serial"],
+                "gap_start_sec": prev_end,
+                "gap_end_sec": nxt_start,
+                "gap_sec": round(gap_sec, 3)
+            })
+    return gaps
+
+
 def build_subtitle_list(job_id, upload_root=None):
     """Build ``subtitles_zh.json`` from ``subtitles_zh_raw.json``. Returns list."""
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT

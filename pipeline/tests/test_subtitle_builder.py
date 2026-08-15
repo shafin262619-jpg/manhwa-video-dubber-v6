@@ -188,5 +188,65 @@ class MissingInputTest(SubtitleBuilderBase):
             self._build()
 
 
+
+
+class SubtitleGapDetectionTest(unittest.TestCase):
+    def test_no_gaps(self):
+        entries = [
+            {"serial": 1, "text_zh": "a", "start_sec": 1.0, "end_sec": 4.0, "status": "ok"},
+            {"serial": 2, "text_zh": "b", "start_sec": 4.1, "end_sec": 6.0, "status": "ok"},
+        ]
+        gaps = subtitle_builder.detect_gaps(entries, threshold_sec=1.0)
+        self.assertEqual(gaps, [])
+
+    def test_one_big_gap(self):
+        entries = [
+            {"serial": 1, "text_zh": "a", "start_sec": 1.0, "end_sec": 4.0, "status": "ok"},
+            {"serial": 2, "text_zh": "b", "start_sec": 10.5, "end_sec": 12.0, "status": "ok"},
+        ]
+        gaps = subtitle_builder.detect_gaps(entries, threshold_sec=6.0)
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["after_serial"], 1)
+        self.assertEqual(gaps[0]["before_serial"], 2)
+        self.assertEqual(gaps[0]["gap_start_sec"], 4.0)
+        self.assertEqual(gaps[0]["gap_end_sec"], 10.5)
+        self.assertEqual(gaps[0]["gap_sec"], 6.5)
+
+    def test_boundary_gaps(self):
+        entries = [
+            {"serial": 1, "text_zh": "a", "start_sec": 0.0, "end_sec": 2.0, "status": "ok"},
+            {"serial": 2, "text_zh": "b", "start_sec": 8.0, "end_sec": 10.0, "status": "ok"}, # gap is 6.0
+            {"serial": 3, "text_zh": "c", "start_sec": 16.01, "end_sec": 18.0, "status": "ok"}, # gap is 6.01
+        ]
+        gaps = subtitle_builder.detect_gaps(entries) # default 6.0 from config
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["after_serial"], 2)
+        self.assertEqual(gaps[0]["before_serial"], 3)
+        self.assertEqual(gaps[0]["gap_sec"], 6.01)
+
+    def test_multiple_gaps_chronological_order(self):
+        entries = [
+            {"serial": 1, "text_zh": "a", "start_sec": 0.0, "end_sec": 1.0, "status": "ok"},
+            {"serial": 2, "text_zh": "b", "start_sec": 4.0, "end_sec": 5.0, "status": "ok"}, # gap 3.0
+            {"serial": 3, "text_zh": "c", "start_sec": 10.0, "end_sec": 12.0, "status": "ok"}, # gap 5.0
+        ]
+        gaps = subtitle_builder.detect_gaps(entries, threshold_sec=2.0)
+        self.assertEqual(len(gaps), 2)
+        self.assertEqual(gaps[0]["after_serial"], 1)
+        self.assertEqual(gaps[0]["before_serial"], 2)
+        self.assertEqual(gaps[1]["after_serial"], 2)
+        self.assertEqual(gaps[1]["before_serial"], 3)
+
+    def test_custom_threshold_override(self):
+        entries = [
+            {"serial": 1, "text_zh": "a", "start_sec": 1.0, "end_sec": 3.0, "status": "ok"},
+            {"serial": 2, "text_zh": "b", "start_sec": 5.0, "end_sec": 7.0, "status": "ok"}, # gap 2.0
+        ]
+        gaps_default = subtitle_builder.detect_gaps(entries) # threshold 6.0
+        self.assertEqual(gaps_default, [])
+        gaps_custom = subtitle_builder.detect_gaps(entries, threshold_sec=1.5)
+        self.assertEqual(len(gaps_custom), 1)
+        self.assertEqual(gaps_custom[0]["gap_sec"], 2.0)
+
 if __name__ == "__main__":
     unittest.main()
