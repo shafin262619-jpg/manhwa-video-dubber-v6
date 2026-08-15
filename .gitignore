@@ -31,3 +31,4 @@ tmp/
 *.mp4
 *.mkv
 *.mov
+uvicorn.log
