@@ -635,5 +635,95 @@ class RepairFlaggedRegionsTest(unittest.TestCase):
         self.assertEqual(len(summary["skipped_budget"]), 3)
 
 
+class BuildSubtitleListAutoRepairTest(SubtitleBuilderBase):
+    def _read_qa(self):
+        return json.loads(
+            (self.job_dir / "subtitle_qa.json").read_text(encoding="utf-8")
+        )
+
+    def test_auto_repair_runs_repair_and_rediagnoses(self):
+        self._write_meta(20.0)
+        self._write_raw(
+            {
+                "status": "ok",
+                "chunked": False,
+                "segments_count": 1,
+                "failed_segments": [],
+                "subtitles": [
+                    {"text": "a", "start_sec": 0.0, "end_sec": 2.0},
+                    {"text": "b", "start_sec": 3.0, "end_sec": 3.0},
+                    {"text": "c", "start_sec": 3.0, "end_sec": 3.0},
+                    {"text": "d", "start_sec": 3.0, "end_sec": 3.0},
+                    {"text": "e", "start_sec": 15.0, "end_sec": 16.0},
+                ],
+            }
+        )
+        with mock.patch.object(
+            subtitle_builder.subtitle_extract,
+            "extract_window",
+            return_value=[{"text": "fixed", "start_sec": 3.0, "end_sec": 5.0}],
+        ) as fake:
+            result = self._build()
+
+        fake.assert_called_once()
+        qa = self._read_qa()
+        self.assertEqual(qa["repair"]["attempted"], 1)
+        self.assertEqual(qa["repair"]["succeeded"], 1)
+        self.assertIn("repair", qa)
+        texts = [e["text_zh"] for e in result]
+        self.assertIn("fixed", texts)
+        self.assertLessEqual(len(qa["duplicate_clusters"]), 1)
+
+    def test_auto_repair_false_skips_repair(self):
+        self._write_meta(20.0)
+        self._write_raw(
+            {
+                "status": "ok",
+                "chunked": False,
+                "segments_count": 1,
+                "failed_segments": [],
+                "subtitles": [
+                    {"text": "a", "start_sec": 0.0, "end_sec": 2.0},
+                    {"text": "b", "start_sec": 3.0, "end_sec": 3.0},
+                    {"text": "c", "start_sec": 3.0, "end_sec": 3.0},
+                    {"text": "d", "start_sec": 3.0, "end_sec": 3.0},
+                ],
+            }
+        )
+        with mock.patch.object(
+            subtitle_builder.subtitle_extract, "extract_window"
+        ) as fake:
+            result = subtitle_builder.build_subtitle_list(
+                self.job_id, upload_root=self.upload_root, auto_repair=False
+            )
+        fake.assert_not_called()
+        qa = self._read_qa()
+        self.assertNotIn("repair", qa)
+        self.assertEqual(len(qa["duplicate_clusters"]), 1)
+        self.assertEqual(len(result), 4)
+
+    def test_clean_input_no_repair_calls(self):
+        self._write_meta(10.0)
+        self._write_raw(
+            {
+                "status": "ok",
+                "chunked": False,
+                "segments_count": 1,
+                "failed_segments": [],
+                "subtitles": [
+                    {"text": "a", "start_sec": 0.0, "end_sec": 3.0},
+                    {"text": "b", "start_sec": 3.5, "end_sec": 6.0},
+                ],
+            }
+        )
+        with mock.patch.object(
+            subtitle_builder.subtitle_extract, "extract_window"
+        ) as fake:
+            result = self._build()
+        fake.assert_not_called()
+        qa = self._read_qa()
+        self.assertNotIn("repair", qa)
+
+
 if __name__ == "__main__":
     unittest.main()

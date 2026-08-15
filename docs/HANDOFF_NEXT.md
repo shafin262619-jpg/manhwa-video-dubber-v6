@@ -1,3 +1,3 @@
 # HANDOFF NEXT
 
-B2 (repair_flagged_regions, standalone orchestration) সম্পূর্ণ। পরের কাজ: B3 (build_subtitle_list() + app.py-তে wire করা — end-to-end auto-repair)।
+B3 (end-to-end auto-repair wired into upload_pipeline) সম্পূর্ণ। গ্রুপ B বাকি: B4 (পূর্ণাঙ্গ টেস্ট স্যুট + edge cases: budget-exhausted, whole-repair-failed)।

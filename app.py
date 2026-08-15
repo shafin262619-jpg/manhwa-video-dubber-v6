@@ -189,7 +189,7 @@ def _run_upload_pipeline(job_id):
             extraction = subtitle_extract.extract_subtitles(
                 job_id, call_budget=budget
             )
-            subtitle_builder.build_subtitle_list(job_id)
+            subtitle_builder.build_subtitle_list(job_id, call_budget=budget)
             translation = translator.translate_subtitles(
                 job_id, call_budget=budget
             )

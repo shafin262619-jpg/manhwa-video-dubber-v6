@@ -1,5 +1,36 @@
 # Manhwa Video Dubber — Changelog
 
+## [B3] — 2026-08-15 — auto-repair wired into `build_subtitle_list()` + `app.py` upload pipeline (end-to-end, Subtitle QA Fix)
+
+Third chunk of group B (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`). Wires
+the B2 repair orchestration into the normal build path so every job
+automatically self-heals flagged gaps/clusters.
+
+- `pipeline/subtitle_builder.py` `build_subtitle_list()` signature extended
+  to `build_subtitle_list(job_id, upload_root=None, call_budget=None,
+  auto_repair=True)` (backward-compatible defaults). When `auto_repair` is
+  true and A3 diagnostics flag any gaps/duplicate clusters, it calls
+  `repair_flagged_regions()`, rebuilds the entries, and **re-diagnoses** the
+  repaired list; the `"repair"` summary is added to the `subtitle_qa.json`
+  artifact. Diagnostics always reflect the final list. Return value stays the
+  serialized entries list (backward compat).
+- `call_budget` is forwarded through to `repair_flagged_regions()` →
+  `extract_window()`, so the repair shares the job's per-job CallBudget.
+- New internal helper `_entries_from_serialized()` converts serialized
+  entries back to raw dicts for re-serialization.
+- `pipeline/subtitle_builder.py` `_build_repair_ranges()` clamps negative
+  duplicate-cluster window starts to `0.0` (defensive).
+- `app.py` `_run_upload_pipeline()` now calls
+  `build_subtitle_list(job_id, call_budget=budget)`, sharing the same
+  per-job CallBudget already passed to `extract_subtitles()` and
+  `translate_subtitles()`.
+- New tests in `pipeline/tests/test_subtitle_builder.py`
+  (`BuildSubtitleListAutoRepairTest`, 3 tests): flagged input auto-repairs
+  and re-diagnoses (repair summary present, fixed entry inserted);
+  `auto_repair=False` skips repair and keeps raw diagnostics; clean input
+  never calls `extract_window`.
+- Full suite: **329 tests OK** (326 prior + 3 new).
+
 ## [B2] — 2026-08-15 — `subtitle_builder.repair_flagged_regions()` — bounded targeted-repair orchestration (Subtitle QA Fix)
 
 Second chunk of group B (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`). Adds

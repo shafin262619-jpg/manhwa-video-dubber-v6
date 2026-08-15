@@ -276,6 +276,8 @@ def _build_repair_ranges(entries, diagnostics):
             continue
         start = min(float(first["start_sec"]), float(first["end_sec"])) - pad
         end = max(float(last["start_sec"]), float(last["end_sec"])) + pad
+        if start < 0.0:
+            start = 0.0
         weight = float(c.get("count", 0))
         if end > start:
             ranges.append([start, end, weight])
@@ -372,12 +374,17 @@ def repair_flagged_regions(job_id, entries, diagnostics, upload_root=None,
     return _serialize(repaired), summary
 
 
-def build_subtitle_list(job_id, upload_root=None):
+def build_subtitle_list(job_id, upload_root=None, call_budget=None, auto_repair=True):
     """Build ``subtitles_zh.json`` from ``subtitles_zh_raw.json``. Returns list.
 
     Side artifact: also writes ``subtitle_qa.json`` with coverage-gap and
-    duplicate-cluster diagnostics (QA diagnostics, A3). The return value is
-    unchanged (still the serialized entries list) for backward compatibility.
+    duplicate-cluster diagnostics (QA diagnostics, A3). When ``auto_repair``
+    is true and the diagnostics flag any gaps/clusters, ``repair_flagged_regions``
+    is run (bounded targeted re-extraction, B2) and diagnostics are recomputed
+    on the repaired list; the ``"repair"`` summary is added to the QA artifact.
+    The return value is unchanged (still the serialized entries list) for
+    backward compatibility. ``call_budget`` and ``auto_repair`` default to
+    ``None`` / ``True`` so existing callers keep working.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = upload_root / job_id
@@ -385,7 +392,24 @@ def build_subtitle_list(job_id, upload_root=None):
     meta = _load_json_optional(job_dir / "job_meta.json")
     duration = _duration_of(meta, raw.get("subtitles", []))
     entries = _build_entries(raw, duration)
-    result = _serialize(entries)
+
+    repair_summary = None
+    if auto_repair:
+        result = _serialize(entries)
+        gaps = detect_gaps(result)
+        duplicate_clusters = detect_duplicate_clusters(result)
+        if gaps or duplicate_clusters:
+            diagnostics = {
+                "gaps": gaps,
+                "duplicate_clusters": duplicate_clusters,
+            }
+            result, repair_summary = repair_flagged_regions(
+                job_id, entries, diagnostics,
+                upload_root=upload_root, call_budget=call_budget,
+            )
+            entries = _entries_from_serialized(result)
+    else:
+        result = _serialize(entries)
 
     gaps = detect_gaps(result)
     duplicate_clusters = detect_duplicate_clusters(result)
@@ -400,6 +424,8 @@ def build_subtitle_list(job_id, upload_root=None):
         "gaps": gaps,
         "duplicate_clusters": duplicate_clusters,
     }
+    if repair_summary is not None:
+        diagnostics["repair"] = repair_summary
     qa_path = job_dir / "subtitle_qa.json"
     qa_path.write_text(
         json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -410,6 +436,19 @@ def build_subtitle_list(job_id, upload_root=None):
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return result
+
+
+def _entries_from_serialized(serialized):
+    """Convert serialized entries back to raw entry dicts for re-serializing."""
+    return [
+        {
+            "text_zh": e["text_zh"],
+            "status": e["status"],
+            "start_sec": e["start_sec"],
+            "end_sec": e["end_sec"],
+        }
+        for e in serialized
+    ]
 
 
 def load_subtitle_qa(job_id, upload_root=None):
