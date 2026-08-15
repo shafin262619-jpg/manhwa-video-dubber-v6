@@ -1,5 +1,32 @@
 # Manhwa Video Dubber — Changelog
 
+## [D3] — 2026-08-15 — whisper cross-check regression pass + edge-case coverage
+
+Final chunk of group D (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`).
+Verification-only; no production code changed.
+
+- **Real-environment smoke test (passed)**: installed `openai-whisper` with
+  CPU-only torch (`--index-url https://download.pytorch.org/whl/cpu`) — the
+  default CUDA torch pulls several GB of `nvidia-*` wheels and was too slow to
+  finish, so the CPU build was used instead. Ran the real
+  `whisper_cross_check()` against a synthetic 5s audio-only `source.mp4`
+  (ffmpeg-generated sine tone) with a `subtitle_qa.json` fixture: it did not
+  raise, returned a reasonable dict (`status: "ok"`, `coverage_ratio: null`
+  because the tone contains no speech segments, `mismatch: false`), downloaded
+  the `base` model into `~/.cache/whisper/base.pt`, and wrote
+  `uploads/smoke-job/subtitle_qa_whisper.json`. `openai-whisper` is **not**
+  added to `requirements.txt` — it stays an optional lazy dependency by design
+  (D1); environments without it take the `skipped` path.
+- **Full regression pass, no flakiness**: the whole suite (groups A, B, C, D)
+  ran 4 times — 3× with whisper absent, 1× with whisper installed — every run
+  **343 tests OK** with stable timings; the mocked tests use
+  `sys.modules["whisper"] = None` to force the ImportError path, so they are
+  independent of whether whisper is really present.
+- `python3 -m py_compile` passed for all group-D touched files: `app.py`,
+  `pipeline/subtitle_builder.py`, `pipeline/subtitle_extract.py`,
+  `pipeline/subtitle_verify.py`, `pipeline/config.py`.
+- Final test count: **343 tests OK** (no new tests this chunk — verification only).
+
 ## [D2] — 2026-08-15 — wire `whisper_cross_check` into `app.py` upload pipeline (non-blocking, status-tracked)
 
 Second chunk of group D (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`).
