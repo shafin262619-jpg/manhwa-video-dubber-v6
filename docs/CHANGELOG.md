@@ -1,5 +1,25 @@
 # Manhwa Video Dubber — Changelog
 
+## [C2] — 2026-08-15 — regression-verify the 90s chunking threshold + explicit `chunked=True` coverage test
+
+Second and final chunk of group C (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`).
+Verification + test-level coverage only; no production code changed (C1 made
+the actual config change).
+
+- Audited every real-ffmpeg fixture in `test_video_ingest.py`,
+  `test_subtitle_extract.py`, `test_app_orchestration.py`, and
+  `test_full_auto_orchestration.py`: all synthetic clips are 1–5 seconds,
+  far under the new 90s threshold, so none silently fall onto the chunked
+  (ffmpeg segment-cutting) path. The full suite passes unchanged.
+- New test in `pipeline/tests/test_subtitle_extract.py`
+  (`SubtitleExtractChunkTest.test_default_threshold_90s_chunks_150s_video`):
+  with the production default `LONG_VIDEO_CHUNK_THRESHOLD_SEC=90` (no
+  threshold mock), a 150s video (duration read directly from `job_meta.json`)
+  extracts with `chunked=True` and `segments_count=2` — the exact case that
+  used to be `chunked=False` under the old 600s default. Gemini and
+  `_segment_video` are mocked.
+- Full suite: **335 tests OK** (334 prior + 1 new).
+
 ## [C1] — 2026-08-15 — `LONG_VIDEO_CHUNK_THRESHOLD_SEC` 600s → 90s (always sub-chunk dialogue-dense short videos)
 
 First chunk of group C (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`). A

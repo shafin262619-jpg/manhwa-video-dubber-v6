@@ -161,6 +161,38 @@ class SubtitleExtractChunkTest(SubtitleExtractBase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(calls, [("key-a", 0.0), ("key-b", 1.0)])
 
+    def test_default_threshold_90s_chunks_150s_video(self):
+        # C2: with the production default LONG_VIDEO_CHUNK_THRESHOLD_SEC=90, a
+        # ~2.5-minute (150s) video — previously under the old 600s default and
+        # sent whole — now extracts as chunked=True. Duration comes straight
+        # from job_meta.json (no real long ffmpeg fixture needed); segments
+        # and Gemini are mocked.
+        self._write_meta(150.0)
+        self._set_keys(["key-one"])
+
+        def fake_call(key, prompt, video_path, offset_sec):
+            return [{"text": "t", "start_sec": offset_sec + 0.2,
+                     "end_sec": offset_sec + 1.0}]
+
+        with (
+            mock.patch.object(subtitle_extract, "_call_gemini", side_effect=fake_call),
+            mock.patch(
+                "pipeline.subtitle_extract._segment_video",
+                return_value=[
+                    {"index": 0, "start": 0.0, "path": self.job_dir / "s0.mp4"},
+                    {"index": 1, "start": 90.0, "path": self.job_dir / "s1.mp4"},
+                ],
+            ),
+        ):
+            result = subtitle_extract.extract_subtitles(
+                self.job_id, upload_root=self.upload_root
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["chunked"])
+        self.assertEqual(result["segments_count"], 2)
+        self.assertEqual(result["failed_segments"], [])
+
 
 class SubtitleExtractFailureTest(SubtitleExtractBase):
     def test_key_rotation_falls_back(self):

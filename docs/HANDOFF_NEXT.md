@@ -1,3 +1,3 @@
 # HANDOFF NEXT
 
-C1 (LONG_VIDEO_CHUNK_THRESHOLD_SEC 600→90) সম্পূর্ণ। পরের কাজ: C2 (এই বদলের ফলে যেসব real-fixture টেস্ট এখন ffmpeg segment-cutting পাথে গিয়ে পড়ছে সেগুলোর regression চেক)।
+গ্রুপ C (৯০-সেকেন্ড sub-chunking threshold, regression-verified) সম্পূর্ণ। পরের কাজ: গ্রুপ D (D1 থেকে — independent local-Whisper cross-check)।
