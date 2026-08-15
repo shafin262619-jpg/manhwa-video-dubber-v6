@@ -1,3 +1,3 @@
 # HANDOFF NEXT
 
-D1 (subtitle_verify.whisper_cross_check, standalone) সম্পূর্ণ। পরের কাজ: D2 (upload_pipeline-এ wire করা, non-blocking best-effort)।
+D2 (whisper cross-check wired into upload_pipeline, best-effort/non-blocking) সম্পূর্ণ। পরের কাজ: D3 (edge-case টেস্ট + regression পাস)।

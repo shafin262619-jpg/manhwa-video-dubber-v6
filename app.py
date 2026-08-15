@@ -20,12 +20,14 @@ from pipeline import (
     edit_guideline,
     full_auto_chain,
     gemini_rotation,
+    job_logging,
     job_status as job_status_store,
     key_store,
     render_final,
     review,
     subtitle_builder,
     subtitle_extract,
+    subtitle_verify,
     translator,
     ui,
     video_ingest,
@@ -190,12 +192,24 @@ def _run_upload_pipeline(job_id):
                 job_id, call_budget=budget
             )
             subtitle_builder.build_subtitle_list(job_id, call_budget=budget)
+            try:
+                whisper_check = subtitle_verify.whisper_cross_check(
+                    job_id,
+                    logger_=job_logging.get_job_logger(job_id),
+                )
+            except Exception as exc:  # noqa: BLE001 - best-effort, never break upload_pipeline
+                logger.warning(
+                    "whisper cross-check failed for job %s (non-fatal): %s",
+                    job_id, exc,
+                )
+                whisper_check = {"status": "skipped"}
             translation = translator.translate_subtitles(
                 job_id, call_budget=budget
             )
             extra = {
                 "extraction_status": extraction["status"],
                 "serials": len(translation),
+                "whisper_check_status": whisper_check.get("status", "skipped"),
             }
             if extraction["status"] != "ok":
                 extra["errors"] = _extraction_error_summary(extraction)

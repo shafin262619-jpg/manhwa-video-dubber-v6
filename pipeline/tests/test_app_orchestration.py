@@ -323,6 +323,63 @@ class HttpWiringChainTest(unittest.TestCase):
         self.assertEqual(stage["state"], "done")
         self.assertEqual(stage["serials"], 1)
 
+    def test_upload_pipeline_records_whisper_check_status(self):
+        # D2: whisper_cross_check() success -> the upload_pipeline "done"
+        # status extra carries whisper_check_status from the returned dict.
+        job_dir = self.upload_root / "whisper-ok-job"
+        job_dir.mkdir(parents=True)
+        with mock.patch(
+            "pipeline.subtitle_extract.extract_subtitles",
+            return_value={"status": "ok"},
+        ), mock.patch(
+            "pipeline.subtitle_builder.build_subtitle_list",
+            return_value=[],
+        ), mock.patch(
+            "pipeline.subtitle_verify.whisper_cross_check",
+            return_value={"status": "ok", "mismatch": False},
+        ), mock.patch(
+            "pipeline.translator.translate_subtitles",
+            return_value=[],
+        ):
+            import app as app_module
+
+            app_module._run_upload_pipeline("whisper-ok-job")
+        status = job_status_store.read_status("whisper-ok-job")
+        stage = status["stages"]["upload_pipeline"]
+        self.assertEqual(stage["state"], "done")
+        self.assertEqual(stage["whisper_check_status"], "ok")
+
+    def test_upload_pipeline_survives_whisper_check_exception(self):
+        # D2: whisper_cross_check() raising must never break the upload
+        # pipeline — the stage still reaches "done" with whisper_check_status
+        # "skipped" and only a warning is logged.
+        job_dir = self.upload_root / "whisper-boom-job"
+        job_dir.mkdir(parents=True)
+
+        def boom(job_id, upload_root=None, logger_=None):
+            raise RuntimeError("whisper exploded")
+
+        with mock.patch(
+            "pipeline.subtitle_extract.extract_subtitles",
+            return_value={"status": "ok"},
+        ), mock.patch(
+            "pipeline.subtitle_builder.build_subtitle_list",
+            return_value=[],
+        ), mock.patch(
+            "pipeline.subtitle_verify.whisper_cross_check",
+            side_effect=boom,
+        ), mock.patch(
+            "pipeline.translator.translate_subtitles",
+            return_value=[],
+        ):
+            import app as app_module
+
+            app_module._run_upload_pipeline("whisper-boom-job")
+        status = job_status_store.read_status("whisper-boom-job")
+        stage = status["stages"]["upload_pipeline"]
+        self.assertEqual(stage["state"], "done")
+        self.assertEqual(stage["whisper_check_status"], "skipped")
+
 
 if __name__ == "__main__":
     unittest.main()

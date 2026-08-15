@@ -1,5 +1,29 @@
 # Manhwa Video Dubber — Changelog
 
+## [D2] — 2026-08-15 — wire `whisper_cross_check` into `app.py` upload pipeline (non-blocking, status-tracked)
+
+Second chunk of group D (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`).
+
+- `app.py` `_run_upload_pipeline()` now calls
+  `subtitle_verify.whisper_cross_check(job_id, logger_=job_logging.get_job_logger(job_id))`
+  right after `build_subtitle_list(...)` and before translation, wrapped in a
+  defensive `try/except Exception` so the best-effort cross-check can never
+  break the upload pipeline (bare `Exception` is intentional — the pipeline
+  must survive any whisper/librosa-related failure). The job's per-job logger
+  (via new `job_logging` import) captures the cross-check diagnostics.
+- The `upload_pipeline` "done" status `extra` now carries
+  `whisper_check_status` = the returned dict's `"status"` field, or
+  `"skipped"` when the call raised.
+- New tests in `pipeline/tests/test_app_orchestration.py`:
+  - `whisper_cross_check` succeeds → status extra shows
+    `whisper_check_status: "ok"`.
+  - `whisper_cross_check` raises (`side_effect=RuntimeError`) → the pipeline
+    still reaches `"done"` with `whisper_check_status: "skipped"`, no crash.
+- Existing upload-pipeline orchestration tests (incl. `test_full_auto_orchestration.py`
+  end-to-end) pass unchanged — with whisper not installed they naturally get
+  the `skipped` path. `python3 -m py_compile app.py` passes.
+- Full suite: **343 tests OK** (341 prior + 2 new).
+
 ## [D1] — 2026-08-15 — `pipeline/subtitle_verify.py` standalone local-Whisper coverage cross-check
 
 First chunk of group D (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`). New
