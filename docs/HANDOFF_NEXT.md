@@ -1,3 +1,3 @@
 # HANDOFF NEXT
 
-গ্রুপ C (৯০-সেকেন্ড sub-chunking threshold, regression-verified) সম্পূর্ণ। পরের কাজ: গ্রুপ D (D1 থেকে — independent local-Whisper cross-check)।
+D1 (subtitle_verify.whisper_cross_check, standalone) সম্পূর্ণ। পরের কাজ: D2 (upload_pipeline-এ wire করা, non-blocking best-effort)।

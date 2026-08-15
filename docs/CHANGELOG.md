@@ -1,5 +1,33 @@
 # Manhwa Video Dubber — Changelog
 
+## [D1] — 2026-08-15 — `pipeline/subtitle_verify.py` standalone local-Whisper coverage cross-check
+
+First chunk of group D (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`). New
+standalone module only — no wiring yet (that is D2).
+
+- New `pipeline/subtitle_verify.py` `whisper_cross_check(job_id, upload_root,
+  logger_)`: extracts mono wav from `source.mp4` via ffmpeg (reuses
+  `voiceover_upload._convert_to_wav`, same `TTS_SAMPLE_RATE`/mono PCM pattern),
+  transcribes with local Whisper (`config.WHISPER_MODEL`, segment-level, no
+  word timestamps, language auto-detect) and compares Whisper's measured
+  spoken duration against the Gemini-extracted `covered_duration_sec` from
+  `subtitle_qa.json` (via `subtitle_builder.load_subtitle_qa`). Returns a dict
+  with `status` (`ok`/`skipped`/`mismatch`), `reason`
+  (`whisper_not_installed`/`transcription_failed`), `whisper_spoken_sec`,
+  `extracted_covered_sec`, `coverage_ratio` (None when spoken is 0), and
+  `mismatch` bool. Never raises — Whisper missing / transcription / ffmpeg
+  failure all return `skipped`. Result persisted to
+  `uploads/<job_id>/subtitle_qa_whisper.json`.
+- `pipeline/config.py` `SUBTITLE_COVERAGE_MISMATCH_RATIO = 0.75`: a mismatch
+  is flagged when Gemini-extracted coverage is below this fraction of
+  Whisper's independently-measured spoken duration.
+- New `pipeline/tests/test_subtitle_verify.py` (6 tests): Whisper not
+  installed (`sys.modules["whisper"] = None` → ImportError), transcription
+  runtime failure, ffmpeg audio-extraction failure (all `skipped`, no raise),
+  coverage ratio above threshold → `ok`, below threshold → `mismatch`, and
+  `subtitle_qa_whisper.json` written with the full result dict.
+- Full suite: **341 tests OK** (335 prior + 6 new).
+
 ## [C2] — 2026-08-15 — regression-verify the 90s chunking threshold + explicit `chunked=True` coverage test
 
 Second and final chunk of group C (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`).

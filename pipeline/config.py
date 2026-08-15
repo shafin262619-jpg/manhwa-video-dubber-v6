@@ -131,3 +131,8 @@ SUBTITLE_DUP_CLUSTER_MIN_COUNT = 3
 # pass may make, largest-flagged-range-first (QA repair, B2). Protects the
 # shared per-job CallBudget from a runaway repair loop.
 SUBTITLE_MAX_REPAIR_ATTEMPTS = 3
+
+# whisper_cross_check() flags a mismatch when Gemini-extracted covered
+# duration is below this fraction of Whisper's independently-measured
+# spoken-audio duration (QA verification, D1).
+SUBTITLE_COVERAGE_MISMATCH_RATIO = 0.75
