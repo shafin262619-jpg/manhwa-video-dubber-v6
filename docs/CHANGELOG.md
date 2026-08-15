@@ -1,5 +1,32 @@
 # Manhwa Video Dubber — Changelog
 
+## [E2] — 2026-08-15 — wire QA summary banner into `/voiceover/{id}/choose` (non-blocking) + `subtitle_qa.json` download route
+
+Second chunk of group E (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`).
+
+- `app.py` `voiceover_choose_page()` (GET `/voiceover/{job_id}/choose`) now
+  calls `subtitle_qa.build_qa_summary(job_id)` before rendering. When
+  `qa_status == "flagged"` a `.flagged-banner` (same style as `review.py`) is
+  shown with: a short headline, each `qa["warnings"]` item as an `<li>`, a
+  link to download `subtitle_qa.json`, and an explicit note that it is
+  informational only — the auto_tts / user_upload choice buttons still render
+  unchanged, no confirmation step is added. `qa_status == "ok"` renders the
+  page exactly as before. The whole banner block is wrapped in a defensive
+  `try/except` so a `build_qa_summary` failure still serves the page
+  (non-blocking; E1's never-raise contract is guarded regardless).
+- New route `GET /download/{job_id}/subtitle_qa` → serves
+  `uploads/<job_id>/subtitle_qa.json` (404 when missing), in the same pattern
+  as the existing `download_voiceover_upload` route.
+- New `SubtitleQaBannerTest` in `pipeline/tests/test_app_orchestration.py`
+  (6 tests): `ok` → no banner; `flagged` → banner + warnings text + download
+  link + both choice forms intact (informational only); `build_qa_summary`
+  raising → page still 200 without banner; download route 200 with
+  `application/json` when the file exists and 404 when missing.
+- Existing orchestration tests (incl. the auto_tts zero-click path in
+  `test_full_auto_orchestration.py`, which never calls `/choose`) pass
+  unchanged. `python3 -m py_compile app.py` passes.
+- Full suite: **356 tests OK** (350 prior + 6 new).
+
 ## [E1] — 2026-08-15 — `pipeline/subtitle_qa.py` combined human-readable QA summary
 
 First chunk of group E (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`). New

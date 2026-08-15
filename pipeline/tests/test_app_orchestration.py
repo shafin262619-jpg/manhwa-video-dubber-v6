@@ -381,5 +381,117 @@ class HttpWiringChainTest(unittest.TestCase):
         self.assertEqual(stage["whisper_check_status"], "skipped")
 
 
+class SubtitleQaBannerTest(unittest.TestCase):
+    """E2: QA summary banner on /voiceover/{id}/choose + subtitle_qa download."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.upload_root = Path(self._tmp) / "uploads"
+        self.job_id = "qa-banner-job"
+        self.job_dir = self.upload_root / self.job_id
+        self.job_dir.mkdir(parents=True)
+        self._orig_upload_root = video_ingest.UPLOAD_ROOT
+        video_ingest.UPLOAD_ROOT = self.upload_root
+        self.addCleanup(self._restore)
+        self.client = TestClient(app)
+
+    def _restore(self):
+        video_ingest.UPLOAD_ROOT = self._orig_upload_root
+
+    def _choose_page(self):
+        return self.client.get(f"/voiceover/{self.job_id}/choose")
+
+    def test_ok_qa_shows_no_banner(self):
+        with mock.patch(
+            "pipeline.subtitle_qa.build_qa_summary",
+            return_value={
+                "qa_status": "ok",
+                "warnings": [],
+                "gaps_remaining": 0,
+                "duplicate_clusters_remaining": 0,
+                "repair_attempted": 0,
+                "repair_succeeded": 0,
+                "whisper_check_status": "ok",
+            },
+        ):
+            res = self._choose_page()
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertNotIn("flagged-banner", res.text)
+        self.assertNotIn("সাবটাইটেল এক্সট্রাকশনে কিছু সমস্যা", res.text)
+
+    def test_flagged_qa_shows_banner_with_warnings(self):
+        with mock.patch(
+            "pipeline.subtitle_qa.build_qa_summary",
+            return_value={
+                "qa_status": "flagged",
+                "warnings": [
+                    "~32 সেকেন্ডের একটা অংশ হয়তো বাদ পড়ে গেছে (serial 1-2-এর মাঝে)",
+                    "4টা লাইনে সন্দেহজনক ডুপ্লিকেট টাইমিং পাওয়া গেছে",
+                ],
+                "gaps_remaining": 1,
+                "duplicate_clusters_remaining": 1,
+                "repair_attempted": 1,
+                "repair_succeeded": 0,
+                "whisper_check_status": "ok",
+            },
+        ):
+            res = self._choose_page()
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertIn("flagged-banner", res.text)
+        self.assertIn("সাবটাইটেল এক্সট্রাকশনে কিছু সমস্যা", res.text)
+        self.assertIn("~32 সেকেন্ডের একটা অংশ হয়তো বাদ পড়ে গেছে", res.text)
+        self.assertIn("4টা লাইনে সন্দেহজনক ডুপ্লিকেট টাইমিং", res.text)
+        self.assertIn(f"/download/{self.job_id}/subtitle_qa", res.text)
+        self.assertIn("এগিয়ে যেতে পারেন", res.text)
+        self.assertIn("auto_tts", res.text)
+        self.assertIn("user_upload", res.text)
+
+    def test_flagged_qa_does_not_block_choice_forms(self):
+        # The banner is informational only: both choice buttons must still
+        # render so the user can proceed.
+        with mock.patch(
+            "pipeline.subtitle_qa.build_qa_summary",
+            return_value={
+                "qa_status": "flagged",
+                "warnings": ["কিছু সমস্যা"],
+                "gaps_remaining": 1,
+                "duplicate_clusters_remaining": 0,
+                "repair_attempted": 0,
+                "repair_succeeded": 0,
+                "whisper_check_status": "ok",
+            },
+        ):
+            res = self._choose_page()
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.text.count('method="post" action="/voiceover/'
+                                        f"{self.job_id}/choose\""), 2)
+
+    def test_qa_summary_raise_still_loads_page(self):
+        def boom(job_id, upload_root=None):
+            raise RuntimeError("qa summary exploded")
+
+        with mock.patch(
+            "pipeline.subtitle_qa.build_qa_summary", side_effect=boom
+        ):
+            res = self._choose_page()
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertNotIn("flagged-banner", res.text)
+
+    def test_download_subtitle_qa_returns_file(self):
+        (self.job_dir / "subtitle_qa.json").write_text(
+            json.dumps({"job_id": self.job_id, "covered_duration_sec": 10.0}),
+            encoding="utf-8",
+        )
+        res = self.client.get(f"/download/{self.job_id}/subtitle_qa")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.headers["content-type"], "application/json")
+        self.assertEqual(res.json()["covered_duration_sec"], 10.0)
+
+    def test_download_subtitle_qa_missing_404(self):
+        res = self.client.get(f"/download/{self.job_id}/subtitle_qa")
+        self.assertEqual(res.status_code, 404)
+        self.assertIn("no subtitle_qa.json", res.json()["detail"])
+
+
 if __name__ == "__main__":
     unittest.main()

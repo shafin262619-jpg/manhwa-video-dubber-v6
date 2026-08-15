@@ -5,6 +5,7 @@ Run locally with:
     uvicorn app:app --host 0.0.0.0 --port 5000
 """
 
+import html
 import json
 import logging
 import threading
@@ -27,6 +28,7 @@ from pipeline import (
     review,
     subtitle_builder,
     subtitle_extract,
+    subtitle_qa,
     subtitle_verify,
     translator,
     ui,
@@ -829,6 +831,19 @@ def download_voiceover_upload(job_id: str, format: str = Query("timestamps")) ->
     return FileResponse(path, media_type=media_type, filename=name)
 
 
+@app.get("/download/{job_id}/subtitle_qa")
+def download_subtitle_qa(job_id: str) -> FileResponse:
+    path = video_ingest.UPLOAD_ROOT / job_id / "subtitle_qa.json"
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"no subtitle_qa.json for job {job_id}",
+        )
+    return FileResponse(
+        path, media_type="application/json", filename="subtitle_qa.json"
+    )
+
+
 @app.post("/voiceover/{job_id}/upload", response_class=HTMLResponse)
 async def upload_voiceover(job_id: str, audio: UploadFile = File(...)) -> HTMLResponse:
     audio_bytes = await audio.read()
@@ -889,9 +904,32 @@ def voiceover_choose_page(job_id: str) -> HTMLResponse:
     current_html = (
         f"<p>Current choice: <strong>{current}</strong></p>" if current else ""
     )
+    qa_banner = ""
+    try:
+        qa = subtitle_qa.build_qa_summary(job_id)
+        if qa.get("qa_status") == "flagged":
+            items = "".join(
+                f"<li>{html.escape(w)}</li>" for w in qa.get("warnings", [])
+            )
+            qa_banner = (
+                '<div class="flagged-banner">'
+                "<p><strong>এই ভিডিওর সাবটাইটেল এক্সট্রাকশনে কিছু সমস্যা "
+                "পাওয়া গেছে</strong></p>"
+                f"<ul>{items}</ul>"
+                f'<p><a href="/download/{job_id}/subtitle_qa">subtitle_qa.json '
+                "ডাউনলোড করুন</a></p>"
+                "<p>এটা শুধু তথ্যের জন্য — তবুও এগিয়ে যেতে পারেন, কিন্তু "
+                "ভয়েসওভার রেকর্ড করার আগে চাইলে সাবটাইটেল দেখে নিতে পারেন।</p>"
+                "</div>"
+            )
+    except Exception as exc:  # noqa: BLE001 - banner is non-blocking
+        logger.warning(
+            "QA summary banner failed for job %s (non-fatal): %s", job_id, exc
+        )
     body = f"""
   <h1>Voiceover source — job {job_id}</h1>
   {current_html}
+  {qa_banner}
   <p>Choose how the Hindi voiceover will be created:</p>
   <form method="post" action="/voiceover/{job_id}/choose">
     <button type="submit" name="mode" value="auto_tts">
