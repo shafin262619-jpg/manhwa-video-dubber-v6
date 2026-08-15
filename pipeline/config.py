@@ -115,3 +115,8 @@ SUBTITLE_GAP_FLAG_THRESHOLD_SEC = 6.0
 # zero-duration) are flagged as a degenerate extraction cluster (QA
 # diagnostics, A2).
 SUBTITLE_DUP_CLUSTER_MIN_COUNT = 3
+
+# Max number of targeted re-extraction (Gemini) calls a single job's repair
+# pass may make, largest-flagged-range-first (QA repair, B2). Protects the
+# shared per-job CallBudget from a runaway repair loop.
+SUBTITLE_MAX_REPAIR_ATTEMPTS = 3

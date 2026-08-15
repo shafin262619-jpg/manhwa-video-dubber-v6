@@ -1,5 +1,37 @@
 # Manhwa Video Dubber — Changelog
 
+## [B2] — 2026-08-15 — `subtitle_builder.repair_flagged_regions()` — bounded targeted-repair orchestration (Subtitle QA Fix)
+
+Second chunk of group B (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`). Adds
+the bounded repair orchestration that consumes A3 diagnostics and drives
+B1's `extract_window`.
+
+- New `pipeline/subtitle_builder.py` function `repair_flagged_regions(job_id,
+  entries, diagnostics, upload_root=None, call_budget=None, logger_=None,
+  max_attempts=None)` — builds a merged, weight-ordered list of time ranges
+  from `diagnostics["gaps"]` and `["duplicate_clusters"]` (gaps use their
+  exact window; clusters span first/last entry ± half
+  `SUBTITLE_OVERLAP_SEC` padding; overlapping ranges merged), calls
+  `subtitle_extract.extract_window()` for at most `max_attempts` ranges
+  (largest `gap_sec`/`count` first, default
+  `config.SUBTITLE_MAX_REPAIR_ATTEMPTS = 3`), replaces raw entries
+  overlapping each repaired window with the fresh absolute-timed subtitles,
+  and re-serializes. Returns `(repaired_entries, repair_summary)` with
+  `{"attempted", "succeeded", "failed", "skipped_budget": [ranges]}`. Never
+  raises — a failing range is skipped, remaining ranges still run, and
+  beyond-budget ranges land in `skipped_budget`.
+- `call_budget` is forwarded to `extract_window()` so repair shares the
+  job's per-job CallBudget (no unlimited calls).
+- New `pipeline/config.py` constant `SUBTITLE_MAX_REPAIR_ATTEMPTS = 3`.
+- New tests in `pipeline/tests/test_subtitle_builder.py`
+  (`RepairFlaggedRegionsTest`, 8 tests): gap repaired inserts new entries;
+  duplicate cluster replaced; `extract_window` `None` → range untouched and
+  `failed == 1` without raising; >`max_attempts` flags run largest-first and
+  rest land in `skipped_budget`; overlapping ranges merged into one call;
+  no flags → entries unchanged and `extract_window` never called;
+  `call_budget` forwarded; default `max_attempts` reads config.
+- Full suite: **326 tests OK** (318 prior + 8 new).
+
 ## [B1] — 2026-08-15 — `subtitle_extract.extract_window()` — targeted time-range re-extraction (standalone, Subtitle QA Fix)
 
 First chunk of group B (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`). Adds

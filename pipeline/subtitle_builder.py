@@ -16,7 +16,7 @@ import json
 import logging
 from pathlib import Path
 
-from pipeline import config, video_ingest
+from pipeline import config, subtitle_extract, video_ingest
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +243,133 @@ def detect_gaps(serialized_entries, threshold_sec=None):
                 "gap_sec": round(gap_sec, 3)
             })
     return gaps
+
+
+def _overlap(a_start, a_end, b_start, b_end):
+    return a_start < b_end and b_start < a_end
+
+
+def _build_repair_ranges(entries, diagnostics):
+    """Build sorted, merged repair ranges from A3 diagnostics.
+
+    Gaps map to their exact ``[gap_start_sec, gap_end_sec)`` window;
+    duplicate clusters map to the span of their first/last entry plus half a
+    ``SUBTITLE_OVERLAP_SEC`` padding on each side. Overlapping ranges are
+    merged (redundant Gemini calls avoided). Returns ``[start, end, weight]``
+    sorted by weight descending (most important first).
+    """
+    pad = config.SUBTITLE_OVERLAP_SEC / 2.0
+    serialized = _serialize(entries)
+    by_serial = {e["serial"]: e for e in serialized}
+
+    ranges = []
+    for g in diagnostics.get("gaps", []):
+        start = float(g["gap_start_sec"])
+        end = float(g["gap_end_sec"])
+        weight = float(g.get("gap_sec", 0.0))
+        if end > start:
+            ranges.append([start, end, weight])
+    for c in diagnostics.get("duplicate_clusters", []):
+        first = by_serial.get(c.get("start_serial"))
+        last = by_serial.get(c.get("end_serial"))
+        if first is None or last is None:
+            continue
+        start = min(float(first["start_sec"]), float(first["end_sec"])) - pad
+        end = max(float(last["start_sec"]), float(last["end_sec"])) + pad
+        weight = float(c.get("count", 0))
+        if end > start:
+            ranges.append([start, end, weight])
+
+    ranges.sort(key=lambda r: r[0])
+    merged = []
+    for r in ranges:
+        if merged and _overlap(merged[-1][0], merged[-1][1], r[0], r[1]):
+            merged[-1][0] = min(merged[-1][0], r[0])
+            merged[-1][1] = max(merged[-1][1], r[1])
+            merged[-1][2] = max(merged[-1][2], r[2])
+        else:
+            merged.append(list(r))
+
+    merged.sort(key=lambda r: r[2], reverse=True)
+    return merged
+
+
+def _replace_range_entries(entries, start, end, new_subs):
+    """Drop raw entries overlapping ``[start, end]`` and insert new subs."""
+    kept = []
+    for e in entries:
+        e_start = float(e["start_sec"])
+        e_end = float(e["end_sec"])
+        if e_start < end and e_end > start:
+            continue
+        kept.append(e)
+    for sub in new_subs:
+        kept.append(
+            {
+                "text_zh": sub["text"],
+                "status": "ok",
+                "start_sec": float(sub["start_sec"]),
+                "end_sec": float(sub["end_sec"]),
+            }
+        )
+    return kept
+
+
+def repair_flagged_regions(job_id, entries, diagnostics, upload_root=None,
+                           call_budget=None, logger_=None, max_attempts=None):
+    """Bounded targeted-repair orchestration over A3 diagnostics.
+
+    Builds a merged, weight-ordered list of time ranges from
+    ``diagnostics["gaps"]`` and ``diagnostics["duplicate_clusters"]``, runs
+    ``subtitle_extract.extract_window()`` for at most ``max_attempts`` ranges
+    (largest first, ``config.SUBTITLE_MAX_REPAIR_ATTEMPTS`` by default), and
+    replaces the raw entries overlapping each successfully-repaired window
+    with the freshly extracted absolute-timed subtitles. The whole list is
+    re-serialized at the end.
+
+    Never raises: a range whose extraction returns ``None`` is skipped and the
+    next one proceeds. Ranges beyond ``max_attempts`` are not attempted and are
+    reported in ``skipped_budget``. ``call_budget`` is forwarded to
+    ``extract_window`` so repair shares the job's per-job CallBudget.
+
+    Returns ``(repaired_entries, repair_summary)`` where ``repaired_entries``
+    is the re-serialized entry list and ``repair_summary`` is
+    ``{"attempted", "succeeded", "failed", "skipped_budget": [ranges]}``.
+    """
+    if max_attempts is None:
+        max_attempts = config.SUBTITLE_MAX_REPAIR_ATTEMPTS
+    log = logger_ or logger
+
+    ranges = _build_repair_ranges(entries, diagnostics)
+
+    attempted = 0
+    succeeded = 0
+    failed = 0
+    skipped_budget = []
+    repaired = list(entries)
+
+    for start, end, _weight in ranges:
+        if attempted >= max_attempts:
+            skipped_budget.append({"start_sec": start, "end_sec": end})
+            continue
+        attempted += 1
+        new_subs = subtitle_extract.extract_window(
+            job_id, start, end,
+            upload_root=upload_root, call_budget=call_budget, logger_=log,
+        )
+        if new_subs is None:
+            failed += 1
+            continue
+        succeeded += 1
+        repaired = _replace_range_entries(repaired, start, end, new_subs)
+
+    summary = {
+        "attempted": attempted,
+        "succeeded": succeeded,
+        "failed": failed,
+        "skipped_budget": skipped_budget,
+    }
+    return _serialize(repaired), summary
 
 
 def build_subtitle_list(job_id, upload_root=None):

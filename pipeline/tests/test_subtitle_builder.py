@@ -473,5 +473,167 @@ class LoadSubtitleQaTest(SubtitleBuilderBase):
         self.assertEqual(qa["duplicate_clusters"], [])
 
 
+class RepairFlaggedRegionsTest(unittest.TestCase):
+    def _raw_entries(self, pairs):
+        return [
+            {"text_zh": f"t{i}", "status": "ok", "start_sec": s, "end_sec": e}
+            for i, (s, e) in enumerate(pairs, start=1)
+        ]
+
+    def _diagnostics(self, entries):
+        serialized = subtitle_builder._serialize(entries)
+        return {
+            "gaps": subtitle_builder.detect_gaps(serialized),
+            "duplicate_clusters": subtitle_builder.detect_duplicate_clusters(
+                serialized
+            ),
+        }
+
+    def _patch_extract(self, subs):
+        return mock.patch.object(
+            subtitle_builder.subtitle_extract,
+            "extract_window",
+            return_value=subs,
+        )
+
+    def test_gap_repair_inserts_new_entries(self):
+        entries = self._raw_entries([(0.0, 2.0), (10.0, 12.0)])
+        diag = self._diagnostics(entries)
+        with self._patch_extract(
+            [{"text": "new", "start_sec": 3.0, "end_sec": 5.0}]
+        ) as fake:
+            repaired, summary = subtitle_builder.repair_flagged_regions(
+                "job-x", entries, diag
+            )
+        fake.assert_called_once()
+        self.assertEqual(summary["attempted"], 1)
+        self.assertEqual(summary["succeeded"], 1)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["skipped_budget"], [])
+        texts = [e["text_zh"] for e in repaired]
+        self.assertEqual(texts, ["t1", "new", "t2"])
+        self.assertEqual([e["serial"] for e in repaired], [1, 2, 3])
+
+    def test_duplicate_cluster_repair_replaces_old_entries(self):
+        entries = self._raw_entries([(0.0, 2.0), (3.0, 3.0), (3.0, 3.0), (3.0, 3.0)])
+        diag = self._diagnostics(entries)
+        self.assertTrue(diag["duplicate_clusters"])
+        with self._patch_extract(
+            [{"text": "fixed", "start_sec": 3.0, "end_sec": 5.0}]
+        ) as fake:
+            repaired, summary = subtitle_builder.repair_flagged_regions(
+                "job-x", entries, diag
+            )
+        self.assertEqual(summary["succeeded"], 1)
+        texts = [e["text_zh"] for e in repaired]
+        self.assertNotIn("t2", texts)
+        self.assertNotIn("t3", texts)
+        self.assertNotIn("t4", texts)
+        self.assertIn("fixed", texts)
+
+    def test_extract_failure_keeps_range_untouched(self):
+        entries = self._raw_entries([(0.0, 2.0), (10.0, 12.0)])
+        diag = self._diagnostics(entries)
+        with self._patch_extract(None) as fake:
+            repaired, summary = subtitle_builder.repair_flagged_regions(
+                "job-x", entries, diag
+            )
+        fake.assert_called_once()
+        self.assertEqual(summary["attempted"], 1)
+        self.assertEqual(summary["succeeded"], 0)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual([e["text_zh"] for e in repaired], ["t1", "t2"])
+
+    def test_more_flags_than_max_attempts_uses_largest_first(self):
+        entries = self._raw_entries(
+            [(0.0, 2.0), (10.0, 12.0), (30.0, 32.0), (50.0, 52.0), (80.0, 82.0)]
+        )
+        diag = self._diagnostics(entries)
+        with self._patch_extract(
+            [{"text": "new", "start_sec": 3.0, "end_sec": 4.0}]
+        ) as fake:
+            repaired, summary = subtitle_builder.repair_flagged_regions(
+                "job-x", entries, diag, max_attempts=2
+            )
+        self.assertEqual(fake.call_count, 2)
+        self.assertEqual(summary["attempted"], 2)
+        self.assertEqual(summary["succeeded"], 2)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(len(summary["skipped_budget"]), 2)
+        skipped = sorted(
+            (r["start_sec"], r["end_sec"]) for r in summary["skipped_budget"]
+        )
+        self.assertEqual(skipped, [(2.0, 10.0), (32.0, 50.0)])
+
+    def test_overlapping_ranges_merged_single_call(self):
+        entries = self._raw_entries([(0.0, 2.0), (10.0, 12.0), (30.0, 32.0)])
+        diag = {
+            "gaps": [
+                {"after_serial": 1, "before_serial": 2,
+                 "gap_start_sec": 2.0, "gap_end_sec": 12.0, "gap_sec": 10.0},
+                {"after_serial": 2, "before_serial": 3,
+                 "gap_start_sec": 11.0, "gap_end_sec": 32.0, "gap_sec": 21.0},
+            ],
+            "duplicate_clusters": [],
+        }
+        with self._patch_extract(
+            [{"text": "new", "start_sec": 5.0, "end_sec": 7.0}]
+        ) as fake:
+            repaired, summary = subtitle_builder.repair_flagged_regions(
+                "job-x", entries, diag
+            )
+        fake.assert_called_once()
+        self.assertEqual(summary["attempted"], 1)
+        self.assertEqual(summary["succeeded"], 1)
+        call_start = fake.call_args.args[1]
+        call_end = fake.call_args.args[2]
+        self.assertLessEqual(call_start, 2.0)
+        self.assertGreaterEqual(call_end, 32.0)
+
+    def test_no_flags_returns_entries_unchanged_no_calls(self):
+        entries = self._raw_entries([(0.0, 2.0), (3.0, 5.0)])
+        diag = {"gaps": [], "duplicate_clusters": []}
+        with self._patch_extract([]) as fake:
+            repaired, summary = subtitle_builder.repair_flagged_regions(
+                "job-x", entries, diag
+            )
+        fake.assert_not_called()
+        self.assertEqual(summary["attempted"], 0)
+        self.assertEqual(summary["succeeded"], 0)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["skipped_budget"], [])
+        self.assertEqual([e["text_zh"] for e in repaired], ["t1", "t2"])
+
+    def test_call_budget_forwarded_to_extract_window(self):
+        entries = self._raw_entries([(0.0, 2.0), (10.0, 12.0)])
+        diag = self._diagnostics(entries)
+        budget = object()
+        with self._patch_extract(
+            [{"text": "new", "start_sec": 3.0, "end_sec": 5.0}]
+        ) as fake:
+            subtitle_builder.repair_flagged_regions(
+                "job-x", entries, diag, call_budget=budget
+            )
+        self.assertIs(fake.call_args.kwargs["call_budget"], budget)
+
+    def test_default_max_attempts_reads_config(self):
+        entries = self._raw_entries(
+            [(0.0, 2.0), (10.0, 12.0), (30.0, 32.0), (50.0, 52.0), (80.0, 82.0)]
+        )
+        diag = self._diagnostics(entries)
+        with (
+            self._patch_extract(
+                [{"text": "new", "start_sec": 3.0, "end_sec": 4.0}]
+            ) as fake,
+            mock.patch("pipeline.config.SUBTITLE_MAX_REPAIR_ATTEMPTS", 1),
+        ):
+            repaired, summary = subtitle_builder.repair_flagged_regions(
+                "job-x", entries, diag
+            )
+        self.assertEqual(fake.call_count, 1)
+        self.assertEqual(summary["attempted"], 1)
+        self.assertEqual(len(summary["skipped_budget"]), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

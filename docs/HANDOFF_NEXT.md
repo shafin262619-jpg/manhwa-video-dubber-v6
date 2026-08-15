@@ -1,3 +1,3 @@
 # HANDOFF NEXT
 
-B1 (extract_window, standalone) সম্পূর্ণ। পরের কাজ: B2 (repair orchestration — কোন রেঞ্জে চালাতে হবে সেটা গ্রুপ A-এর diagnostics থেকে ঠিক করা, ফলাফল merge করা)।
+B2 (repair_flagged_regions, standalone orchestration) সম্পূর্ণ। পরের কাজ: B3 (build_subtitle_list() + app.py-তে wire করা — end-to-end auto-repair)।
