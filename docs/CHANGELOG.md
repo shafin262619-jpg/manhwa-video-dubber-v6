@@ -1,5 +1,31 @@
 # Manhwa Video Dubber — Changelog
 
+## [A3] — 2026-08-15 — Wire gap/duplicate-cluster diagnostics into `build_subtitle_list()` → `subtitle_qa.json` (Subtitle QA Fix)
+
+Third and final chunk of group A (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`).
+Wires the A1/A2 standalone diagnostics into the builder and writes a
+per-job QA artifact.
+
+- `pipeline/subtitle_builder.py` `build_subtitle_list()`: after serializing,
+  calls `detect_gaps(result)` and `detect_duplicate_clusters(result)`,
+  computes `covered_duration_sec = max(0.0, duration - sum(gap_sec))`, and
+  writes a diagnostics dict to `job_dir/subtitle_qa.json` (same
+  `json.dumps(..., ensure_ascii=False, indent=2)` style as
+  `subtitles_zh.json`). Return value unchanged — still the serialized entries
+  list, so app.py and existing tests need no changes (backward compat).
+- New helper `load_subtitle_qa(job_id, upload_root=None)` — reads
+  `subtitle_qa.json`; missing/malformed/non-dict input returns a default dict
+  (`gaps: []`, `duplicate_clusters: []`, ...), never raises. Intended for
+  groups B and E.
+- New tests in `pipeline/tests/test_subtitle_builder.py`
+  (`SubtitleQaArtifactTest`, 3 tests; `LoadSubtitleQaTest`, 4 tests):
+  gap+cluster fixture writes correct `subtitle_qa.json` while the return
+  value stays the same; clean fixture writes empty lists; `load_subtitle_qa`
+  reads existing files and returns defaults for missing / malformed /
+  non-dict JSON without raising. Existing builder tests unchanged
+  (regression).
+- Full suite: **312 tests OK** (305 prior + 7 new).
+
 ## [A2] — 2026-08-15 — Duplicate/degenerate-timestamp cluster detection + `_serialize()` zero-duration logging (Subtitle QA Fix)
 
 Second chunk of the subtitle-QA-fix chain (plan:

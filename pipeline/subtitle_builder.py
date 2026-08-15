@@ -246,7 +246,12 @@ def detect_gaps(serialized_entries, threshold_sec=None):
 
 
 def build_subtitle_list(job_id, upload_root=None):
-    """Build ``subtitles_zh.json`` from ``subtitles_zh_raw.json``. Returns list."""
+    """Build ``subtitles_zh.json`` from ``subtitles_zh_raw.json``. Returns list.
+
+    Side artifact: also writes ``subtitle_qa.json`` with coverage-gap and
+    duplicate-cluster diagnostics (QA diagnostics, A3). The return value is
+    unchanged (still the serialized entries list) for backward compatibility.
+    """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = upload_root / job_id
     raw = _load_json(job_dir / "subtitles_zh_raw.json")
@@ -255,8 +260,66 @@ def build_subtitle_list(job_id, upload_root=None):
     entries = _build_entries(raw, duration)
     result = _serialize(entries)
 
+    gaps = detect_gaps(result)
+    duplicate_clusters = detect_duplicate_clusters(result)
+    covered_sec = duration - sum(g["gap_sec"] for g in gaps)
+    if covered_sec < 0.0:
+        covered_sec = 0.0
+    diagnostics = {
+        "job_id": job_id,
+        "total_duration_sec": round(duration, 3),
+        "covered_duration_sec": round(covered_sec, 3),
+        "entries_count": len(result),
+        "gaps": gaps,
+        "duplicate_clusters": duplicate_clusters,
+    }
+    qa_path = job_dir / "subtitle_qa.json"
+    qa_path.write_text(
+        json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
     out_path = job_dir / "subtitles_zh.json"
     out_path.write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return result
+
+
+def load_subtitle_qa(job_id, upload_root=None):
+    """Read ``subtitle_qa.json`` and return its dict.
+
+    Never raises: when the file is missing or malformed, returns a default
+    dict with empty diagnostics lists.
+    """
+    upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
+    job_dir = upload_root / job_id
+    path = job_dir / "subtitle_qa.json"
+    if not path.exists():
+        return {
+            "job_id": job_id,
+            "total_duration_sec": 0.0,
+            "covered_duration_sec": 0.0,
+            "entries_count": 0,
+            "gaps": [],
+            "duplicate_clusters": [],
+        }
+    try:
+        data = _load_json(path)
+    except (ValueError, OSError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    defaults = {
+        "job_id": job_id,
+        "total_duration_sec": 0.0,
+        "covered_duration_sec": 0.0,
+        "entries_count": 0,
+        "gaps": [],
+        "duplicate_clusters": [],
+    }
+    defaults.update(data)
+    if not isinstance(defaults["gaps"], list):
+        defaults["gaps"] = []
+    if not isinstance(defaults["duplicate_clusters"], list):
+        defaults["duplicate_clusters"] = []
+    return defaults

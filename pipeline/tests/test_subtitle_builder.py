@@ -348,5 +348,130 @@ class SerializeZeroDurationLoggingTest(unittest.TestCase):
         self.assertEqual(result[1]["end_sec"], 2.0)
 
 
+class SubtitleQaArtifactTest(SubtitleBuilderBase):
+    def _read_qa(self):
+        return json.loads(
+            (self.job_dir / "subtitle_qa.json").read_text(encoding="utf-8")
+        )
+
+    def test_qa_written_with_gap_and_cluster_return_unchanged(self):
+        self._write_meta(20.0)
+        self._write_raw(
+            {
+                "status": "ok",
+                "chunked": False,
+                "segments_count": 1,
+                "failed_segments": [],
+                "subtitles": [
+                    {"text": "a", "start_sec": 0.0, "end_sec": 2.0},
+                    {"text": "b", "start_sec": 3.0, "end_sec": 3.0},
+                    {"text": "c", "start_sec": 3.0, "end_sec": 3.0},
+                    {"text": "d", "start_sec": 3.0, "end_sec": 3.0},
+                    {"text": "e", "start_sec": 15.0, "end_sec": 16.0},
+                ],
+            }
+        )
+        result = self._build()
+        self.assertEqual(len(result), 5)
+        self.assertEqual(result[0]["serial"], 1)
+        self.assertEqual(result[-1]["serial"], 5)
+
+        qa = self._read_qa()
+        self.assertEqual(qa["job_id"], self.job_id)
+        self.assertEqual(qa["total_duration_sec"], 20.0)
+        self.assertEqual(qa["entries_count"], 5)
+        self.assertEqual(len(qa["gaps"]), 1)
+        self.assertEqual(qa["gaps"][0]["after_serial"], 4)
+        self.assertEqual(qa["gaps"][0]["before_serial"], 5)
+        self.assertEqual(qa["gaps"][0]["gap_sec"], 12.0)
+        self.assertEqual(qa["covered_duration_sec"], 8.0)
+        self.assertEqual(len(qa["duplicate_clusters"]), 1)
+        self.assertEqual(qa["duplicate_clusters"][0]["reason"], "zero_duration")
+        self.assertEqual(qa["duplicate_clusters"][0]["count"], 3)
+
+    def test_clean_fixture_writes_empty_qa_lists(self):
+        self._write_meta(10.0)
+        self._write_raw(
+            {
+                "status": "ok",
+                "chunked": False,
+                "segments_count": 1,
+                "failed_segments": [],
+                "subtitles": [
+                    {"text": "a", "start_sec": 0.0, "end_sec": 3.0},
+                    {"text": "b", "start_sec": 3.5, "end_sec": 6.0},
+                ],
+            }
+        )
+        result = self._build()
+        self.assertEqual(len(result), 2)
+        qa = self._read_qa()
+        self.assertEqual(qa["gaps"], [])
+        self.assertEqual(qa["duplicate_clusters"], [])
+        self.assertEqual(qa["covered_duration_sec"], 10.0)
+        self.assertEqual(qa["total_duration_sec"], 10.0)
+
+    def test_qa_matches_serialized_output(self):
+        self._write_meta(10.0)
+        self._write_raw(
+            {
+                "status": "ok",
+                "chunked": False,
+                "segments_count": 1,
+                "failed_segments": [],
+                "subtitles": [
+                    {"text": "a", "start_sec": 0.0, "end_sec": 2.0},
+                    {"text": "b", "start_sec": 3.0, "end_sec": 4.0},
+                    {"text": "c", "start_sec": 3.0, "end_sec": 4.0},
+                    {"text": "d", "start_sec": 3.0, "end_sec": 4.0},
+                ],
+            }
+        )
+        result = self._build()
+        self.assertEqual(self._read_output(), result)
+        self.assertTrue((self.job_dir / "subtitle_qa.json").exists())
+
+
+class LoadSubtitleQaTest(SubtitleBuilderBase):
+    def test_reads_existing_file(self):
+        self._write_meta(10.0)
+        self._write_raw(
+            {
+                "status": "ok",
+                "chunked": False,
+                "segments_count": 1,
+                "failed_segments": [],
+                "subtitles": [
+                    {"text": "a", "start_sec": 0.0, "end_sec": 2.0},
+                    {"text": "b", "start_sec": 8.5, "end_sec": 9.5},
+                ],
+            }
+        )
+        self._build()
+        qa = subtitle_builder.load_subtitle_qa(self.job_id, upload_root=self.upload_root)
+        self.assertEqual(qa["job_id"], self.job_id)
+        self.assertEqual(len(qa["gaps"]), 1)
+        self.assertEqual(len(qa["duplicate_clusters"]), 0)
+
+    def test_missing_file_returns_defaults(self):
+        qa = subtitle_builder.load_subtitle_qa(self.job_id, upload_root=self.upload_root)
+        self.assertEqual(qa["gaps"], [])
+        self.assertEqual(qa["duplicate_clusters"], [])
+        self.assertEqual(qa["entries_count"], 0)
+
+    def test_malformed_json_returns_defaults(self):
+        (self.job_dir / "subtitle_qa.json").write_text("{not json", encoding="utf-8")
+        qa = subtitle_builder.load_subtitle_qa(self.job_id, upload_root=self.upload_root)
+        self.assertEqual(qa["gaps"], [])
+        self.assertEqual(qa["duplicate_clusters"], [])
+        self.assertEqual(qa["entries_count"], 0)
+
+    def test_non_dict_json_returns_defaults(self):
+        (self.job_dir / "subtitle_qa.json").write_text("[1, 2]", encoding="utf-8")
+        qa = subtitle_builder.load_subtitle_qa(self.job_id, upload_root=self.upload_root)
+        self.assertEqual(qa["gaps"], [])
+        self.assertEqual(qa["duplicate_clusters"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
