@@ -160,7 +160,7 @@ class BackwardCompatAuditTest(unittest.TestCase):
             }
         if name in ("draft_final_video.mp4", "final_video.mp4"):
             return {
-                "format": {"duration": "2.0"},
+                "format": {"duration": "5.0"},
                 "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
             }
         return {"format": {}, "streams": []}

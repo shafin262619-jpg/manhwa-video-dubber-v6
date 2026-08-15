@@ -104,9 +104,20 @@ RENDER_AUDIO_CODEC = "aac"
 # source fps cannot be read (E2).
 RENDER_DEFAULT_FPS = 25
 
-# The draft video duration is validated against the voiceover duration within
-# this many frames of the source frame rate (E2).
+# The draft video duration is validated against the source video duration
+# within this many frames of the source frame rate (E2).
 RENDER_TOLERANCE_FRAMES = 3
+
+# user_upload draft-duration validation tolerance (E2). A human-recorded
+# voiceover has natural pacing variance, so the draft cannot be expected to
+# land within a few frames of the source video the way the auto-TTS path can
+# (whose clip durations are measured and precisely controlled). The tolerance
+# is the LARGER of this fixed few seconds and this ratio of the source video
+# duration. A large mismatch (well beyond both, e.g. 20+s on a ~5min video)
+# still fails and is a strong signal that a wrong/mismatched file was
+# uploaded or the alignment is broken.
+USER_UPLOAD_DURATION_TOLERANCE_SEC = 3.0
+USER_UPLOAD_DURATION_TOLERANCE_RATIO = 0.05
 
 # Timeout (seconds) for each ffmpeg render step: clip / concat / mux (E2).
 RENDER_TIMEOUT_SEC = 600

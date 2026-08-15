@@ -1,5 +1,67 @@
 # Manhwa Video Dubber — Changelog
 
+## [E6] — 2026-08-15 — draft duration-validation fix: validate against the source video (single source of truth) + loose user_upload tolerance
+
+Real-media QA audio-upload validation bug, reported from job
+`705fea53-129e-4cfe-bc75-0e49ef356305` (voice source `user_upload`):
+
+```
+draft video validation failed for job 705fea53-129e-4cfe-bc75-0e49ef356305:
+{'has_video': True, 'has_audio': True, 'duration_sec': 526.228451,
+ 'expected_duration_sec': 504.517, 'tolerance_sec': 0.1, 'duration_ok': False}
+```
+
+The same job's `subtitle_qa.json` reported `total_duration_sec: 303.021` — a
+different number for the same source video (also confirmed by the user: ~5min
+3s). Two distinct problems:
+
+- **Problem 1 — `expected_duration_sec` from the wrong source**
+  (`pipeline/auto_cut.py` + duplicated in `pipeline/review.py`): the draft
+  validation compared the rendered draft against the **voiceover audio's**
+  ffprobe duration (`_probe_duration(voiceover_hi.wav)`), which for a
+  human-recorded voiceover can be a completely different number from the
+  source video's real length. So the same job produced two unrelated
+  durations (303s vs 504s). Fix: `expected_duration_sec` now comes from the
+  **source video** via `auto_cut._source_duration` — it reads
+  `job_meta.json` (written by `video_ingest` from an ffprobe of
+  `source.mp4`) with a direct ffprobe fallback. This is the exact same
+  origin `subtitle_builder` uses for `subtitle_qa.json`'s
+  `total_duration_sec`, so the validation and the subtitle diagnostics now
+  share one source of truth and always agree.
+- **Problem 2 — tolerance unrealistically strict for user uploads**: the
+  tolerance was `RENDER_TOLERANCE_FRAMES` (3 source frames ≈ 0.1s) — fine for
+  auto-TTS (clip durations are measured/precise) but impossible for a
+  human-recorded voiceover with natural pacing variance. Fix: a new
+  configurable loose tolerance is applied only when
+  `voice_source == "user_upload"` — the larger of
+  `config.USER_UPLOAD_DURATION_TOLERANCE_SEC` (3.0s) and
+  `config.USER_UPLOAD_DURATION_TOLERANCE_RATIO` (0.05 × source duration). The
+  auto-TTS / unset path keeps the strict frames tolerance. A large mismatch
+  (e.g. 20+s on a ~5min video) still fails — a strong wrong-file signal.
+- **Files**: `pipeline/auto_cut.py` (`_source_duration`,
+  `_draft_validation_tolerance`, `build_draft_video` now reports
+  `expected_duration_sec` + `voice_source`), `pipeline/review.py`
+  (`apply_clip_edit` re-splice validation uses the same helpers),
+  `pipeline/config.py` (new `USER_UPLOAD_DURATION_TOLERANCE_SEC` /
+  `USER_UPLOAD_DURATION_TOLERANCE_RATIO`).
+- **Regression tests** (`pipeline/tests/test_auto_cut.py`,
+  `DurationValidationRegressionTest`, +6):
+  - auto-TTS and user_upload paths: `expected_duration_sec` equals the
+    draft's real ffprobe duration (a correct draft lands on the source
+    duration).
+  - `expected_duration_sec` reads `job_meta.json` (single source of truth,
+    matching `subtitle_qa.json`'s `total_duration_sec`) even when a direct
+    source probe would disagree.
+  - user_upload accepts a few seconds of variation (2.5s on a 60s video).
+  - user_upload rejects a large mismatch (25s) and the raised error reports
+    the **source** duration as `expected_duration_sec`.
+  - auto-TTS keeps the strict tolerance (a 3s drift is rejected).
+  - Existing orchestration/chain/review fixtures updated so their mocked
+    draft duration matches the mocked/real source duration (the validation
+    base changed from voiceover to source).
+- Full suite: **366 tests OK** (was 360; +6).
+- Tag: `manhwa-video-dubber-v6-duration-validation-fix`.
+
 ## [E5] — 2026-08-15 — real-media QA-writeback fix: single zero-duration subtitles now repaired instead of leaking into the final SRT
 
 Root-cause fix + regression tests. Real job

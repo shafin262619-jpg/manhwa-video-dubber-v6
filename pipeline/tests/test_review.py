@@ -269,7 +269,7 @@ class ApplyClipEditTest(ReviewBase):
             return {"format": {"duration": "14.0"}, "streams": []}
         if name == "source.mp4":
             return {
-                "format": {"duration": "60.0"},
+                "format": {"duration": "14.0"},
                 "streams": [{"codec_type": "video", "r_frame_rate": "25/1"}],
             }
         if name == "draft_final_video.mp4":
@@ -453,7 +453,7 @@ class ApplyClipEditEndpointTest(ReviewBase):
                     duration = "14.0"
                 elif name == "source.mp4":
                     return _ok_result(json.dumps({
-                        "format": {"duration": "60.0"},
+                        "format": {"duration": "14.0"},
                         "streams": [{"codec_type": "video", "r_frame_rate": "25/1"}],
                     }))
                 else:

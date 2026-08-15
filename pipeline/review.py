@@ -26,7 +26,7 @@ import json
 import logging
 from pathlib import Path
 
-from pipeline import auto_cut, config, ui, video_ingest
+from pipeline import auto_cut, config, ui, video_ingest, voiceover_unify
 from pipeline.auto_cut import DraftValidationError
 
 logger = logging.getLogger(__name__)
@@ -387,13 +387,14 @@ def apply_clip_edit(
     auto_cut._run(auto_cut.build_concat_command(concat_list, concat_video))
     auto_cut._run(auto_cut.build_mux_command(concat_video, voiceover, draft_out))
 
-    voiceover_duration = auto_cut._probe_duration(voiceover)
     source_probe = auto_cut._probe(source)
-    fps = auto_cut._first_video_frame_rate(source_probe)
-    frame_duration = (1.0 / fps) if fps else (1.0 / config.RENDER_DEFAULT_FPS)
-    tolerance = config.RENDER_TOLERANCE_FRAMES * frame_duration
+    expected_duration_sec = auto_cut._source_duration(job_dir)
+    voice_source = voiceover_unify.get_voice_source(job_id, upload_root)
+    tolerance = auto_cut._draft_validation_tolerance(
+        expected_duration_sec, source_probe, voice_source
+    )
     ok, details = auto_cut._validate_draft(
-        auto_cut._probe(draft_out), voiceover_duration, tolerance
+        auto_cut._probe(draft_out), expected_duration_sec, tolerance
     )
     if not ok:
         logger.error("job %s: post-edit draft validation failed: %s", job_id, details)

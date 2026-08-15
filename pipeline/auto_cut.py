@@ -13,8 +13,11 @@ ratio are inherited from the source video (no forced values).
 
 Verification (mirrors the Auto Manhwa Maker ``render.py`` pattern): the draft
 is probed with ffprobe and must have both a video and an audio stream and a
-duration within a few frames of the voiceover duration. A failed validation
-raises :class:`DraftValidationError`.
+duration within tolerance of the **source video's** duration (the same
+ffprobe-derived length ``subtitle_qa.json`` reports). The tolerance is a few
+source frames for the auto-TTS path and a loose, configurable margin for the
+``user_upload`` path (a human-recorded voiceover has natural pacing
+variance). A failed validation raises :class:`DraftValidationError`.
 """
 
 import json
@@ -22,7 +25,7 @@ import logging
 import subprocess
 from pathlib import Path
 
-from pipeline import config, video_ingest
+from pipeline import config, video_ingest, voiceover_unify
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,52 @@ def _probe_duration(path):
         return float(data.get("format", {}).get("duration"))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _source_duration(job_dir):
+    """Source video duration (sec) — the single source of truth for the draft
+    validation.
+
+    Reads ``job_meta.json`` (written by ``video_ingest`` from an ffprobe of
+    ``source.mp4``), falling back to probing the file directly. This is the
+    same origin ``subtitle_builder`` uses for ``subtitle_qa.json``'s
+    ``total_duration_sec``, so diagnostics and the draft validation agree on
+    the real video length instead of two unrelated numbers.
+    """
+    meta_path = job_dir / "job_meta.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            meta = {}
+        duration = meta.get("duration_sec")
+        if duration is not None:
+            try:
+                return float(duration)
+            except (TypeError, ValueError):
+                pass
+    return _probe_duration(job_dir / "source.mp4")
+
+
+def _draft_validation_tolerance(expected_duration_sec, source_probe, voice_source):
+    """Draft-duration validation tolerance for a job's voice source.
+
+    - ``auto_tts`` (and unset choice): strict — a few frames of the source
+      frame rate. TTS clip durations are measured/precise, so the draft is
+      expected to land essentially on the source duration.
+    - ``user_upload``: loose — ``USER_UPLOAD_DURATION_TOLERANCE_SEC`` seconds
+      or ``USER_UPLOAD_DURATION_TOLERANCE_RATIO`` of the source duration,
+      whichever is larger, because a human-recorded voiceover has natural
+      pacing variance.
+    """
+    if voice_source == voiceover_unify.ALLOWED_MODES[1]:
+        return max(
+            config.USER_UPLOAD_DURATION_TOLERANCE_SEC,
+            float(expected_duration_sec) * config.USER_UPLOAD_DURATION_TOLERANCE_RATIO,
+        )
+    fps = _first_video_frame_rate(source_probe)
+    frame_duration = (1.0 / fps) if fps else (1.0 / config.RENDER_DEFAULT_FPS)
+    return config.RENDER_TOLERANCE_FRAMES * frame_duration
 
 
 def _load_json_list(path):
@@ -208,9 +257,11 @@ def build_draft_video(job_id, upload_root=None):
     voiceover_duration = _probe_duration(voiceover)
 
     source_probe = _probe(source)
-    fps = _first_video_frame_rate(source_probe)
-    frame_duration = (1.0 / fps) if fps else (1.0 / config.RENDER_DEFAULT_FPS)
-    tolerance = config.RENDER_TOLERANCE_FRAMES * frame_duration
+    expected_duration_sec = _source_duration(job_dir)
+    voice_source = voiceover_unify.get_voice_source(job_id, upload_root)
+    tolerance = _draft_validation_tolerance(
+        expected_duration_sec, source_probe, voice_source
+    )
 
     clips_dir = job_dir / DRAFT_CLIPS_DIR
     clips_dir.mkdir(parents=True, exist_ok=True)
@@ -240,7 +291,7 @@ def build_draft_video(job_id, upload_root=None):
     _run(build_mux_command(concat_video, voiceover, draft_out))
 
     final_probe = _probe(draft_out)
-    ok, details = _validate_draft(final_probe, voiceover_duration, tolerance)
+    ok, details = _validate_draft(final_probe, expected_duration_sec, tolerance)
     if not ok:
         logger.error("job %s: draft validation failed: %s", job_id, details)
         raise DraftValidationError(
@@ -253,6 +304,8 @@ def build_draft_video(job_id, upload_root=None):
         "status": "ok",
         "clip_count": len(clip_paths),
         "duration_sec": details["duration_sec"],
+        "expected_duration_sec": round(expected_duration_sec, 3),
+        "voice_source": voice_source,
         "voiceover_duration_sec": round(voiceover_duration, 3),
         "tolerance_sec": round(tolerance, 3),
         "draft_path": str(draft_out),

@@ -49,6 +49,12 @@ class AutoCutBase(unittest.TestCase):
             json.dumps(entries, ensure_ascii=False), encoding="utf-8"
         )
 
+    def _write_choice(self, mode):
+        (self.job_dir / "voice_source_choice.json").write_text(
+            json.dumps({"job_id": self.job_id, "mode": mode}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
     def _probe_for(self, path):
         """Return the ffprobe JSON dict the mock should emit for a path."""
         name = Path(path).name
@@ -56,7 +62,7 @@ class AutoCutBase(unittest.TestCase):
             return {"format": {"duration": "12.0"}, "streams": []}
         if name == "source.mp4":
             return {
-                "format": {"duration": "60.0"},
+                "format": {"duration": "12.0"},
                 "streams": [{"codec_type": "video", "r_frame_rate": "25/1"}],
             }
         if name == "draft_final_video.mp4":
@@ -214,7 +220,7 @@ class ValidationInBuildTest(AutoCutBase):
 
         def probe_override(path):
             if Path(path).name == "draft_final_video.mp4":
-                # grossly longer than the voiceover -> validation must fail
+                # grossly longer than the source video -> validation must fail
                 return {
                     "format": {"duration": "30.0"},
                     "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
@@ -233,6 +239,87 @@ class ValidationInBuildTest(AutoCutBase):
         self.assertEqual(result["duration_sec"], 12.1)
         # 3 frames at 25fps -> 0.12s tolerance
         self.assertAlmostEqual(result["tolerance_sec"], 0.12, places=2)
+
+
+class DurationValidationRegressionTest(AutoCutBase):
+    """Real-media QA regression: draft duration is validated against the
+    SOURCE video duration (single source of truth, same as subtitle_qa.json's
+    total_duration_sec), with a loose tolerance for user_upload and the strict
+    frames tolerance for auto_tts.
+    """
+
+    def _write(self, source_dur, draft_dur, mode=None):
+        self._write_inputs()
+        self._write_guideline([_entry(1, 0.0, 6.0, 1.0)])
+        if mode is not None:
+            self._write_choice(mode)
+
+        def probe_override(path):
+            name = Path(path).name
+            if name == "source.mp4":
+                return {
+                    "format": {"duration": str(source_dur)},
+                    "streams": [{"codec_type": "video", "r_frame_rate": "25/1"}],
+                }
+            if name == "draft_final_video.mp4":
+                return {
+                    "format": {"duration": str(draft_dur)},
+                    "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
+                }
+            return self._probe_for(path)
+
+        return self._run_with(probe_override=probe_override)
+
+    def test_auto_tts_expected_duration_matches_draft(self):
+        # A correct auto-TTS draft lands on the source duration; the reported
+        # expected_duration_sec must equal the draft's real ffprobe duration.
+        result, _ = self._write(60.0, 60.0, mode="auto_tts")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["expected_duration_sec"], 60.0)
+        self.assertEqual(result["duration_sec"], 60.0)
+        self.assertEqual(result["voice_source"], "auto_tts")
+        self.assertAlmostEqual(result["tolerance_sec"], 0.12, places=2)
+
+    def test_user_upload_expected_duration_matches_draft(self):
+        result, _ = self._write(60.0, 60.0, mode="user_upload")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["expected_duration_sec"], 60.0)
+        self.assertEqual(result["duration_sec"], 60.0)
+        self.assertEqual(result["voice_source"], "user_upload")
+
+    def test_expected_duration_reads_job_meta_single_source_of_truth(self):
+        # The validation's expected_duration_sec and subtitle_qa's
+        # total_duration_sec must derive from the same ffprobe value: the
+        # source video, recorded in job_meta.json. Even if a direct source
+        # probe would say otherwise, job_meta wins (it is the value
+        # subtitle_builder reports as total_duration_sec).
+        (self.job_dir / "job_meta.json").write_text(
+            json.dumps({"job_id": self.job_id, "duration_sec": 303.021}),
+            encoding="utf-8",
+        )
+        result, _ = self._write(60.0, 303.0, mode="user_upload")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["expected_duration_sec"], 303.021)
+
+    def test_user_upload_accepts_few_seconds_variation(self):
+        # A few seconds of human-pacing variance on a user recording is fine.
+        result, _ = self._write(60.0, 62.5, mode="user_upload")
+        self.assertEqual(result["status"], "ok")
+        self.assertAlmostEqual(result["tolerance_sec"], 3.0, places=3)
+
+    def test_user_upload_rejects_large_mismatch(self):
+        # A 25s mismatch signals a wrong/mismatched file; it must be rejected
+        # and the reported expected_duration_sec must be the SOURCE duration
+        # (not the voiceover's).
+        with self.assertRaises(auto_cut.DraftValidationError) as ctx:
+            self._write(60.0, 85.0, mode="user_upload")
+        self.assertIn("'expected_duration_sec': 60.0", str(ctx.exception))
+
+    def test_auto_tts_keeps_strict_tolerance(self):
+        # The auto-TTS path keeps the frames-strict tolerance: a 3s drift is
+        # rejected even though the user_upload path would accept it.
+        with self.assertRaises(auto_cut.DraftValidationError):
+            self._write(60.0, 63.0, mode="auto_tts")
 
 
 class InputErrorTest(AutoCutBase):
