@@ -1,5 +1,29 @@
 # Manhwa Video Dubber — Changelog
 
+## [B1] — 2026-08-15 — `subtitle_extract.extract_window()` — targeted time-range re-extraction (standalone, Subtitle QA Fix)
+
+First chunk of group B (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`). Adds
+the windowed re-extraction primitive the repair pipeline will consume.
+
+- New `pipeline/subtitle_extract.py` function `extract_window(job_id,
+  start_sec, end_sec, upload_root=None, call_budget=None, logger_=None)` —
+  cuts `[start_sec, end_sec)` from `source.mp4` via ffmpeg with the exact
+  `_segment_video()` pattern (`-ss` / `-to` / `-c copy`, no re-encode),
+  writes the clip under `job_dir/repair_segments/`, sends it to Gemini
+  through `call_with_rotation` (key-rotation / content-block resilience
+  preserved), and returns a subtitle list with absolute timing (offset
+  `start_sec` added back). Never raises: returns `None` on missing source,
+  no active keys, ffmpeg failure, rotated-Gemini failure, or malformed
+  response. Standalone — not wired into `build_subtitle_list()` or app.py
+  yet (that is B2/B3).
+- New tests in `pipeline/tests/test_subtitle_extract.py`
+  (`ExtractWindowTest`, 6 tests): success applies absolute offset (relative
+  Gemini times become `start_sec`-shifted absolute times); all-keys-fail →
+  `None` without raising; malformed JSON → `None` without raising; ffmpeg
+  call uses `-ss`/`-to`/`-c copy` and writes under `repair_segments/`;
+  ffmpeg failure → `None` (Gemini never called); missing source → `None`.
+- Full suite: **318 tests OK** (312 prior + 6 new).
+
 ## [A3] — 2026-08-15 — Wire gap/duplicate-cluster diagnostics into `build_subtitle_list()` → `subtitle_qa.json` (Subtitle QA Fix)
 
 Third and final chunk of group A (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`).

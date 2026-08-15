@@ -336,6 +336,130 @@ class SubtitleExtractRetryTest(SubtitleExtractBase):
         self.assertEqual(result["errors"]["0"]["message"], "real cause")
 
 
+class ExtractWindowTest(SubtitleExtractBase):
+    def test_success_applies_absolute_offset(self):
+        self._write_meta(120.0)
+        self._set_keys(["key-one"])
+
+        def fake_call(key, prompt, video_path, offset_sec):
+            self.assertEqual(offset_sec, 45.0)
+            return [
+                {"text": "a", "start_sec": offset_sec + 1.0,
+                 "end_sec": offset_sec + 2.5},
+                {"text": "b", "start_sec": offset_sec + 3.0,
+                 "end_sec": offset_sec + 4.0},
+            ]
+
+        with (
+            mock.patch.object(subtitle_extract, "_run_ffmpeg"),
+            mock.patch.object(subtitle_extract, "_call_gemini", side_effect=fake_call),
+        ):
+            subs = subtitle_extract.extract_window(
+                self.job_id, 45.0, 75.0, upload_root=self.upload_root
+            )
+
+        self.assertEqual(len(subs), 2)
+        self.assertEqual(subs[0]["text"], "a")
+        self.assertEqual(subs[0]["start_sec"], 46.0)
+        self.assertEqual(subs[0]["end_sec"], 47.5)
+        self.assertEqual(subs[1]["start_sec"], 48.0)
+        self.assertEqual(subs[1]["end_sec"], 49.0)
+
+    def test_all_keys_fail_returns_none(self):
+        self._write_meta(120.0)
+        self._set_keys(["key-bad", "key-worse"])
+
+        def fake_call(*args, **kwargs):
+            raise RuntimeError("total failure")
+
+        with (
+            mock.patch.object(subtitle_extract, "_run_ffmpeg"),
+            mock.patch.object(subtitle_extract, "_call_gemini", side_effect=fake_call),
+        ):
+            result = subtitle_extract.extract_window(
+                self.job_id, 10.0, 20.0, upload_root=self.upload_root
+            )
+
+        self.assertIsNone(result)
+
+    def test_malformed_json_returns_none(self):
+        self._write_meta(120.0)
+        self._set_keys(["key-one"])
+
+        with (
+            mock.patch.object(subtitle_extract, "_run_ffmpeg"),
+            mock.patch.object(
+                subtitle_extract, "_call_gemini",
+                side_effect=ValueError("malformed JSON from Gemini"),
+            ),
+        ):
+            result = subtitle_extract.extract_window(
+                self.job_id, 10.0, 20.0, upload_root=self.upload_root
+            )
+
+        self.assertIsNone(result)
+
+    def test_ffmpeg_args_use_ss_to_copy(self):
+        self._write_meta(120.0)
+        self._set_keys(["key-one"])
+        fake_ffmpeg_result = type(
+            "R", (), {"returncode": 0, "stderr": "", "stdout": ""}
+        )()
+        clip_path = None
+
+        def fake_call(key, prompt, video_path, offset_sec):
+            nonlocal clip_path
+            clip_path = str(video_path)
+            return [{"text": "x", "start_sec": offset_sec + 0.1,
+                     "end_sec": offset_sec + 1.0}]
+
+        with (
+            mock.patch.object(subtitle_extract.subprocess, "run",
+                              return_value=fake_ffmpeg_result) as fake_run,
+            mock.patch.object(subtitle_extract, "_call_gemini", side_effect=fake_call),
+        ):
+            subs = subtitle_extract.extract_window(
+                self.job_id, 30.0, 60.0, upload_root=self.upload_root
+            )
+
+        self.assertIsNotNone(subs)
+        run_calls = fake_run.call_args_list
+        ffmpeg_args = run_calls[0].args[0]
+        self.assertEqual(ffmpeg_args[0], "ffmpeg")
+        self.assertIn("-ss", ffmpeg_args)
+        self.assertIn("-to", ffmpeg_args)
+        self.assertIn("-c", ffmpeg_args)
+        self.assertEqual(ffmpeg_args[ffmpeg_args.index("-c") + 1], "copy")
+        self.assertIn("30.000", ffmpeg_args)
+        self.assertIn("60.000", ffmpeg_args)
+        self.assertTrue(clip_path.startswith(str(self.job_dir / "repair_segments")))
+        self.assertTrue(clip_path.endswith(".mp4"))
+
+    def test_ffmpeg_failure_returns_none(self):
+        self._write_meta(120.0)
+        self._set_keys(["key-one"])
+        with (
+            mock.patch.object(
+                subtitle_extract, "_run_ffmpeg",
+                side_effect=RuntimeError("ffmpeg failed"),
+            ),
+            mock.patch.object(subtitle_extract, "_call_gemini") as fake,
+        ):
+            result = subtitle_extract.extract_window(
+                self.job_id, 10.0, 20.0, upload_root=self.upload_root
+            )
+        self.assertIsNone(result)
+        fake.assert_not_called()
+
+    def test_missing_source_returns_none(self):
+        (self.job_dir / "source.mp4").unlink()
+        self._write_meta(120.0)
+        result = subtitle_extract.extract_window(
+            self.job_id, 0.0, 10.0, upload_root=self.upload_root
+        )
+        self.assertIsNone(result)
+
+
 class UploadReuseTest(unittest.TestCase):
     def test_upload_cached_per_key_and_path(self):
         # U2b: same-key same-path uploads are cached (no re-upload); a second

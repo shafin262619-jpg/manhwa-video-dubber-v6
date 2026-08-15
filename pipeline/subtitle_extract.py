@@ -389,6 +389,59 @@ def _save(job_dir, result):
     return result
 
 
+def extract_window(job_id, start_sec, end_sec, upload_root=None,
+                   call_budget=None, logger_=None):
+    """Re-extract subtitles for a specific time range ``[start_sec, end_sec)``.
+
+    Cuts a clip from ``source.mp4`` via ffmpeg (``-ss``/``-to``/``-c copy``,
+    exactly like ``_segment_video``), sends it to Gemini separately through
+    ``call_with_rotation`` (key-rotation / content-block resilience), and
+    returns a subtitle list with absolute timing (offset ``start_sec`` added
+    back). The clip is written under ``job_dir/repair_segments/`` so it never
+    collides with the main ``segments/`` or the group-A artifacts.
+
+    Standalone (not wired into ``build_subtitle_list`` or app.py yet; wiring
+    is B2/B3). Never raises on Gemini/parse failures: returns ``None`` when
+    ffmpeg fails, no active keys, the rotated Gemini call fails, or the
+    response is malformed. On success returns a list of subtitle dicts with
+    ``text`` / ``start_sec`` / ``end_sec`` (absolute).
+    """
+    upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
+    job_dir = upload_root / job_id
+    source = job_dir / "source.mp4"
+    if not source.exists():
+        return None
+
+    keys = key_store.get_active_keys()
+    if not keys:
+        logger_.error("extract_window cannot start for job %s: no active Gemini keys", job_id) if logger_ else None
+        return None
+
+    repair_dir = job_dir / "repair_segments"
+    repair_dir.mkdir(exist_ok=True)
+    out = repair_dir / f"window_{start_sec:06.3f}_{end_sec:06.3f}.mp4"
+    try:
+        _run_ffmpeg(
+            [
+                "ffmpeg", "-y", "-ss", f"{start_sec:.3f}", "-to", f"{end_sec:.3f}",
+                "-i", str(source), "-c", "copy", str(out),
+            ]
+        )
+    except RuntimeError:
+        return None
+
+    subs, rotation, error = call_with_rotation(
+        keys, 0, _call_gemini, SUBTITLE_EXTRACT_PROMPT, out, start_sec,
+        call_budget=call_budget, logger_=logger_,
+    )
+    if subs is None:
+        log = logger_ or logger
+        log.error("extract_window for job %s window [%.3f, %.3f) failed: %s",
+                  job_id, start_sec, end_sec, error)
+        return None
+    return subs
+
+
 def extract_subtitles(job_id, upload_root=None, call_budget=None):
     """Extract Chinese subtitles for a job. Never raises on Gemini failures."""
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
