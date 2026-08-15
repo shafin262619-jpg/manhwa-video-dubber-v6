@@ -393,8 +393,10 @@ def apply_clip_edit(
     tolerance = auto_cut._draft_validation_tolerance(
         expected_duration_sec, source_probe, voice_source
     )
+    enforce_duration = voice_source != voiceover_unify.ALLOWED_MODES[1]
     ok, details = auto_cut._validate_draft(
-        auto_cut._probe(draft_out), expected_duration_sec, tolerance
+        auto_cut._probe(draft_out), expected_duration_sec, tolerance,
+        enforce_duration,
     )
     if not ok:
         logger.error("job %s: post-edit draft validation failed: %s", job_id, details)

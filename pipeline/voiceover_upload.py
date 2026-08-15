@@ -21,7 +21,10 @@ fallback" pattern):
 
 Every line whose timing did not come from the primary Gemini pass is flagged
 ``alignment_fallback: true`` (plus an ``alignment_source`` field for clarity).
-``align_uploaded_voiceover`` never raises on Gemini/Whisper failures.
+``align_uploaded_voiceover`` never raises on Gemini/Whisper failures — the
+only alignment failure it treats as blocking is an audio file with no
+measurable content (``total_sec <= 0``), which raises
+:class:`~pipeline.voiceover_unify.VoiceoverAlignmentError`.
 """
 
 import json
@@ -38,6 +41,7 @@ from google.genai import types as genai_types
 from pipeline import config, job_logging, key_store, video_ingest
 from pipeline.subtitle_extract import _extract_json, call_with_rotation
 from pipeline.voiceover_auto import _probe_audio_duration, _run
+from pipeline.voiceover_unify import VoiceoverAlignmentError
 
 logger = logging.getLogger(__name__)
 
@@ -335,6 +339,7 @@ def align_uploaded_voiceover(job_id, upload_root=None):
             "fallback_serials": [],
             "entries_count": 0,
             "total_sec": 0.0,
+            "warnings": [],
             "voiceover_path": str(audio_path),
             "timestamps_path": str(timestamps_path),
         }
@@ -344,6 +349,16 @@ def align_uploaded_voiceover(job_id, upload_root=None):
     except Exception as exc:  # noqa: BLE001 - fallback must survive
         job_logger.error("job %s: cannot probe voiceover duration: %s", job_id, exc)
         total_sec = 0.0
+
+    if total_sec <= 0:
+        # No measurable audio content -> no segment can be aligned to real
+        # audio. This is a genuine per-segment alignment failure (not a
+        # total-duration mismatch, which is normal translation drift), so it
+        # blocks and tells the user what to do.
+        raise VoiceoverAlignmentError(
+            f"voiceover alignment failed for job {job_id}: the uploaded audio "
+            "has no measurable content. Re-upload a valid audio file."
+        )
 
     keys = key_store.get_active_keys()
     timestamps = _gemini_align(keys, entries, audio_path, logger_=job_logger)
@@ -371,6 +386,20 @@ def align_uploaded_voiceover(job_id, upload_root=None):
         entry["serial"] for entry in timestamps if entry["alignment_fallback"]
     ]
 
+    warnings = []
+    if status == "equal_split":
+        warnings.append(
+            "Uploaded audio could not be matched to any subtitle line; "
+            "placeholder (equal-split) timings were used for every segment. "
+            "The dubbing will still render, but line timing may be off."
+        )
+    elif status == "whisper":
+        warnings.append(
+            f"{len(fallback_serials)} line(s) could not be matched to the "
+            "uploaded audio and got placeholder timing. The dubbing will "
+            "still render, but those segments may be mis-timed."
+        )
+
     timestamps_path.write_text(
         json.dumps(timestamps, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -384,6 +413,7 @@ def align_uploaded_voiceover(job_id, upload_root=None):
         "fallback_serials": fallback_serials,
         "entries_count": len(entries),
         "total_sec": round(total_sec, 3),
+        "warnings": warnings,
         "voiceover_path": str(audio_path),
         "timestamps_path": str(timestamps_path),
     }

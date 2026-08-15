@@ -329,5 +329,84 @@ class VoiceoverUnifyTimestampsTest(VoiceoverUnifyTimestampsBase):
             self._unify()
 
 
+class VoiceoverAlignmentCompletenessTest(VoiceoverUnifyTimestampsBase):
+    """Per-segment alignment validation (duration-check removal): every
+    subtitle segment must have a matching voiceover timestamp. A subtitle
+    serial with no timestamp means no audio was aligned for that segment,
+    which is the real user_upload blocking condition — unlike a total-length
+    mismatch, which is normal translation drift and never blocks."""
+
+    def _write_subtitles(self, serials):
+        self._write_source(
+            "subtitles_hi.json",
+            [{"serial": s, "text_zh": "A", "text_hi": "कुछ"} for s in serials],
+        )
+
+    def test_missing_subtitle_serial_raises(self):
+        self._set_mode("user_upload")
+        self._write_subtitles([1, 2])
+        self._write_source(
+            "timestamps_hi_upload.json",
+            [
+                {
+                    "serial": 1, "start_sec": 0.0, "end_sec": 1.0,
+                    "alignment_fallback": False, "alignment_source": "gemini",
+                },
+            ],
+        )
+        self._make_audio()
+        with self.assertRaises(voiceover_unify.VoiceoverAlignmentError) as ctx:
+            self._unify()
+        self.assertIn("segment(s)", str(ctx.exception))
+        self.assertFalse((self.job_dir / "timestamps_hi_final.json").exists())
+
+    def test_all_subtitle_serials_present_passes(self):
+        self._set_mode("user_upload")
+        self._write_subtitles([1, 2])
+        self._write_source(
+            "timestamps_hi_upload.json",
+            [
+                {
+                    "serial": 1, "start_sec": 0.0, "end_sec": 1.0,
+                    "alignment_fallback": False, "alignment_source": "gemini",
+                },
+                {
+                    "serial": 2, "start_sec": 1.0, "end_sec": 2.0,
+                    "alignment_fallback": False, "alignment_source": "gemini",
+                },
+            ],
+        )
+        self._make_audio()
+        result = self._unify()
+        self.assertEqual(result["entries_count"], 2)
+        self.assertEqual(result["missing_serials"], [])
+        self.assertTrue((self.job_dir / "timestamps_hi_final.json").exists())
+
+    def test_missing_serials_reported_in_result_when_extra_subtitle_only(self):
+        # When subtitles exist and all their serials are covered, missing is [].
+        self._set_mode("auto_tts")
+        self._write_subtitles([1])
+        self._write_source(
+            "timestamps_hi_auto.json",
+            [{"serial": 1, "start_sec": 0.0, "end_sec": 1.0, "tts_failed": False}],
+        )
+        self._make_audio()
+        result = self._unify()
+        self.assertEqual(result["missing_serials"], [])
+
+    def test_without_subtitles_file_skips_completeness_check(self):
+        # Backward compat: callers that only work with timestamps (no
+        # subtitles_hi.json on disk) are unaffected by the check.
+        self._set_mode("auto_tts")
+        self._write_source(
+            "timestamps_hi_auto.json",
+            [{"serial": 1, "start_sec": 0.0, "end_sec": 1.0, "tts_failed": False}],
+        )
+        self._make_audio()
+        result = self._unify()
+        self.assertEqual(result["entries_count"], 1)
+        self.assertEqual(result["missing_serials"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

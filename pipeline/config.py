@@ -105,19 +105,28 @@ RENDER_AUDIO_CODEC = "aac"
 RENDER_DEFAULT_FPS = 25
 
 # The draft video duration is validated against the source video duration
-# within this many frames of the source frame rate (E2).
+# within this many frames of the source frame rate (E2). This strict check
+# applies to the auto-TTS path only (clip durations are measured/precise); the
+# user_upload path never blocks on total duration (see below).
 RENDER_TOLERANCE_FRAMES = 3
 
-# user_upload draft-duration validation tolerance (E2). A human-recorded
-# voiceover has natural pacing variance, so the draft cannot be expected to
-# land within a few frames of the source video the way the auto-TTS path can
-# (whose clip durations are measured and precisely controlled). The tolerance
-# is the LARGER of this fixed few seconds and this ratio of the source video
-# duration. A large mismatch (well beyond both, e.g. 20+s on a ~5min video)
-# still fails and is a strong signal that a wrong/mismatched file was
-# uploaded or the alignment is broken.
+# user_upload draft-duration tolerance (E2, informational only after the
+# duration-check removal). A human-recorded voiceover has natural pacing
+# variance, and translated dialogue is legitimately a different length from
+# the original video, so the draft is never BLOCKED on total-duration for the
+# user_upload path. These two values only size the reported tolerance /
+# mismatch diagnostics now; they do not gate the render.
 USER_UPLOAD_DURATION_TOLERANCE_SEC = 3.0
 USER_UPLOAD_DURATION_TOLERANCE_RATIO = 0.05
+
+# Non-blocking "did you upload the right file?" warning threshold for the
+# user_upload path: when the rendered draft (which equals the uploaded
+# voiceover's total length) is at least this many times LONGER or this fraction
+# SHORTER than the source video, the job still completes but the result page
+# shows a warning banner. 5x (or 1/5x) is a strong wrong-file signal while
+# staying well clear of legitimate translation drift (e.g. the real-media test
+# of 523s audio on a 303s video is ~1.7x and produces no warning).
+USER_UPLOAD_DURATION_WARNING_RATIO = 5.0
 
 # Timeout (seconds) for each ffmpeg render step: clip / concat / mux (E2).
 RENDER_TIMEOUT_SEC = 600

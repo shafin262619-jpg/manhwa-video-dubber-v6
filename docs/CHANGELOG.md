@@ -1,5 +1,71 @@
 # Manhwa Video Dubber — Changelog
 
+## [E8] — 2026-08-15 — duration-check removed for user_upload: total-length differences are normal translation drift, never a block
+
+Design correction of the E6 fix. E6 made the draft video validation compare the
+rendered draft's **total duration** against the **source video's** duration
+with a loose `user_upload` tolerance (3s / 5%), blocking the whole job with
+`duration_ok: False` on a large mismatch. The premise was wrong: the pipeline's
+purpose is to stretch/squeeze each source scene-clip to the length of the
+corresponding segment of the user's uploaded voiceover (`pts_multiplier` in
+`auto_cut.py`). Because of translation, a dialogue (and therefore the whole
+video) being substantially shorter or longer than the original is **normal and
+desirable** — the real-media test was 523s of audio on a 303s video (~73%
+longer) and that is valid, not an error condition.
+
+- **Problem** (`pipeline/auto_cut.py` `_validate_draft` + `build_draft_video`):
+  the total-duration tolerance check blocked `user_upload` jobs whose
+  translated voiceover was a different length from the source video.
+- **Fix 1 — remove the total-duration block for `user_upload`**:
+  `_validate_draft` gained an `enforce_duration` flag. It is now `False` when
+  `voice_source == "user_upload"`, so a duration mismatch never fails the draft
+  (structural checks — video + audio streams — still always apply). The
+  auto-TTS / unset path keeps the strict frames tolerance unchanged (TTS clip
+  durations are measured/precise). The duration numbers are still computed and
+  reported (`duration_ok`, `duration_enforced`).
+- **Fix 2 — the real correctness check is per-segment alignment** (the log
+  line `unified N voiceover timestamps from timestamps_hi_upload.json`):
+  - `voiceover_unify.unify_voiceover_timestamps` (D4) now validates per-segment
+    completeness: every serial in `subtitles_hi.json` must have a matching
+    voiceover timestamp. A subtitle segment with no aligned audio raises the
+    new `VoiceoverAlignmentError` (blocking) — the only legitimate user_upload
+    block, alongside an audio file with no measurable content.
+  - `voiceover_upload.align_uploaded_voiceover` (D3) raises
+    `VoiceoverAlignmentError` when the uploaded audio has `total_sec <= 0`
+    (no measurable content → no segment can be aligned to real audio). Its
+    result now carries a `warnings` list; a serious `equal_split` fallback
+    (no segment matched real audio) is surfaced as a non-blocking warning.
+  - `full_auto_chain` results now include the `draft` (E2) result, and the
+    final-video page renders a non-blocking banner when the alignment or draft
+    stage reported warnings.
+- **Fix 3 — optional non-blocking warning for extreme mismatches**:
+  `build_draft_video` reports `duration_warning` when the user_upload draft
+  length differs from the source by ≥ `USER_UPLOAD_DURATION_WARNING_RATIO`
+  (5x, new config; 1/5x in the short direction) — e.g. "এই অডিও আসল ভিডিওর
+  চেয়ে উল্লেখযোগ্য ভিন্ন দৈর্ঘ্যের, ঠিক ফাইল আপলোড হয়েছে তো?" It never
+  blocks.
+- **Files**: `pipeline/config.py` (new
+  `USER_UPLOAD_DURATION_WARNING_RATIO`; tolerance constants are now
+  informational-only), `pipeline/auto_cut.py`, `pipeline/voiceover_unify.py`
+  (`VoiceoverAlignmentError` + completeness check), `pipeline/voiceover_upload.py`,
+  `pipeline/review.py` (`apply_clip_edit` re-splice uses the same
+  `enforce_duration` logic), `pipeline/full_auto_chain.py`, `app.py` (catches
+  `VoiceoverAlignmentError`, renders the warning banner).
+- **Regression tests** (+13):
+  - `test_auto_cut.py`: user_upload accepts a large mismatch (523s vs 303s,
+    the real-media case) and 50%+ longer / 50%+ shorter without blocking;
+    extreme ~5x mismatch proceeds with a non-blocking warning; structural
+    validation (missing audio stream) still blocks; auto-TTS keeps the strict
+    tolerance.
+  - `test_voiceover_unify.py`: a subtitle serial with no voiceover timestamp
+    raises `VoiceoverAlignmentError`; complete coverage passes; the check is
+    skipped when `subtitles_hi.json` is absent (backward compat).
+  - `test_voiceover_upload.py`: zero-duration audio raises
+    `VoiceoverAlignmentError`; the equal_split serious fallback is surfaced as
+    a non-blocking warning.
+- Full suite: **395 tests OK** (was 382; +13).
+- Tag: `manhwa-video-dubber-v6-duration-check-removed`.
+
 ## [E7] — 2026-08-15 — cascade-crash fix: subtitle collision clusters are redistributed (no more zero-length ffmpeg cuts)
 
 Real-media QA whole-job crash, reported from job

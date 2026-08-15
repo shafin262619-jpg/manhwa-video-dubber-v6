@@ -183,6 +183,7 @@ class ValidationUnitTest(AutoCutBase):
         self.assertTrue(details["has_video"])
         self.assertTrue(details["has_audio"])
         self.assertTrue(details["duration_ok"])
+        self.assertTrue(details["duration_enforced"])
 
     def test_fail_when_audio_stream_missing(self):
         probe = {"format": {"duration": "12.0"}, "streams": [{"codec_type": "video"}]}
@@ -210,6 +211,24 @@ class ValidationUnitTest(AutoCutBase):
             "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
         }
         ok, _ = auto_cut._validate_draft(probe, 12.0, 0.2)
+        self.assertFalse(ok)
+
+    def test_duration_mismatch_passes_when_not_enforced(self):
+        # user_upload semantics: a large duration mismatch is normal
+        # translation drift and must NOT fail the structural check.
+        probe = {
+            "format": {"duration": "20.0"},
+            "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
+        }
+        ok, details = auto_cut._validate_draft(probe, 12.0, 0.2, enforce_duration=False)
+        self.assertTrue(ok)
+        self.assertFalse(details["duration_ok"])
+        self.assertFalse(details["duration_enforced"])
+
+    def test_missing_streams_fail_even_when_duration_not_enforced(self):
+        # Structural integrity is always required, even on the user_upload path.
+        probe = {"format": {"duration": "20.0"}, "streams": [{"codec_type": "video"}]}
+        ok, _ = auto_cut._validate_draft(probe, 12.0, 0.2, enforce_duration=False)
         self.assertFalse(ok)
 
 
@@ -242,10 +261,13 @@ class ValidationInBuildTest(AutoCutBase):
 
 
 class DurationValidationRegressionTest(AutoCutBase):
-    """Real-media QA regression: draft duration is validated against the
-    SOURCE video duration (single source of truth, same as subtitle_qa.json's
-    total_duration_sec), with a loose tolerance for user_upload and the strict
-    frames tolerance for auto_tts.
+    """Regression (duration-check removal): the draft's STRUCTURE is always
+    validated, but the total-duration check is only enforced on the auto-TTS
+    path (whose clip durations are measured/precise). A user upload is
+    legitimately a different length from the source video (translation
+    drift), so on the user_upload path any duration mismatch proceeds — the
+    per-segment alignment check (voiceover_unify) is the real accuracy gate,
+    and an extreme mismatch at most produces a non-blocking warning.
     """
 
     def _write(self, source_dur, draft_dur, mode=None):
@@ -306,20 +328,74 @@ class DurationValidationRegressionTest(AutoCutBase):
         result, _ = self._write(60.0, 62.5, mode="user_upload")
         self.assertEqual(result["status"], "ok")
         self.assertAlmostEqual(result["tolerance_sec"], 3.0, places=3)
+        self.assertFalse(result["duration_enforced"])
+        self.assertIsNone(result["duration_warning"])
 
-    def test_user_upload_rejects_large_mismatch(self):
-        # A 25s mismatch signals a wrong/mismatched file; it must be rejected
-        # and the reported expected_duration_sec must be the SOURCE duration
-        # (not the voiceover's).
-        with self.assertRaises(auto_cut.DraftValidationError) as ctx:
-            self._write(60.0, 85.0, mode="user_upload")
-        self.assertIn("'expected_duration_sec': 60.0", str(ctx.exception))
+    def test_user_upload_accepts_50_percent_longer(self):
+        # The real-media failure: 523s of uploaded audio on a 303s video
+        # (~73% longer). This must proceed — it is normal translation drift.
+        result, _ = self._write(303.0, 523.0, mode="user_upload")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["expected_duration_sec"], 303.0)
+        self.assertAlmostEqual(result["duration_sec"], 523.0, places=3)
+        self.assertFalse(result["duration_enforced"])
+        self.assertIsNone(result["duration_warning"])
+
+    def test_user_upload_accepts_50_percent_shorter(self):
+        # A translated voiceover can also be much shorter than the source;
+        # it must not be blocked either.
+        result, _ = self._write(60.0, 25.0, mode="user_upload")
+        self.assertEqual(result["status"], "ok")
+        self.assertAlmostEqual(result["duration_sec"], 25.0, places=3)
+        self.assertFalse(result["duration_enforced"])
+
+    def test_user_upload_large_mismatch_proceeds_with_warning(self):
+        # An extreme mismatch (~5x+) is a possible wrong-file signal: it
+        # still does NOT block, but surfaces as a non-blocking warning.
+        result, _ = self._write(60.0, 320.0, mode="user_upload")
+        self.assertEqual(result["status"], "ok")
+        self.assertIsNotNone(result["duration_warning"])
+        self.assertIn("right audio file", result["duration_warning"])
+
+    def test_user_upload_extremely_short_proceeds_with_warning(self):
+        result, _ = self._write(60.0, 10.0, mode="user_upload")
+        self.assertEqual(result["status"], "ok")
+        self.assertIsNotNone(result["duration_warning"])
+
+    def test_user_upload_still_requires_video_and_audio_streams(self):
+        # The duration check is gone for user_upload, but structural
+        # validation (video + audio streams present) still applies.
+        self._write_inputs()
+        self._write_guideline([_entry(1, 0.0, 6.0, 1.0)])
+        self._write_choice("user_upload")
+
+        def probe_override(path):
+            name = Path(path).name
+            if name == "source.mp4":
+                return {
+                    "format": {"duration": "60.0"},
+                    "streams": [{"codec_type": "video", "r_frame_rate": "25/1"}],
+                }
+            if name == "draft_final_video.mp4":
+                return {
+                    "format": {"duration": "95.0"},
+                    "streams": [{"codec_type": "video"}],  # audio missing
+                }
+            return self._probe_for(path)
+
+        with self.assertRaises(auto_cut.DraftValidationError):
+            self._run_with(probe_override=probe_override)
 
     def test_auto_tts_keeps_strict_tolerance(self):
         # The auto-TTS path keeps the frames-strict tolerance: a 3s drift is
         # rejected even though the user_upload path would accept it.
         with self.assertRaises(auto_cut.DraftValidationError):
             self._write(60.0, 63.0, mode="auto_tts")
+
+    def test_auto_tts_mismatch_still_blocks_even_if_extreme(self):
+        # Enforced duration is on for auto_tts, so a huge mismatch blocks too.
+        with self.assertRaises(auto_cut.DraftValidationError):
+            self._write(60.0, 320.0, mode="auto_tts")
 
 
 class InputErrorTest(AutoCutBase):

@@ -12,12 +12,14 @@ Output: ``uploads/<job_id>/draft_final_video.mp4``. Resolution and aspect
 ratio are inherited from the source video (no forced values).
 
 Verification (mirrors the Auto Manhwa Maker ``render.py`` pattern): the draft
-is probed with ffprobe and must have both a video and an audio stream and a
-duration within tolerance of the **source video's** duration (the same
-ffprobe-derived length ``subtitle_qa.json`` reports). The tolerance is a few
-source frames for the auto-TTS path and a loose, configurable margin for the
-``user_upload`` path (a human-recorded voiceover has natural pacing
-variance). A failed validation raises :class:`DraftValidationError`.
+is probed with ffprobe and must have both a video and an audio stream. The
+duration is checked against the **source video's** duration (the same
+ffprobe-derived length ``subtitle_qa.json`` reports) only when the voiceover
+length is controllable — the auto-TTS path (a few source frames). For the
+``user_upload`` path a translated voiceover is legitimately a different total
+length from the source video, so a duration mismatch never blocks; it is only
+reported (plus a non-blocking wrong-file warning when the ratio is extreme).
+A failed structural validation raises :class:`DraftValidationError`.
 """
 
 import json
@@ -134,8 +136,9 @@ def _draft_validation_tolerance(expected_duration_sec, source_probe, voice_sourc
       expected to land essentially on the source duration.
     - ``user_upload``: loose — ``USER_UPLOAD_DURATION_TOLERANCE_SEC`` seconds
       or ``USER_UPLOAD_DURATION_TOLERANCE_RATIO`` of the source duration,
-      whichever is larger, because a human-recorded voiceover has natural
-      pacing variance.
+      whichever is larger. Since the duration check no longer blocks the
+      user_upload path, this value is informational only (reported in the
+      result diagnostics).
     """
     if voice_source == voiceover_unify.ALLOWED_MODES[1]:
         return max(
@@ -226,8 +229,16 @@ def build_mux_command(concat_video, voiceover, out_path):
     ]
 
 
-def _validate_draft(probe_data, expected_duration_sec, tolerance_sec):
-    """Check the draft has video+audio and a duration near the voiceover.
+def _validate_draft(probe_data, expected_duration_sec, tolerance_sec,
+                    enforce_duration=True):
+    """Check the draft has video+audio (always) and, when ``enforce_duration``
+    is true, a duration near the expected value.
+
+    ``enforce_duration=False`` is used for the ``user_upload`` path: a
+    human-recorded / translated voiceover is legitimately a different total
+    length from the source video, so a duration mismatch must never block the
+    render. The duration is still computed and reported (``duration_ok``) so
+    diagnostics and the non-blocking wrong-file warning have the number.
 
     Returns ``(ok, details)`` where ``details`` carries the individual checks
     (useful for logging / error messages).
@@ -245,7 +256,7 @@ def _validate_draft(probe_data, expected_duration_sec, tolerance_sec):
         and abs(actual_duration - float(expected_duration_sec))
         <= float(tolerance_sec)
     )
-    ok = bool(has_video and has_audio and duration_ok)
+    ok = bool(has_video and has_audio and (duration_ok if enforce_duration else True))
     details = {
         "has_video": has_video,
         "has_audio": has_audio,
@@ -253,8 +264,34 @@ def _validate_draft(probe_data, expected_duration_sec, tolerance_sec):
         "expected_duration_sec": float(expected_duration_sec),
         "tolerance_sec": float(tolerance_sec),
         "duration_ok": duration_ok,
+        "duration_enforced": bool(enforce_duration),
     }
     return ok, details
+
+
+def _duration_warning(expected_duration_sec, actual_duration_sec):
+    """Non-blocking "did you upload the right file?" warning for user_upload.
+
+    Returns a message string when the draft (== uploaded voiceover) length
+    differs from the source video by at least
+    ``USER_UPLOAD_DURATION_WARNING_RATIO`` in either direction, else None.
+    Never blocks — this only surfaces on the result page.
+    """
+    if expected_duration_sec is None or not actual_duration_sec:
+        return None
+    expected = float(expected_duration_sec)
+    if expected <= 0:
+        return None
+    ratio = float(actual_duration_sec) / expected
+    threshold = config.USER_UPLOAD_DURATION_WARNING_RATIO
+    if ratio >= threshold or ratio <= 1.0 / threshold:
+        return (
+            f"The uploaded voiceover (~{float(actual_duration_sec):.0f}s) is "
+            f"about {ratio:.1f}x the length of the original video "
+            f"({expected:.0f}s). This can be normal translation drift, but if "
+            "it looks wrong, double-check you uploaded the right audio file."
+        )
+    return None
 
 
 def build_draft_video(job_id, upload_root=None):
@@ -299,6 +336,12 @@ def build_draft_video(job_id, upload_root=None):
     tolerance = _draft_validation_tolerance(
         expected_duration_sec, source_probe, voice_source
     )
+    # The total-duration check only makes sense when the voiceover length is
+    # controllable (auto-TTS clips are measured/precise). A user upload is
+    # legitimately a different length from the source video (translation
+    # drift), so for user_upload the duration is reported + warned about but
+    # never blocks — only the per-segment alignment check can fail that path.
+    enforce_duration = voice_source != voiceover_unify.ALLOWED_MODES[1]
 
     clips_dir = job_dir / DRAFT_CLIPS_DIR
     clips_dir.mkdir(parents=True, exist_ok=True)
@@ -352,12 +395,22 @@ def build_draft_video(job_id, upload_root=None):
     _run(build_mux_command(concat_video, voiceover, draft_out))
 
     final_probe = _probe(draft_out)
-    ok, details = _validate_draft(final_probe, expected_duration_sec, tolerance)
+    ok, details = _validate_draft(
+        final_probe, expected_duration_sec, tolerance, enforce_duration
+    )
     if not ok:
         logger.error("job %s: draft validation failed: %s", job_id, details)
         raise DraftValidationError(
             f"draft video validation failed for job {job_id}: {details}"
         )
+
+    duration_warning = None
+    if not enforce_duration and details.get("duration_sec") is not None:
+        duration_warning = _duration_warning(
+            expected_duration_sec, details["duration_sec"]
+        )
+        if duration_warning:
+            logger.warning("job %s: %s", job_id, duration_warning)
 
     logger.info("job %s: draft rendered and validated (%s)", job_id, draft_out)
     return {
@@ -369,5 +422,7 @@ def build_draft_video(job_id, upload_root=None):
         "voice_source": voice_source,
         "voiceover_duration_sec": round(voiceover_duration, 3),
         "tolerance_sec": round(tolerance, 3),
+        "duration_enforced": enforce_duration,
+        "duration_warning": duration_warning,
         "draft_path": str(draft_out),
     }

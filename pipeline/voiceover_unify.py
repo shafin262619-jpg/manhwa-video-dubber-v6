@@ -26,6 +26,17 @@ class InvalidVoiceSourceError(Exception):
     """Raised when the mode is not one of ALLOWED_MODES."""
 
 
+class VoiceoverAlignmentError(Exception):
+    """Raised when the voiceover could not be aligned per subtitle segment.
+
+    This is the real accuracy check for the user_upload path: every subtitle
+    segment must end up with a voiceover timestamp. A subtitle serial with no
+    matching timestamp means no audio was found/aligned for that segment, which
+    is a hard failure (unlike a total-duration mismatch, which is normal
+    translation drift and never blocks).
+    """
+
+
 def _choice_path(job_id, upload_root):
     return Path(upload_root) / job_id / "voice_source_choice.json"
 
@@ -146,6 +157,40 @@ def _clamp_consecutive_overlaps(entries):
     return out, clamped_serials
 
 
+def _missing_serials(job_dir, final_entries):
+    """Subtitle serials with no matching voiceover timestamp, if known.
+
+    Reads ``subtitles_hi.json`` when present (both D2 and D3 align to its
+    serials) and returns the sorted list of serials that exist there but have
+    no entry in the unified timestamps. When the subtitle file is missing or
+    unreadable, returns ``[]`` so this check never breaks a caller that only
+    works with timestamps (e.g. the direct D4 unit fixtures).
+    """
+    subs_path = job_dir / "subtitles_hi.json"
+    if not subs_path.exists():
+        return []
+    try:
+        subs = json.loads(subs_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(subs, list):
+        return []
+
+    sub_serials = set()
+    for entry in subs:
+        try:
+            sub_serials.add(int(entry.get("serial")))
+        except (TypeError, ValueError):
+            continue
+    final_serials = set()
+    for entry in final_entries:
+        try:
+            final_serials.add(int(entry["serial"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return sorted(sub_serials - final_serials)
+
+
 def unify_voiceover_timestamps(job_id, upload_root=None):
     """Merge the chosen voiceover path into one common format (D4).
 
@@ -158,9 +203,16 @@ def unify_voiceover_timestamps(job_id, upload_root=None):
     ``voiceover_hi.wav`` is shared by D2 and D3 at the same path; its presence
     is verified so later chunks can use it mode-agnostically.
 
+    Per-segment alignment validation: when ``subtitles_hi.json`` is present,
+    every subtitle serial must have a matching unified timestamp. A subtitle
+    segment with no voiceover timestamp means no audio was aligned for it,
+    which raises :class:`VoiceoverAlignmentError` (the real user_upload
+    correctness check — total-duration mismatches never block).
+
     Raises FileNotFoundError when the job, the voice source choice, the chosen
     timestamps file or the voiceover audio is missing; ValueError on malformed
-    timestamps.
+    timestamps; VoiceoverAlignmentError when a subtitle segment has no aligned
+    voiceover timestamp.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = upload_root / job_id
@@ -189,6 +241,18 @@ def unify_voiceover_timestamps(job_id, upload_root=None):
     mapped = [_map_timestamp_entry(entry) for entry in entries]
     final, clamped_serials = _clamp_consecutive_overlaps(mapped)
 
+    missing = _missing_serials(job_dir, final)
+    if missing:
+        logger.error(
+            "job %s: %d subtitle segment(s) have no aligned voiceover timestamp: %s",
+            job_id, len(missing), missing,
+        )
+        raise VoiceoverAlignmentError(
+            f"voiceover alignment failed for job {job_id}: no audio timing "
+            f"found for subtitle segment(s) {missing}. Re-upload the audio "
+            "or re-run the alignment before continuing."
+        )
+
     out_path = job_dir / "timestamps_hi_final.json"
     out_path.write_text(
         json.dumps(final, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -206,6 +270,7 @@ def unify_voiceover_timestamps(job_id, upload_root=None):
         "entries_count": len(final),
         "flagged_count": sum(1 for e in final if e["flagged"]),
         "clamped_serials": clamped_serials,
+        "missing_serials": missing,
         "voiceover_path": str(audio_path),
         "timestamps_path": str(out_path),
         "timestamps": final,

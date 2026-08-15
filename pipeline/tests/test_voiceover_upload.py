@@ -255,6 +255,32 @@ class EqualSplitFallbackTest(VoiceoverUploadBase):
         self.assertEqual(result["status"], "equal_split")
         self.assertTrue(result["fallback_used"])
 
+    def test_equal_split_surfaces_non_blocking_warning(self):
+        # A serious alignment fallback (no segment matched real audio) must be
+        # surfaced as a warning on the result, but it never raises/blocks as
+        # long as the audio itself has measurable content.
+        _make_subtitles(
+            self.job_dir,
+            [{"serial": 1, "text_zh": "A", "text_hi": "एक"}],
+        )
+        _make_audio(self.job_dir / "voiceover_hi.wav", 4.0)
+        with mock.patch.object(
+            voiceover_upload,
+            "_call_gemini_align",
+            side_effect=lambda key, path, entries: (_ for _ in ()).throw(
+                RuntimeError("gemini down")
+            ),
+        ), mock.patch.object(
+            voiceover_upload, "_transcribe_words", return_value=None
+        ):
+            result = self._align()
+        self.assertEqual(result["status"], "equal_split")
+        self.assertTrue(result["warnings"])
+        self.assertTrue(
+            any("equal-split" in w for w in result["warnings"]),
+            "warning must explain the equal-split fallback",
+        )
+
 
 class EdgeCaseTest(VoiceoverUploadBase):
     def test_empty_entries_writes_empty_timestamps(self):
@@ -263,6 +289,19 @@ class EdgeCaseTest(VoiceoverUploadBase):
         result = self._align()
         self.assertEqual(result["status"], "ok")
         self.assertEqual(self._timestamps(), [])
+
+    def test_zero_duration_audio_raises_alignment_error(self):
+        # No measurable audio content means no segment can be aligned to real
+        # audio. This is a per-segment alignment failure (NOT a total-length
+        # mismatch, which never blocks on the user_upload path) and it blocks.
+        _make_subtitles(self.job_dir, [{"serial": 1, "text_hi": "एक"}])
+        _make_audio(self.job_dir / "voiceover_hi.wav", 4.0)
+        with mock.patch.object(
+            voiceover_upload, "_probe_audio_duration", return_value=0.0
+        ):
+            with self.assertRaises(voiceover_upload.VoiceoverAlignmentError):
+                self._align()
+        self.assertFalse((self.job_dir / "timestamps_hi_upload.json").exists())
 
     def test_missing_audio_raises(self):
         _make_subtitles(self.job_dir, [{"serial": 1, "text_hi": "एक"}])

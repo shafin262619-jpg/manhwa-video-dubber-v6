@@ -272,6 +272,7 @@ def _run_voiceover_auto(job_id):
         ValueError,
         RuntimeError,
         auto_cut.DraftValidationError,
+        voiceover_unify.VoiceoverAlignmentError,
     ) as exc:
         logger.error("auto voiceover failed for job %s: %s", job_id, exc)
         job_status_store.write_status(
@@ -328,6 +329,7 @@ def _run_user_audio_pipeline(job_id):
         ValueError,
         RuntimeError,
         auto_cut.DraftValidationError,
+        voiceover_unify.VoiceoverAlignmentError,
     ) as exc:
         logger.error("user audio pipeline failed for job %s: %s", job_id, exc)
         job_status_store.write_status(
@@ -367,6 +369,7 @@ def _run_auto_full_render(job_id):
         ValueError,
         RuntimeError,
         auto_cut.DraftValidationError,
+        voiceover_unify.VoiceoverAlignmentError,
     ) as exc:
         logger.error("auto full render failed for job %s: %s", job_id, exc)
         job_status_store.write_status(
@@ -518,7 +521,23 @@ def _render_chain_final_result(job_id: str, stage: str) -> HTMLResponse:
         if isinstance(chain_result, dict)
         else None
     )
-    return _render_final_result(job_id, result=final_result)
+    # Non-blocking warnings from the alignment (D3) and draft (E2) stages —
+    # e.g. a serious alignment fallback or an extreme duration mismatch on the
+    # user_upload path. They surface as a banner on the final page, never as a
+    # block.
+    warnings = []
+    if isinstance(chain_result, dict):
+        for key in ("alignment", "draft", "voiceover"):
+            sub = chain_result.get(key)
+            if not isinstance(sub, dict):
+                continue
+            for item in sub.get("warnings") or []:
+                if item not in warnings:
+                    warnings.append(item)
+            duration_warning = sub.get("duration_warning")
+            if duration_warning and duration_warning not in warnings:
+                warnings.append(duration_warning)
+    return _render_final_result(job_id, result=final_result, warnings=warnings)
 
 
 @app.get("/upload/{job_id}", response_class=HTMLResponse)
@@ -1128,7 +1147,7 @@ def final_page(job_id: str) -> HTMLResponse:
     return _render_final_result(job_id)
 
 
-def _render_final_result(job_id: str, result=None) -> HTMLResponse:
+def _render_final_result(job_id: str, result=None, warnings=None) -> HTMLResponse:
     if not isinstance(result, dict):
         stage = job_status_store.read_status(job_id).get("stages", {}).get(
             "final_render"
@@ -1137,12 +1156,24 @@ def _render_final_result(job_id: str, result=None) -> HTMLResponse:
     if not isinstance(result, dict):
         result = render_final.finalize_video(job_id)
 
+    warning_html = ""
+    warning_items = [w for w in (warnings or []) if w]
+    if warning_items:
+        items = "".join(f"<li>{html.escape(w)}</li>" for w in warning_items)
+        warning_html = (
+            '<div class="error-banner">'
+            '<p class="error-banner-title">Note</p>'
+            f"<ul>{items}</ul>"
+            "</div>"
+        )
+
     duration = (
         f"{result['duration_sec']:.3f} sec." if result["duration_sec"] is not None
         else "duration unknown"
     )
     body = f"""<h1>Final video — job {job_id}</h1>
   <p>Status: <strong>{result["status"]}</strong>. Duration: {duration}</p>
+  {warning_html}
   <video controls src="/download/{job_id}"></video>
   <p><a href="/download/{job_id}">Download final video</a></p>
   <p><a href="/review/{job_id}">Back to Review</a></p>

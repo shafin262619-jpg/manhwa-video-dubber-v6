@@ -27,17 +27,18 @@ def run_auto_tts_chain(job_id, call_budget=None):
     uncaught exceptions, no silent swallow): a mid-chain failure stops the
     following steps immediately.
 
-    Returns ``{"voiceover": <D2 result>, "final": <F3 result>}`` so the
-    caller (group C) can persist both in the job status.
+    Returns ``{"voiceover": <D2 result>, "draft": <E2 result>, "final": <F3
+    result>}`` so the caller (group C) can persist all of them in the job
+    status (the draft result carries the non-blocking duration warning).
     """
     voiceover_result = voiceover_auto.generate_auto_voiceover(
         job_id, call_budget=call_budget
     )
     voiceover_unify.unify_voiceover_timestamps(job_id)
     edit_guideline.build_edit_guideline(job_id)
-    auto_cut.build_draft_video(job_id)
+    draft_result = auto_cut.build_draft_video(job_id)
     final_result = render_final.finalize_video(job_id)
-    return {"voiceover": voiceover_result, "final": final_result}
+    return {"voiceover": voiceover_result, "draft": draft_result, "final": final_result}
 
 
 def run_user_upload_chain(job_id):
@@ -52,12 +53,13 @@ def run_user_upload_chain(job_id):
     uncaught exceptions, no silent swallow): a mid-chain failure stops the
     following steps immediately.
 
-    Returns ``{"alignment": <D3 result>, "final": <F3 result>}`` so the
-    caller (group D) can persist both in the job status.
+    Returns ``{"alignment": <D3 result>, "draft": <E2 result>, "final": <F3
+    result>}`` so the caller (group D) can persist all of them in the job
+    status (the alignment + draft results carry the non-blocking warnings).
     """
     alignment_result = voiceover_upload.align_uploaded_voiceover(job_id)
     voiceover_unify.unify_voiceover_timestamps(job_id)
     edit_guideline.build_edit_guideline(job_id)
-    auto_cut.build_draft_video(job_id)
+    draft_result = auto_cut.build_draft_video(job_id)
     final_result = render_final.finalize_video(job_id)
-    return {"alignment": alignment_result, "final": final_result}
+    return {"alignment": alignment_result, "draft": draft_result, "final": final_result}
