@@ -1,5 +1,28 @@
 # Manhwa Video Dubber — Changelog
 
+## [E1] — 2026-08-15 — `pipeline/subtitle_qa.py` combined human-readable QA summary
+
+First chunk of group E (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`). New
+standalone module only — no wiring yet (that is E2).
+
+- New `pipeline/subtitle_qa.py` `build_qa_summary(job_id, upload_root)`:
+  pure aggregation (no Gemini/Whisper calls) that merges the mechanical
+  diagnostics from `subtitle_qa.json` (A3/B3: `gaps`,
+  `duplicate_clusters`, `repair` summary) with the independent cross-check
+  from `subtitle_qa_whisper.json` (D1). Returns `{job_id, qa_status
+  ("ok"|"flagged"), warnings[], gaps_remaining, duplicate_clusters_remaining,
+  repair_attempted, repair_succeeded, whisper_check_status}`. `flagged` when
+  gaps/clusters remain or the whisper check is a mismatch; each flag gets one
+  short Bengali, non-technical warning line. Never raises — a missing or
+  malformed file contributes no flags (whisper absent → `"skipped"`), and the
+  behaviour is documented in the module docstring.
+- New `pipeline/tests/test_subtitle_qa.py` (7 tests): clean files → `ok` with
+  empty warnings; gaps+clusters → `flagged` with the right warning lines and
+  repair counts; whisper mismatch → `flagged` and mentioned in warnings; both
+  files missing / one malformed / whisper missing with gaps present — no raise
+  and the most reasonable status.
+- Full suite: **350 tests OK** (343 prior + 7 new).
+
 ## [D3] — 2026-08-15 — whisper cross-check regression pass + edge-case coverage
 
 Final chunk of group D (plan: `docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`).
