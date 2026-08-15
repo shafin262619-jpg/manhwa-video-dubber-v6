@@ -110,3 +110,8 @@ MAX_API_CALLS_PER_JOB = None
 # Consecutive serialized subtitle entries whose gap exceeds this (seconds)
 # are flagged as possible missing content (QA diagnostics, A1).
 SUBTITLE_GAP_FLAG_THRESHOLD_SEC = 6.0
+
+# 3+ consecutive serialized subtitle entries sharing the same start_sec (or
+# zero-duration) are flagged as a degenerate extraction cluster (QA
+# diagnostics, A2).
+SUBTITLE_DUP_CLUSTER_MIN_COUNT = 3

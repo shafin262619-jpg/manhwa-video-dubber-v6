@@ -248,5 +248,105 @@ class SubtitleGapDetectionTest(unittest.TestCase):
         self.assertEqual(len(gaps_custom), 1)
         self.assertEqual(gaps_custom[0]["gap_sec"], 2.0)
 
+class DetectDuplicateClustersTest(unittest.TestCase):
+    def _entries(self, pairs):
+        return [
+            {"serial": i, "text_zh": "x", "start_sec": s, "end_sec": e, "status": "ok"}
+            for i, (s, e) in enumerate(pairs, start=1)
+        ]
+
+    def test_no_clusters_returns_empty(self):
+        entries = self._entries([(0.0, 3.0), (3.1, 5.0), (5.2, 7.0), (7.5, 9.0)])
+        self.assertEqual(subtitle_builder.detect_duplicate_clusters(entries), [])
+
+    def test_same_start_cluster_flagged(self):
+        entries = self._entries([(0.0, 2.0), (3.0, 5.0), (3.0, 5.0), (3.0, 5.0), (8.0, 9.0)])
+        clusters = subtitle_builder.detect_duplicate_clusters(entries)
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(
+            clusters[0],
+            {
+                "start_serial": 2,
+                "end_serial": 4,
+                "start_sec": 3.0,
+                "count": 3,
+                "reason": "same_start_timestamp",
+            },
+        )
+
+    def test_zero_duration_cluster_flagged_with_reason(self):
+        entries = self._entries([(0.0, 2.0), (4.0, 4.0), (4.0, 4.0), (4.0, 4.0), (9.0, 10.0)])
+        clusters = subtitle_builder.detect_duplicate_clusters(entries)
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0]["reason"], "zero_duration")
+        self.assertEqual(clusters[0]["count"], 3)
+        self.assertEqual(clusters[0]["start_serial"], 2)
+        self.assertEqual(clusters[0]["end_serial"], 4)
+
+    def test_below_min_count_not_flagged(self):
+        entries = self._entries([(0.0, 2.0), (3.0, 5.0), (3.0, 5.0), (8.0, 9.0)])
+        self.assertEqual(subtitle_builder.detect_duplicate_clusters(entries), [])
+
+    def test_multiple_clusters_in_serial_order(self):
+        entries = self._entries(
+            [
+                (1.0, 2.0),
+                (1.0, 2.0),
+                (1.0, 2.0),
+                (1.0, 2.0),
+                (5.0, 6.0),
+                (5.0, 6.0),
+                (5.0, 6.0),
+            ]
+        )
+        clusters = subtitle_builder.detect_duplicate_clusters(entries)
+        self.assertEqual(len(clusters), 2)
+        self.assertEqual([c["start_serial"] for c in clusters], [1, 5])
+        self.assertEqual([c["reason"] for c in clusters], ["same_start_timestamp"] * 2)
+
+    def test_custom_min_count_override(self):
+        entries = self._entries([(0.0, 2.0), (3.0, 5.0), (3.0, 5.0), (8.0, 9.0)])
+        self.assertEqual(
+            subtitle_builder.detect_duplicate_clusters(entries, min_count=2)[0]["count"], 2
+        )
+        self.assertEqual(subtitle_builder.detect_duplicate_clusters(entries, min_count=4), [])
+
+    def test_default_min_count_reads_config(self):
+        entries = self._entries([(0.0, 2.0), (3.0, 5.0), (3.0, 5.0), (8.0, 9.0)])
+        with mock.patch("pipeline.config.SUBTITLE_DUP_CLUSTER_MIN_COUNT", 2):
+            self.assertEqual(
+                subtitle_builder.detect_duplicate_clusters(entries)[0]["count"], 2
+            )
+
+    def test_zero_duration_precedence_in_mixed_run(self):
+        entries = self._entries([(0.0, 2.0), (4.0, 4.0), (4.0, 4.0), (4.0, 4.0), (9.0, 10.0)])
+        clusters = subtitle_builder.detect_duplicate_clusters(entries)
+        self.assertEqual(clusters[0]["reason"], "zero_duration")
+
+
+class SerializeZeroDurationLoggingTest(unittest.TestCase):
+    def test_raw_zero_duration_entry_logged(self):
+        entries = [
+            {"text_zh": "a", "start_sec": 0.0, "end_sec": 2.0, "status": "ok"},
+            {"text_zh": "b", "start_sec": 4.0, "end_sec": 4.0, "status": "ok"},
+        ]
+        with self.assertLogs("pipeline.subtitle_builder", level="WARNING") as cm:
+            subtitle_builder._serialize(entries)
+        self.assertTrue(any("zero-duration entry" in line for line in cm.output))
+
+    def test_clamp_induced_zero_duration_logged(self):
+        entries = [
+            {"text_zh": "a", "start_sec": 0.0, "end_sec": 2.0, "status": "ok"},
+            {"text_zh": "b", "start_sec": 1.5, "end_sec": 1.2, "status": "ok"},
+        ]
+        with self.assertLogs("pipeline.subtitle_builder", level="WARNING") as cm:
+            result = subtitle_builder._serialize(entries)
+        self.assertTrue(
+            any("zero/negative duration after clamp" in line for line in cm.output)
+        )
+        self.assertEqual(result[1]["start_sec"], 2.0)
+        self.assertEqual(result[1]["end_sec"], 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()

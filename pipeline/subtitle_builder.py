@@ -121,6 +121,7 @@ def _serialize(entries):
     for index, entry in enumerate(entries, start=1):
         start = float(entry["start_sec"])
         end = float(entry["end_sec"])
+        raw_zero_duration = start == end
         if prev_end is not None and start < prev_end:
             logger.warning(
                 "subtitle serial %d overlap: start %.3fs clamped to previous end %.3fs",
@@ -128,7 +129,17 @@ def _serialize(entries):
             )
             start = prev_end
         if end < start:
+            logger.warning(
+                "subtitle serial %d zero/negative duration after clamp "
+                "(start %.3fs, original end %.3fs)",
+                index, start, entry["end_sec"],
+            )
             end = start
+        elif raw_zero_duration:
+            logger.warning(
+                "subtitle serial %d zero-duration entry (start %.3fs, end %.3fs)",
+                index, start, end,
+            )
         prev_end = end
         out.append(
             {
@@ -140,6 +151,63 @@ def _serialize(entries):
             }
         )
     return out
+
+
+def detect_duplicate_clusters(serialized_entries, min_count=None):
+    """Flag degenerate runs of post-_serialize subtitle entries.
+
+    Pure Python, no network, no side effects. Scans consecutive entries for
+    runs that either share the same rounded ``start_sec`` or are
+    zero-duration (``start_sec == end_sec``). When ``min_count`` is None,
+    ``config.SUBTITLE_DUP_CLUSTER_MIN_COUNT`` is used (default 3).
+
+    Each flagged cluster (3+ consecutive entries) is returned in serial order:
+        {"start_serial", "end_serial", "start_sec", "count",
+         "reason": "same_start_timestamp" | "zero_duration"}
+    A run that qualifies under both reasons is reported as "zero_duration"
+    (more severe takes precedence).
+    """
+    if min_count is None:
+        min_count = config.SUBTITLE_DUP_CLUSTER_MIN_COUNT
+
+    clusters = []
+    i = 0
+    n = len(serialized_entries)
+    while i < n:
+        start_sec = float(serialized_entries[i]["start_sec"])
+        end_sec = float(serialized_entries[i]["end_sec"])
+        zero_duration = start_sec == end_sec
+        j = i + 1
+        if zero_duration:
+            reason = "zero_duration"
+            while j < n:
+                nxt = serialized_entries[j]
+                if float(nxt["start_sec"]) == float(nxt["end_sec"]):
+                    j += 1
+                else:
+                    break
+        else:
+            reason = "same_start_timestamp"
+            while j < n:
+                nxt = serialized_entries[j]
+                nxt_start = float(nxt["start_sec"])
+                if nxt_start == start_sec and nxt_start != float(nxt["end_sec"]):
+                    j += 1
+                else:
+                    break
+        count = j - i
+        if count >= min_count:
+            clusters.append(
+                {
+                    "start_serial": serialized_entries[i]["serial"],
+                    "end_serial": serialized_entries[j - 1]["serial"],
+                    "start_sec": start_sec,
+                    "count": count,
+                    "reason": reason,
+                }
+            )
+        i = j
+    return clusters
 
 
 def detect_gaps(serialized_entries, threshold_sec=None):

@@ -1,3 +1,3 @@
 # HANDOFF NEXT
 
-চাংক A1 (detect_gaps) সম্পূর্ণ, standalone, wire হয়নি এখনো। পরের কাজ: A2 (duplicate-cluster detection + _serialize() logging fix)।
+চাংক A2 (detect_duplicate_clusters + logging fix) সম্পূর্ণ। পরের কাজ: A3 (build_subtitle_list()-এ diagnostics wire করে subtitle_qa.json লেখা)।

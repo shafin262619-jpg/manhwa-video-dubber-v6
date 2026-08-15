@@ -1,5 +1,35 @@
 # Manhwa Video Dubber — Changelog
 
+## [A2] — 2026-08-15 — Duplicate/degenerate-timestamp cluster detection + `_serialize()` zero-duration logging (Subtitle QA Fix)
+
+Second chunk of the subtitle-QA-fix chain (plan:
+`docs/SUBTITLE_QA_FIX_HANDOFF_PLAN.md`). Adds degenerate-timestamp cluster
+diagnostics and zero-duration logging to the serializer.
+
+- New `pipeline/subtitle_builder.py` function `detect_duplicate_clusters(
+  serialized_entries, min_count=None)` — flags consecutive post-`_serialize`
+  runs sharing the same rounded `start_sec` or being zero-duration
+  (`start_sec == end_sec`), returning serial-ordered
+  `{"start_serial", "end_serial", "start_sec", "count",
+  "reason": "same_start_timestamp" | "zero_duration"}` dicts. A run matching
+  both reasons is reported as `"zero_duration"` (more severe takes
+  precedence). Pure Python, no network, no side effects. Not yet wired into
+  `build_subtitle_list()` (that is chunk A3).
+- `_serialize()`: two new distinct `logger.warning` lines — one for
+  clamp-induced zero/negative duration (`"zero/negative duration after
+  clamp"`), one for raw zero-duration input entries. Existing overlap-clamp
+  warning message/behavior unchanged (backward-compat).
+- New `pipeline/config.py` constant `SUBTITLE_DUP_CLUSTER_MIN_COUNT = 3`.
+- New tests in `pipeline/tests/test_subtitle_builder.py`
+  (`DetectDuplicateClustersTest`, 8 tests; `SerializeZeroDurationLoggingTest`,
+  2 tests): no-cluster case; same-start cluster; zero-duration cluster with
+  distinct reason; below-min-count run not flagged; multiple clusters in
+  serial order; custom `min_count` override; config-default min_count;
+  zero-duration precedence in mixed runs; `assertLogs` verifies both new
+  zero-duration warnings fire; existing overlap-clamp tests still pass
+  (regression).
+- Full suite: **305 tests OK** (295 prior + 10 new).
+
 ## [A1] — 2026-08-15 — Coverage-gap diagnostics (Subtitle QA Fix)
 
 Introduces standalone coverage-gap diagnostics to detect consecutive subtitle timing gaps exceeding a threshold.
