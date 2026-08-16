@@ -16,8 +16,11 @@ Soft clamp (flag, never block):
 - Multipliers outside ``SPEED_RATIO_MIN``..``SPEED_RATIO_MAX`` (default
   0.5..2.0) keep their real value but are flagged ``extreme_speed_ratio`` so
   the F-group review UI can highlight them.
-- Zero or negative source/target durations never crash the job: they get a
-  safe ``pts_multiplier = 1.0`` and are flagged ``invalid_duration``.
+- Zero or negative source/target durations never crash the job: they are
+  flagged ``invalid_duration``. A collapsed source keeps ``pts_multiplier =
+  1.0`` (auto_cut cuts a minimal window for it); a collapsed target with a
+  healthy source shrinks the whole clip to ``RENDER_MIN_SEGMENT_DURATION_SEC``
+  (F8 target-collapse fix) so it renders near-zero instead of full-length.
 
 Output: ``uploads/<job_id>/edit_guideline.json`` with one entry per serial:
 ``[{"serial", "source_start_sec", "source_end_sec", "target_start_sec",
@@ -76,12 +79,24 @@ def _build_entry(serial, zh_entry, hi_entry):
     target_duration = target_end - target_start
 
     if source_duration <= 0 or target_duration <= 0:
-        logger.warning(
-            "serial %d invalid duration (source %.3fs, target %.3fs); "
-            "using pts_multiplier 1.0",
-            serial, source_duration, target_duration,
-        )
-        pts_multiplier = 1.0
+        if source_duration > 0 and target_duration <= 0:
+            # Target collapsed (F8): shrinking the whole source clip to the
+            # render-minimum window instead of leaving it full-length makes a
+            # near-zero target render near-zero (a plain 1.0 multiplier would
+            # render the whole clip — the target-collapse bug).
+            pts_multiplier = config.RENDER_MIN_SEGMENT_DURATION_SEC / source_duration
+            logger.warning(
+                "serial %d invalid duration (source %.3fs, target %.3fs); "
+                "rendering minimal window (pts_multiplier %.4f)",
+                serial, source_duration, target_duration, pts_multiplier,
+            )
+        else:
+            pts_multiplier = 1.0
+            logger.warning(
+                "serial %d invalid duration (source %.3fs, target %.3fs); "
+                "using pts_multiplier 1.0",
+                serial, source_duration, target_duration,
+            )
         flagged = True
         flag_reason = "invalid_duration"
     else:

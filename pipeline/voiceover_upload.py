@@ -5,25 +5,27 @@ line read in serial order). The file is saved as ``uploads/<job_id>/voiceover_hi
 and ``align_uploaded_voiceover`` finds, for every serial, the second-range in the
 audio where that line is spoken, writing ``uploads/<job_id>/timestamps_hi_upload.json``
 in the same schema D2 uses: ``[{"serial", "start_sec", "end_sec",
-"alignment_fallback"}]``.
+"alignment_fallback", "alignment_source"}]``.
 
-Alignment strategy (resilience ladder, mirrors the "Gemini fail -> Whisper
-fallback" pattern):
+Alignment strategy (F8 — Whisper is the primary timing authority):
 
-1. Gemini audio-understanding (audio + the subtitle list) returns the start/end
-   seconds per serial. Used only when every serial is present and numeric.
-2. On Gemini failure / malformed response: the whole audio is transcribed with
-   local Whisper (word timestamps) and Whisper's text is matched to the subtitle
-   lines sequentially with fuzzy matching. Unmatched lines are filled between
-   their matched neighbours (equal-split of the gap).
-3. If Whisper is also unavailable / matches nothing: every line gets an
-   equal-split of the total audio duration.
+1. Whisper transcribes the whole audio with word timestamps and the subtitle
+   lines are matched onto the word stream sequentially with fuzzy matching.
+   Matched serials keep Whisper's timing (``alignment_source="whisper"``).
+2. Unmatched serials are offered to Gemini as a bounded secondary pass: Gemini
+   sees only those lines, and a result is accepted (``alignment_source=
+   "gemini_assisted"``) only when its reported end time stays within
+   ``WHISPER_TAIL_TOLERANCE_SEC`` of the last Whisper-detected speech — Gemini
+   can never place audio past what Whisper actually heard. Remaining unmatched
+   serials get an equal-split of the gap.
+3. If Whisper is unavailable / fails entirely, today's pure-Gemini flow is
+   used unchanged (Gemini for every serial, Whisper fallback, then equal
+   split).
 
-Every line whose timing did not come from the primary Gemini pass is flagged
-``alignment_fallback: true`` (plus an ``alignment_source`` field for clarity).
-``align_uploaded_voiceover`` never raises on Gemini/Whisper failures — the
-only alignment failure it treats as blocking is an audio file with no
-measurable content (``total_sec <= 0``), which raises
+Every line whose timing did not come from Whisper is flagged
+``alignment_fallback: true``. ``align_uploaded_voiceover`` never raises on
+Gemini/Whisper failures — the only alignment failure it treats as blocking is
+an audio file with no measurable content (``total_sec <= 0``), which raises
 :class:`~pipeline.voiceover_unify.VoiceoverAlignmentError`.
 
 Duration-drift invariant (E9): whatever the alignment source, the per-serial
@@ -38,10 +40,7 @@ a 522s audio).
 
 import json
 import logging
-import re
 import tempfile
-import unicodedata
-from difflib import SequenceMatcher
 from pathlib import Path
 
 from google import genai
@@ -51,6 +50,11 @@ from pipeline import config, job_logging, key_store, video_ingest
 from pipeline.subtitle_extract import _extract_json, call_with_rotation
 from pipeline.voiceover_auto import _probe_audio_duration, _run
 from pipeline.voiceover_unify import VoiceoverAlignmentError, _clamp_timestamps_to_audio
+from pipeline.whisper_align import (
+    last_speech_end,
+    match_words_to_entries as _match_words_to_entries,
+    transcribe_words as _transcribe_words,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,13 +72,6 @@ ALIGNMENT_PROMPT = (
 
 class UnsupportedAudioError(Exception):
     """Raised when the uploaded voiceover file type is not supported."""
-
-
-def _norm_text(text):
-    """Normalize text for fuzzy matching: strip punctuation, keep letters."""
-    text = unicodedata.normalize("NFKC", str(text or ""))
-    text = re.sub(r"[^\w\u0900-\u097F]+", "", text, flags=re.UNICODE)
-    return text.lower()
 
 
 def _convert_to_wav(src_path, out_path):
@@ -185,83 +182,60 @@ def _gemini_align(keys, entries, audio_path, logger_=None):
     ]
 
 
-def _transcribe_words(audio_path, logger_=None):
-    """Transcribe the audio with local Whisper; return word-level timestamps.
+def _gemini_align_secondary(keys, entries, audio_path, logger_=None):
+    """Gemini audio alignment for a SUBSET of serials (whisper-primary D3).
 
-    Returns None when whisper is unavailable or the transcription fails.
+    The primary Whisper pass matched most serials; Gemini is asked only for the
+    ones it could not match, so it can never override a Whisper match. Partial
+    results are accepted (unlike :func:`_gemini_align` which demands every
+    serial): the caller additionally bounds each accepted item by the
+    Whisper-detected speech tail.
+
+    Returns the raw ``[{"serial", "start_sec", "end_sec"}]`` list (possibly
+    partial), or ``None`` when Gemini fails entirely.
     """
     log = logger_ or logger
-    try:
-        import whisper  # lazy: heavy optional dependency
-    except ImportError as exc:
-        log.error("whisper not installed; skipping whisper fallback: %s", exc)
+    rotation = 0
+    alignments, _, _ = call_with_rotation(
+        keys, rotation, _call_gemini_align, audio_path, entries, logger_=log
+    )
+    if not alignments:
         return None
-    try:
-        model = whisper.load_model(config.WHISPER_MODEL)
-        result = model.transcribe(str(audio_path), word_timestamps=True)
-    except Exception as exc:  # noqa: BLE001 - resilience: fallback must survive
-        log.error("whisper transcription failed: %s", exc)
-        return None
-
-    words = []
-    for segment in result.get("segments", []) or []:
-        for word in segment.get("words", []) or []:
-            try:
-                words.append(
-                    {
-                        "word": str(word.get("word", "")),
-                        "start": float(word.get("start", 0.0)),
-                        "end": float(word.get("end", 0.0)),
-                    }
-                )
-            except (TypeError, ValueError):
-                continue
-    return words
-
-
-def _match_words_to_entries(words, entries):
-    """Sequential fuzzy match of subtitle lines onto the whisper word stream.
-
-    Returns ``{serial: {"start_sec", "end_sec"}}`` for the lines that matched
-    above ``WHISPER_MATCH_MIN_RATIO``; lines without usable text are skipped.
-    """
-    tokens = [w for w in words if _norm_text(w.get("word"))]
-    if not tokens:
-        return {}
-
-    n = len(tokens)
-    cursor = 0
-    matches = {}
-    for entry in entries:
-        target = _norm_text(entry.get("text_hi"))
-        if not target:
+    items = []
+    for item in alignments:
+        try:
+            serial = int(item["serial"])
+            start_sec = float(item["start_sec"])
+            end_sec = float(item["end_sec"])
+        except (KeyError, TypeError, ValueError):
             continue
-        best = None
-        for start_idx in range(cursor, n):
-            acc = ""
-            best_ratio = 0.0
-            best_end = start_idx
-            for end_idx in range(start_idx, n):
-                acc += _norm_text(tokens[end_idx].get("word"))
-                if len(acc) > len(target) * 1.6 + 4:
-                    break
-                ratio = SequenceMatcher(None, acc, target).ratio()
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best_end = end_idx
-                if best_ratio >= 0.95:
-                    break
-            if best_ratio >= config.WHISPER_MATCH_MIN_RATIO:
-                best = (start_idx, best_end)
-                break
-        if best is not None:
-            start_idx, end_idx = best
-            matches[entry["serial"]] = {
-                "start_sec": float(tokens[start_idx]["start"]),
-                "end_sec": float(tokens[end_idx]["end"]),
-            }
-            cursor = end_idx + 1
-    return matches
+        items.append({"serial": serial, "start_sec": start_sec, "end_sec": end_sec})
+    return items or None
+
+
+def _apply_gemini_assisted(timestamps, gemini_items, speech_end, tolerance):
+    """Apply bounded Gemini secondary results onto unmatched serials.
+
+    Only serials whose ``end_sec`` is within ``speech_end + tolerance`` are
+    accepted (``alignment_source="gemini_assisted"``) — Gemini can never place
+    audio past what Whisper actually detected. Serial order is preserved.
+    Returns ``(timestamps, applied_serials)``.
+    """
+    by_serial = {entry["serial"]: entry for entry in timestamps}
+    applied = []
+    for item in gemini_items or []:
+        entry = by_serial.get(item["serial"])
+        if entry is None or entry["alignment_source"] != "equal_split":
+            continue
+        if item["end_sec"] > speech_end + tolerance:
+            continue
+        entry["start_sec"] = round(item["start_sec"], 3)
+        entry["end_sec"] = round(item["end_sec"], 3)
+        entry["alignment_source"] = "gemini_assisted"
+        entry["alignment_fallback"] = True
+        applied.append(entry["serial"])
+    ordered = [by_serial[entry["serial"]] for entry in timestamps]
+    return ordered, applied
 
 
 def _finalize_timestamps(entries, matches, total_sec):
@@ -270,6 +244,11 @@ def _finalize_timestamps(entries, matches, total_sec):
     Matched serials keep their ``(start, end)``; runs of unmatched serials are
     equal-split between the previous matched end and the next matched start
     (or the audio bounds). Order is always preserved.
+
+    Whisper is the primary authority (F8): whisper-matched serials are
+    ``alignment_source="whisper"`` with ``alignment_fallback=False``; only
+    equal-split placeholders are fallbacks (and later the bounded Gemini
+    secondary results, ``"gemini_assisted"``).
     """
     n = len(entries)
     starts = [None] * n
@@ -308,11 +287,32 @@ def _finalize_timestamps(entries, matches, total_sec):
                 "serial": entry["serial"],
                 "start_sec": round(starts[i], 3),
                 "end_sec": round(ends[i], 3),
-                "alignment_fallback": sources[i] != "gemini",
+                "alignment_fallback": sources[i] != "whisper",
                 "alignment_source": sources[i],
             }
         )
     return out
+
+
+def _status_from_sources(sources):
+    """Map the set of per-serial alignment sources onto (status, source).
+
+    F8 taxonomy:
+    - all Whisper -> "ok" (Whisper, the primary authority, matched everything)
+    - all Gemini -> "ok" (pure-Gemini fallback: Whisper was unavailable)
+    - any gemini_assisted -> "gemini_assisted" (Whisper primary, bounded Gemini
+      secondary resolved some unmatched serials)
+    - all equal_split -> "equal_split"
+    - Whisper + equal_split -> "whisper" (Whisper matched some but Gemini did
+      not help; the rest got placeholder timing)
+    """
+    if sources == {"whisper"} or sources == {"gemini"}:
+        return "ok", next(iter(sources))
+    if sources == {"equal_split"}:
+        return "equal_split", "equal_split"
+    if "gemini_assisted" in sources:
+        return "gemini_assisted", "whisper"
+    return "whisper", "whisper"
 
 
 def align_uploaded_voiceover(job_id, upload_root=None):
@@ -372,18 +372,41 @@ def align_uploaded_voiceover(job_id, upload_root=None):
         )
 
     keys = key_store.get_active_keys()
-    timestamps = _gemini_align(keys, entries, audio_path, logger_=job_logger)
 
-    if timestamps is None:
-        words = _transcribe_words(audio_path, logger_=job_logger)
-        matches = _match_words_to_entries(words, entries) if words else {}
-        if not matches:
-            job_logger.error("job %s: whisper fallback unusable; using equal split", job_id)
+    # Whisper is the primary timing authority (F8). When Whisper is
+    # unavailable/fails entirely, we fall back to today's pure-Gemini flow.
+    words = _transcribe_words(
+        audio_path, language="hi", model=config.WHISPER_MODEL_HI,
+        logger_=job_logger,
+    )
+
+    gemini_assisted_serials = []
+    if words is None:
+        timestamps = _gemini_align(keys, entries, audio_path, logger_=job_logger)
+        if timestamps is None:
+            job_logger.error("job %s: Gemini alignment failed; using equal split", job_id)
             timestamps = _finalize_timestamps(entries, {}, total_sec)
-        else:
-            job_logger.info("job %s: whisper fallback matched %d/%d lines",
-                            job_id, len(matches), len(entries))
-            timestamps = _finalize_timestamps(entries, matches, total_sec)
+    else:
+        matches = _match_words_to_entries(words, entries)
+        job_logger.info("job %s: whisper primary matched %d/%d lines",
+                        job_id, len(matches), len(entries))
+        timestamps = _finalize_timestamps(entries, matches, total_sec)
+        unmatched = [e for e in entries if e["serial"] not in matches]
+        if unmatched and keys:
+            speech_end = last_speech_end(words)
+            gemini_items = _gemini_align_secondary(
+                keys, unmatched, audio_path, logger_=job_logger
+            )
+            if gemini_items:
+                timestamps, gemini_assisted_serials = _apply_gemini_assisted(
+                    timestamps, gemini_items, speech_end,
+                    config.WHISPER_TAIL_TOLERANCE_SEC,
+                )
+                if gemini_assisted_serials:
+                    job_logger.info(
+                        "job %s: gemini secondary resolved %d unmatched serial(s)",
+                        job_id, len(gemini_assisted_serials),
+                    )
 
     # Duration-drift guard (E9): alignment models can return end times past
     # the real audio length, so the per-serial target durations would sum to
@@ -395,12 +418,7 @@ def align_uploaded_voiceover(job_id, upload_root=None):
     timestamps, clamped_serials = _clamp_timestamps_to_audio(timestamps, total_sec)
 
     sources = {entry["alignment_source"] for entry in timestamps}
-    if sources == {"gemini"}:
-        status, source = "ok", "gemini"
-    elif sources == {"equal_split"}:
-        status, source = "equal_split", "equal_split"
-    else:
-        status, source = "whisper", "whisper"
+    status, source = _status_from_sources(sources)
 
     fallback_serials = [
         entry["serial"] for entry in timestamps if entry["alignment_fallback"]
@@ -424,6 +442,12 @@ def align_uploaded_voiceover(job_id, upload_root=None):
             f"{len(fallback_serials)} line(s) could not be matched to the "
             "uploaded audio and got placeholder timing. The dubbing will "
             "still render, but those segments may be mis-timed."
+        )
+    elif status == "gemini_assisted":
+        warnings.append(
+            f"{len(fallback_serials)} line(s) could not be matched by Whisper; "
+            f"{len(gemini_assisted_serials)} were resolved by Gemini within the "
+            "detected speech range and the rest got placeholder timing."
         )
 
     timestamps_path.write_text(

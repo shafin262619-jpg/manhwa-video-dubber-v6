@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pipeline import edit_guideline, video_ingest
+from pipeline import config, edit_guideline, video_ingest
 
 
 def _zh_entry(serial, start, end):
@@ -169,10 +169,17 @@ class EdgeCaseTest(EditGuidelineBase):
         self.assertEqual(entry["flag_reason"], "invalid_duration")
 
     def test_zero_target_duration_safe_default(self):
+        # F8 target-collapse fix: a zero target with a healthy source shrinks
+        # the whole clip to the render-minimum window instead of rendering it
+        # full-length (pt=1.0).
         self._write_zh([_zh_entry(1, 0.0, 6.0)])
         self._write_hi([_hi_entry(1, 0.0, 0.0)])
         entry = self._guideline_from_build()[0]
-        self.assertAlmostEqual(entry["pts_multiplier"], 1.0, places=4)
+        self.assertAlmostEqual(
+            entry["pts_multiplier"],
+            config.RENDER_MIN_SEGMENT_DURATION_SEC / 6.0,
+            places=4,
+        )
         self.assertTrue(entry["flagged"])
         self.assertEqual(entry["flag_reason"], "invalid_duration")
 
@@ -180,7 +187,11 @@ class EdgeCaseTest(EditGuidelineBase):
         self._write_zh([_zh_entry(1, 0.0, 6.0)])
         self._write_hi([_hi_entry(1, 2.0, 1.0)])
         entry = self._guideline_from_build()[0]
-        self.assertAlmostEqual(entry["pts_multiplier"], 1.0, places=4)
+        self.assertAlmostEqual(
+            entry["pts_multiplier"],
+            config.RENDER_MIN_SEGMENT_DURATION_SEC / 6.0,
+            places=4,
+        )
         self.assertTrue(entry["flagged"])
         self.assertEqual(entry["flag_reason"], "invalid_duration")
 

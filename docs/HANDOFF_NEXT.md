@@ -2,53 +2,68 @@
 
 গ্রুপ A-E (subtitle-QA-fix, A1-E4) + E5 (real-media QA-writeback fix) +
 E6 (draft duration-validation fix) + E7 (cascade-crash fix) +
-E8 (user_upload duration-check removal) + E9 (duration-drift fix) সম্পূর্ণ।
+E8 (user_upload duration-check removal) + E9 (duration-drift fix) + E10
+(test-isolation fix) + F8 (Whisper timing authority) সম্পূর্ণ।
 
-E9 (`manhwa-video-dubber-v6-duration-drift-fix`): user_upload ডিউরেশন-ড্রিফট বাগ
+F8 (`whisper timing authority`): Whisper এখন টাইমিং-এর প্রাইমারি অথোরিটি
 
-- **বাগ**: real-media QA job `6b2c0929-607f-4f79-a99a-76e0ed0dd5f1`-এ ৫২২s
-  ভয়েসওভার অডিও থেকে **৭৯৭.৮s** ফাইনাল ভিডিও রেন্ডার হয়েছিল (~৫৩% বেশি,
-  ২২৬-এর মধ্যে ১১১ segment `extreme_speed_ratio`)।
-- **রুট-কজ (কোনো cap ছিল না)**: `pts_multiplier`-এর উপর কোনো ক্যাপ/ক্ল্যাম্প
-  ছিল না — `edit_guideline.py` আসল মান রাখে (`target_duration / source_duration`),
-  `auto_cut.py` সেটা সরাসরি `setpts=<multiplier>*PTS`-এ দেয়; `SPEED_RATIO_MIN/MAX`
-  (0.5/2.0) শুধু QA-flag। E7-এর `_redistribute_collision_cluster` +
-  `SUBTITLE_MIN_SERIAL_DURATION_SEC` এবং `RENDER_MIN_SEGMENT_DURATION_SEC`
-  min-window সবই source-side — অডিও-সাইড target-কে ছোঁয় না।
-- **আসল কারণ**: D3 alignment (Gemini/Whisper) প্রতিটা serial-এর জন্য আসল
-  অডিও দৈর্ঘ্যের (৫২২s) বাইরে end-time দিচ্ছিল, ফলে target duration-গুলোর
-  যোগফল অডিওর চেয়ে বেশি হচ্ছিল এবং E2 প্রতিটা clip-কে স্ফীত target-এ
-  stretch করে ভিডিও লম্বা করে দিচ্ছিল।
-- **ফিক্স**: `_clamp_timestamps_to_audio` (এখন `voiceover_unify.py`-তে, D3
-  ইমপোর্ট করে) সব alignment-টাইমস্ট্যাম্পকে `[0, total_sec]`-এর মধ্যে
-  ক্ল্যাম্প করে + কনসিকিউটিভ start-কে আগের end-এ টেনে আনে — target duration
-  কখনো অডিওর চেয়ে বেশি যোগফল দিতে পারে না। D3-তে (প্রাইমারি) + D4-তে
-  (user_upload পাথে defense-in-depth) দুই জায়গাতেই প্রযোজ্য। ফলাফলে এখন
-  `target_total_sec` + `clamped_serials` থাকে, ক্ল্যাম্প হলে non-blocking
-  warning আসে। `auto_tts` পাথ অপরিবর্তিত।
-- **Tests**: full suite **৪০৩ টেস্ট OK** (was ৩৯৫; +৮) — 522s/797.8s
-  real-media প্যাটার্ন রিপ্লিকেট করা টেস্ট, 20x+ multiplier uncapped
-  (শুধু flagged), D4 ক্ল্যাম্প-গার্ড, draft == voiceover দৈর্ঘ্য।
-
-টেস্ট-আইসোলেশন ফিক্স (E9 audit-এর সময় পাওয়া):
-- `test_video_ingest`-এর `/upload` টেস্টটি FA-C1 বেহেভিয়রের কারণে ব্যাকগ্রাউন্ড
-  ডেমন থ্রেডে auto-full-render চালু করে (app.py: `/upload` ডিফল্ট `auto_tts` +
-  একই থ্রেডে `_run_auto_full_render`)। টেস্ট শুধু `upload_pipeline` stage-এর
-  "done" পর্যন্ত অপেক্ষা করত, তাই থ্রেডটি টেস্ট শেষ হওয়ার পরেও বেঁচে থেকে
-  পরবর্তী টেস্টে লিক করত — `test_voiceover_auto`-এর `_call_tts` mock-কে কল করে
-  `fake.assert_not_called()` ফেল করত (সিরিয়াল রানে flaky failure)।
-- ফিক্স: টেস্টে `full_auto_chain.run_auto_tts_chain` mock করা + `_wait_for_stage_done`
-  দিয়ে `auto_full_render` stage settle হওয়া পর্যন্ত অপেক্ষা — থ্রেড টেস্টের
-  `with` ব্লক বন্ধ হওয়ার আগেই পুরোপুরি শেষ হয়, নেটওয়ার্ক কলও হয় না।
+- **F1-F3 (Chinese subtitle extraction)**: প্রতিটা চাঙ্কের Gemini extraction-এর
+  পরে চাঙ্ক-অডিও `-vn -ar 16000 -ac 1` দিয়ে বের করে Whisper দিয়ে
+  transcribe করা হয় (per-chunk, `_dedup_merge`-এর আগে; chunking/dedup
+  কাঠামো অপরিবর্তিত)। প্রতিটা Whisper segment একটা subtitle entry হয়
+  (টাইমিং Whisper-এর); Gemini-এর text তখনই ব্যবহার হয় যখন কোনো unused Gemini
+  line overlap_ratio ≥ 0.5 (SUBTITLE_OVERLAP_MATCH_MIN) **এবং** text
+  similarity ≥ 0.3 — তখন `text_source="gemini_cleaned"`, নাহলে
+  `text_source="whisper_raw"`। কোনো Whisper segment-এর সঙ্গে zero-overlap
+  Gemini line drop হয় + `gemini_hallucinated_dropped`-এ গোনা হয়। Whisper
+  unavailable/falsy হলে আজকের pure-Gemini আউটপুট অপরিবর্তিত (text_source নেই)।
+  F7-এর `timing_source` বাদ → `text_source`।
+- **D3 (user-uploaded voiceover)**: Whisper-primary — voiceover-টা
+  unconditionally transcribe (`language="hi"`), serial-গুলো sequential fuzzy
+  match (matched → `alignment_source="whisper"`)। Unmatched serial-গুলো
+  **bounded Gemini secondary pass**-এ যায়: Gemini শুধু ওই serial-গুলো দেখে, আর
+  একটা item তখনই মানা হয় যখন `end_sec <= last_speech_end +
+  WHISPER_TAIL_TOLERANCE_SEC (1.0)` (`alignment_source="gemini_assisted"`) —
+  Gemini কখনো Whisper-এর ধরা অডিওর বাইরে টাইম দিতে পারে না। নতুন status
+  `"gemini_assisted"`; `"ok"` = সব serial Whisper-matched (বা pure-Gemini
+  fallback-এ সব Gemini-matched); `"whisper"` = কিছু line match হয়নি / Gemini
+  সাহায্য করেনি; `"equal_split"` আগের মতো। Whisper unavailable হলে আজকের
+  pure-Gemini flow অপরিবর্তিত (Gemini → equal-split)। E9
+  `_clamp_timestamps_to_audio` গার্ড প্রতিটা পাথে আগের মতোই চলে।
+- **Config**: `WHISPER_MODEL` "base" → **"small"** (প্রাইমারি টাইমিং-এর জন্য
+  "base"-এর boundary ঢিলা), নতুন `WHISPER_MODEL_ZH`/`WHISPER_MODEL_HI` (None),
+  `SUBTITLE_OVERLAP_MATCH_MIN` (0.5), `WHISPER_TAIL_TOLERANCE_SEC` (1.0)।
+- **Target-collapse render fix (F7 item 4)**: near-zero target এখন near-zero
+  render করে, full source clip নয়।
+  - `edit_guideline._build_entry`: collapsed target (≤ 0) + healthy source →
+    `pts_multiplier = RENDER_MIN_SEGMENT_DURATION_SEC / source_duration` (আগে
+    1.0), এখনো `invalid_duration` flag।
+  - `auto_cut.py`: degenerate-segment guard এখন target-side-ও trigger করে
+    (`target_duration <= RENDER_MIN_SEGMENT_DURATION_SEC` + normal-length
+    source → minimal window কাটা হয়)। `extreme_speed_ratio` এখনো
+    soft/informational।
+- **New shared module `pipeline/whisper_align.py`** (F7 item 1, extended):
+  `transcribe_segments`, `transcribe_words`, `last_speech_end`,
+  `overlap_ratio`, `match_words_to_entries` (voiceover_upload-এর প্রাইভেট
+  `_transcribe_words`/`_match_words_to_entries` এখন alias; call site ও mocks
+  অপরিবর্তিত)। সব helper কখনো raise করে না।
+- **Tests**: full suite **৪৩০ টেস্ট OK + ৪২ subtest** (was ৪০৫; +২৫) —
+  test_whisper_align.py (নতুন), whisper-primary subtitle_extract
+  (text_source, hallucinated drop, per-chunk merge), D3 gemini_assisted
+  (speech-tail-এর ভিতরে/বাইরে), `max(end_sec) <= audio + epsilon` +
+  E9 clamp whisper-primary পাথেও, target-collapse render (edit_guideline /
+  auto_cut)।
 
 বাকি কাজ:
 - ব্যবহারকারীর নিজের real-media QA রান:
   - docs/FINAL_SUMMARY.md → "Subtitle QA Fixes (A1-E4)" → "The user must do this"
-  - যে jobগুলো আগে cascade-crash/zero-duration/duration-drift দিয়েছিল
-    (যেমন `6b2c0929-607f-4f79-a99a-76e0ed0dd5f1`, `97a9b90e-...`) সেগুলো
-    রি-রান করে confirm করো যে এখন ফাইনাল ভিডিওর দৈর্ঘ্য == ভয়েসওভার অডিওর
-    দৈর্ঘ্য, `.srt`-এ আর zero/negative duration নেই এবং কোনো ffmpeg
-    abort/crash নেই।
+  - Whisper-primary পাথ (যখন Whisper ইনস্টল করা থাকবে) দিয়ে একটা job রি-রান
+    করে confirm করো যে subtitles-এর টাইমিং Whisper-এর সাথে মিলছে, `text_source`
+    ফিল্ড ঠিকমতো আসছে, এবং `max(end_sec)` কোনো ফাইলে probed audio-দৈর্ঘ্যের
+    বাইরে যাচ্ছে না।
+- Whisper এখনো এনভায়রনমেন্টে ইনস্টল নেই (pip `openai-whisper` + `numpy`) —
+  ইনস্টল করলে F1-F3/D3-এর প্রাইমারি পাথ সক্রিয় হবে; না করলে pure-Gemini
+  fallback-এ সব আগের মতোই চলে (সম্পূর্ণ resilience সংরক্ষিত)।
 - E6-এর `expected_duration_sec` (draft ≈ source duration) ধারণাটা এখন শুধু
   auto-TTS পাথেই প্রযোজ্য; `user_upload` পাথে draft-এর মোট দৈর্ঘ্য source-এর
   চেয়ে আলাদা হওয়াই প্রত্যাশিত (কিন্তু ভয়েসওভার অডিও দৈর্ঘ্যের সমান থাকবে)।

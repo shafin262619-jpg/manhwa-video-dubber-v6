@@ -1,5 +1,86 @@
 # Manhwa Video Dubber — Changelog
 
+## [F8] — 2026-08-16 — Whisper becomes the primary timing authority (F1-F3, D3) + target-collapse render fix (F7 item 4)
+
+Every source-video subtitle line has real spoken audio, so local Whisper is now
+the timing authority for Chinese subtitle extraction (F1-F3) and user-uploaded
+Hindi voiceover alignment (D3); Gemini is demoted to a bounded advisory
+text-cleanup / secondary-pass role. Gemini can never set timing outside what
+Whisper detected. Replaces F7 items 2-3; item 1 (shared `whisper_align.py`) is
+extended, not replaced; item 4 (render fix) is implemented here.
+
+- **New shared module `pipeline/whisper_align.py`** (F7 item 1, extended):
+  `transcribe_segments` (segment-level, for F1-F3), `transcribe_words`
+  (word-level, for D3), `last_speech_end`, `overlap_ratio`, and
+  `match_words_to_entries` (migrated from `voiceover_upload.py`, which keeps
+  the private `_transcribe_words` / `_match_words_to_entries` names as aliases
+  so its call site and mocks are unchanged). All helpers never raise — `None`
+  on import/transcribe failure, `[]` when Whisper hears no speech.
+- **F1-F3 — `subtitle_extract.py`**: after each chunk's Gemini extraction, the
+  chunk audio is extracted (`-vn -ar 16000 -ac 1`; whole source ->
+  `source_audio.wav`, chunk -> `segments/seg_XXX.wav`) and transcribed with
+  Whisper (per-chunk merge, before the existing `_dedup_merge`, which is
+  structurally unchanged). Every Whisper segment becomes a subtitle entry:
+  timing from Whisper; text = Gemini's when an unused Gemini line overlaps the
+  segment by `overlap_ratio >= SUBTITLE_OVERLAP_MATCH_MIN (0.5)` AND their
+  normalized texts are at least 0.3 similar (`SequenceMatcher`) ->
+  `text_source="gemini_cleaned"`, otherwise `text_source="whisper_raw"`. Gemini
+  lines that overlap no Whisper segment are dropped and counted in
+  `gemini_hallucinated_dropped`. When Whisper is unavailable / hears no speech
+  / audio extraction fails, the pure-Gemini output is returned unchanged (no
+  `text_source` keys). F7's `timing_source` is dropped in favour of
+  `text_source`.
+- **D3 — `voiceover_upload.py`**: Whisper-primary flow — transcribe the
+  voiceover unconditionally (`language="hi"`, model
+  `WHISPER_MODEL_HI or WHISPER_MODEL`), sequential fuzzy-match serials
+  (matched -> `alignment_source="whisper"`, `alignment_fallback=False`).
+  Unmatched serials go to a **bounded Gemini secondary pass**: Gemini only sees
+  those serials and an item is accepted (`alignment_source="gemini_assisted"`)
+  iff its `end_sec <= last_speech_end + WHISPER_TAIL_TOLERANCE_SEC (1.0)`;
+  everything else keeps the equal-split placeholder. New status
+  `"gemini_assisted"` (some serials resolved via the bounded secondary);
+  `"ok"` = every serial Whisper-matched (or, in the pure-Gemini fallback, every
+  serial Gemini-matched); `"whisper"` keeps its meaning (some lines never got
+  matched / Gemini did not help); `"equal_split"` unchanged. When Whisper is
+  unavailable/fails entirely, today's pure-Gemini flow is used unchanged
+  (Gemini for all serials, then equal-split) — this keeps the existing
+  `_gemini_align` mocks and behavior intact. The E9 `_clamp_timestamps_to_audio`
+  guard still runs after every path.
+- **Config**: `WHISPER_MODEL` "base" -> **"small"** (coarse `base` boundaries
+  are not reliable enough for primary timing), new `WHISPER_MODEL_ZH` /
+  `WHISPER_MODEL_HI` (None), `SUBTITLE_OVERLAP_MATCH_MIN` (0.5),
+  `WHISPER_TAIL_TOLERANCE_SEC` (1.0).
+- **Target-collapse render fix (F7 item 4)**: a near-zero target must render
+  near-zero, not the full untouched source clip.
+  - `edit_guideline._build_entry`: a collapsed target (`<= 0`) with a healthy
+    source now sets `pts_multiplier = RENDER_MIN_SEGMENT_DURATION_SEC /
+    source_duration` (was `1.0`), still flagged `invalid_duration`.
+  - `auto_cut.py` render loop: the degenerate-segment guard now also triggers
+    when `target_duration <= RENDER_MIN_SEGMENT_DURATION_SEC` with a
+    normal-length source — a minimal real window is cut (instead of rendering
+    the full source clip) and the guideline multiplier / target sizes it.
+    `extreme_speed_ratio` stays soft/informational.
+- **Regression tests** (+25, full suite 430 passed, 42 subtests):
+  - `test_whisper_align.py` (new): `overlap_ratio`, `last_speech_end`,
+    `transcribe_segments` / `transcribe_words` (fake whisper via
+    `sys.modules`), `match_words_to_entries` sequential matching.
+  - `test_subtitle_extract.py` `WhisperPrimaryMergeTest`: whisper timing +
+    `text_source` schema, zero-overlap Gemini lines dropped +
+    `gemini_hallucinated_dropped`, whisper_raw when texts differ, falsy /
+    unavailable Whisper keeps pure-Gemini output, per-chunk merge before dedup.
+  - `test_voiceover_upload.py`: whisper-primary matches everything -> `"ok"`;
+    `"gemini_assisted"` accepted within the speech tail / rejected past it;
+    `max(end_sec) <= total_sec + epsilon` and the E9 clamp still protecting the
+    whisper-primary path.
+  - `test_edit_guideline.py` zero/negative-target multiplier assertions updated
+    to the MIN/source value; `test_auto_cut.py` `_entry` now builds healthy
+    (non-collapsed) targets, plus the existing degenerate-source tests still
+    green.
+- **Files**: `pipeline/whisper_align.py` (new), `pipeline/subtitle_extract.py`,
+  `pipeline/voiceover_upload.py`, `pipeline/edit_guideline.py`,
+  `pipeline/auto_cut.py`, `pipeline/config.py`, tests above,
+  `docs/CHANGELOG.md`, `docs/HANDOFF_NEXT.md`.
+
 ## [E10] — 2026-08-16 — test-isolation fix: drain the FA-C1 auto-render thread so `/upload` tests cannot leak into later suites
 
 Found while running the full suite as part of the E9 duration-drift verification.

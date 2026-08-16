@@ -1,10 +1,18 @@
-"""Chinese subtitle extraction via Gemini video understanding.
+"""Chinese subtitle extraction via Gemini video understanding + Whisper timing (F8).
 
 For each job, videos shorter than ``LONG_VIDEO_CHUNK_THRESHOLD_SEC`` are sent to
 Gemini in one shot. Longer videos are split into overlapping segments (see
 ``SUBTITLE_OVERLAP_SEC``), each segment is sent separately with its absolute
 start offset added back to the timestamps, then overlap duplicates are
 de-duplicated into one continuous list.
+
+Whisper is the primary timing authority (F1-F3): after each chunk's Gemini
+extraction, the chunk audio is transcribed with local Whisper and every
+Whisper segment becomes a subtitle entry (``text_source`` is ``"gemini_cleaned"``
+when Gemini's text matched the segment, ``"whisper_raw"`` otherwise). Gemini
+lines that overlap no Whisper segment are dropped and counted in
+``gemini_hallucinated_dropped``. When Whisper is unavailable or hears no
+speech, today's pure-Gemini output is returned unchanged.
 
 Resilience rules:
 
@@ -20,15 +28,16 @@ Resilience rules:
 - If every key fails for a segment (or the response is malformed JSON), that
   segment is flagged in ``failed_segments`` with the last exception message
   recorded under ``errors``, logged, and processing continues.
-- ``extract_subtitles`` never raises on Gemini/parse failures. It returns a
-  result with status ``ok`` / ``partial`` / ``extraction_failed`` and writes
-  ``uploads/<job_id>/subtitles_zh_raw.json``.
+- ``extract_subtitles`` never raises on Gemini/Whisper/ffmpeg failures. It
+  returns a result with status ``ok`` / ``partial`` / ``extraction_failed``
+  and writes ``uploads/<job_id>/subtitles_zh_raw.json``.
 """
 
 import json
 import logging
 import re
 import subprocess
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from google import genai
@@ -40,6 +49,7 @@ from pipeline.gemini_rotation import (
     CallBudgetExceeded,
     call_with_rotation_v2,
 )
+from pipeline.whisper_align import overlap_ratio, transcribe_segments
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +381,153 @@ def _dedup_merge(segment_results):
     return merged
 
 
+def _whisper_merge_subtitles(subtitles, whisper_segments):
+    """Whisper-primary merge of Gemini text onto Whisper timing (F1-F3).
+
+    Every Whisper segment becomes one subtitle entry anchored to the segment's
+    timing. Its text is Gemini's (``text_source="gemini_cleaned"``) when an
+    unused Gemini line overlaps the segment by at least
+    ``SUBTITLE_OVERLAP_MATCH_MIN`` AND its normalized text is at least 0.3
+    similar to the segment's (``SequenceMatcher`` ratio); otherwise the raw
+    Whisper text is used (``text_source="whisper_raw"``). Gemini lines that
+    overlap no Whisper segment at all are dropped and counted in the returned
+    ``hallucinated_dropped`` count.
+
+    Returns ``(merged, hallucinated_dropped)``.
+    """
+    used = [False] * len(subtitles)
+    merged = []
+    for segment in whisper_segments:
+        seg_start = float(segment.get("start_sec", 0.0))
+        seg_end = float(segment.get("end_sec", 0.0))
+        seg_text = str(segment.get("text", "")).strip()
+        best_index = None
+        best_key = None
+        for i, sub in enumerate(subtitles):
+            if used[i]:
+                continue
+            ratio = overlap_ratio(
+                sub.get("start_sec", 0.0), sub.get("end_sec", 0.0),
+                seg_start, seg_end,
+            )
+            if ratio < config.SUBTITLE_OVERLAP_MATCH_MIN:
+                continue
+            sim = SequenceMatcher(
+                None, _normalize(sub.get("text")), _normalize(seg_text)
+            ).ratio()
+            if sim < 0.3:
+                continue
+            if best_key is None or (ratio, sim) > best_key:
+                best_key = (ratio, sim)
+                best_index = i
+        if best_index is not None:
+            used[best_index] = True
+            text = str(subtitles[best_index].get("text", "")).strip()
+            text_source = "gemini_cleaned"
+        else:
+            text = seg_text
+            text_source = "whisper_raw"
+        if not text:
+            continue
+        merged.append(
+            {
+                "text": text,
+                "start_sec": round(seg_start, 3),
+                "end_sec": round(seg_end, 3),
+                "text_source": text_source,
+            }
+        )
+
+    hallucinated_dropped = 0
+    for i, sub in enumerate(subtitles):
+        if used[i]:
+            continue
+        if not _overlaps_any_segment(sub, whisper_segments):
+            hallucinated_dropped += 1
+    return merged, hallucinated_dropped
+
+
+def _overlaps_any_segment(sub, whisper_segments):
+    """True when a Gemini line's span overlaps any Whisper segment at all."""
+    for segment in whisper_segments:
+        if (
+            overlap_ratio(
+                sub.get("start_sec", 0.0), sub.get("end_sec", 0.0),
+                segment.get("start_sec", 0.0), segment.get("end_sec", 0.0),
+            )
+            > 0
+        ):
+            return True
+    return False
+
+
+def _extract_audio(video_path):
+    """Extract a mono 16kHz wav from a video for Whisper (F1-F3).
+
+    The whole ``source.mp4`` becomes ``source_audio.wav``; a chunk segment
+    ``segments/seg_XXX.mp4`` becomes ``segments/seg_XXX.wav`` (relative
+    timestamps, shifted by the chunk offset at merge time).
+    """
+    if video_path.name == "source.mp4":
+        wav_path = video_path.with_name("source_audio.wav")
+    else:
+        wav_path = video_path.with_suffix(".wav")
+    _run_ffmpeg(
+        [
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vn", "-ar", "16000", "-ac", "1",
+            "-c:a", "pcm_s16le", str(wav_path),
+        ]
+    )
+    return wav_path
+
+
+def _whisper_merge(job_dir, video_path, subtitles, offset_sec, job_logger):
+    """Whisper-primary merge for one video (whole source or a chunk).
+
+    ``video_path`` is the video Whisper transcribes; ``subtitles`` are the
+    Gemini lines for it with ABSOLUTE timing; ``offset_sec`` is the video's
+    start offset (0.0 for the whole source, the chunk start for a segment) so
+    the Whisper segment times (relative to the video) are shifted to absolute
+    before merging.
+
+    Returns ``(merged_subtitles, stats)`` — on Whisper unavailability / no
+    usable segments / failed audio extraction, returns ``(subtitles, None)``
+    so the caller keeps today's pure-Gemini output unchanged.
+    """
+    if not subtitles:
+        return subtitles, None
+    try:
+        wav_path = _extract_audio(video_path)
+    except RuntimeError as exc:
+        job_logger.warning(
+            "job %s: whisper audio extraction failed for %s; "
+            "skipping whisper merge: %s",
+            job_dir.name, video_path.name, exc,
+        )
+        return subtitles, None
+
+    segments = transcribe_segments(
+        wav_path, model=config.WHISPER_MODEL_ZH, logger_=job_logger
+    )
+    if not segments:
+        return subtitles, None
+
+    for segment in segments:
+        segment["start_sec"] = float(segment.get("start_sec", 0.0)) + offset_sec
+        segment["end_sec"] = float(segment.get("end_sec", 0.0)) + offset_sec
+
+    merged, hallucinated = _whisper_merge_subtitles(subtitles, segments)
+    if not merged:
+        return subtitles, None
+    stats = {
+        "whisper_used": True,
+        "whisper_segments_count": len(segments),
+        "gemini_hallucinated_dropped": hallucinated,
+    }
+    return merged, stats
+
+
 def _build_result(job_id, status, chunked, segments_count, failed_segments, errors, subtitles):
     return {
         "job_id": job_id,
@@ -470,6 +627,7 @@ def extract_subtitles(job_id, upload_root=None, call_budget=None):
     segment_results = []
     failed_segments = []
     errors = {}
+    whisper_stats = []
 
     if not chunked:
         subs, rotation, error = _generate_with_rotation(
@@ -481,6 +639,9 @@ def extract_subtitles(job_id, upload_root=None, call_budget=None):
             failed_segments.append(0)
             errors[0] = error
         else:
+            subs, stats = _whisper_merge(job_dir, source, subs, 0.0, job_logger)
+            if stats:
+                whisper_stats.append(stats)
             segment_results.append(subs)
     else:
         segments = _segment_video(job_dir, source, duration)
@@ -494,6 +655,9 @@ def extract_subtitles(job_id, upload_root=None, call_budget=None):
                 failed_segments.append(seg["index"])
                 errors[seg["index"]] = error
             else:
+                subs, stats = _whisper_merge(job_dir, seg["path"], subs, seg["start"], job_logger)
+                if stats:
+                    whisper_stats.append(stats)
                 segment_results.append(subs)
 
     if len(failed_segments) == segments_count:
@@ -504,7 +668,17 @@ def extract_subtitles(job_id, upload_root=None, call_budget=None):
         status = "ok"
 
     subtitles = _dedup_merge(segment_results) if segment_results else []
+    whisper_fields = {
+        "whisper_used": bool(whisper_stats),
+        "whisper_segments_count": sum(
+            stats.get("whisper_segments_count", 0) for stats in whisper_stats
+        ),
+        "gemini_hallucinated_dropped": sum(
+            stats.get("gemini_hallucinated_dropped", 0) for stats in whisper_stats
+        ),
+    }
     result = _build_result(
         job_id, status, chunked, segments_count, failed_segments, errors, subtitles
     )
+    result.update(whisper_fields)
     return _save(job_dir, result)

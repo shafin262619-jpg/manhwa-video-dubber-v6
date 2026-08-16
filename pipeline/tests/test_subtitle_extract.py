@@ -3,7 +3,9 @@
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -27,6 +29,21 @@ def _make_video(path, seconds=1):
             "ffmpeg", "-y", "-f", "lavfi",
             "-i", f"color=c=black:s=320x240:d={seconds}",
             "-pix_fmt", "yuv420p", str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _make_video_with_audio(path, seconds=1):
+    """Color video + silent audio so whisper audio extraction (``-vn``) works."""
+    _require_tools()
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", f"color=c=black:s=320x240:d={seconds}",
+            "-f", "lavfi", "-i", f"anullsrc=r=16000:cl=mono:d={seconds}",
+            "-pix_fmt", "yuv420p", "-shortest", str(path),
         ],
         check=True,
         capture_output=True,
@@ -192,6 +209,150 @@ class SubtitleExtractChunkTest(SubtitleExtractBase):
         self.assertTrue(result["chunked"])
         self.assertEqual(result["segments_count"], 2)
         self.assertEqual(result["failed_segments"], [])
+
+
+class WhisperPrimaryMergeTest(SubtitleExtractBase):
+    """F1-F3: Whisper is the timing authority; Gemini text merges onto its
+    segments. Whisper itself is faked via ``sys.modules`` and the source video
+    is a real ffmpeg clip so audio extraction runs for real."""
+
+    @classmethod
+    def setUpClass(cls):
+        _require_tools()
+        cls._tmp = tempfile.mkdtemp()
+        cls.video = Path(cls._tmp) / "vid.mp4"
+        _make_video_with_audio(cls.video, seconds=3)
+
+    def _fake_whisper(self, segments_by_name):
+        fake = types.ModuleType("whisper")
+
+        def _load_model(name):
+            def transcribe(path, **kwargs):
+                segments = segments_by_name.get(Path(path).name, [])
+                return {"segments": segments}
+
+            return types.SimpleNamespace(transcribe=transcribe)
+
+        fake.load_model = _load_model
+        return mock.patch.dict(sys.modules, {"whisper": fake})
+
+    def _run_extract(self, fake_call):
+        (self.job_dir / "source.mp4").write_bytes(self.video.read_bytes())
+        self._write_meta(3.0)
+        self._set_keys(["key-one"])
+        with mock.patch.object(subtitle_extract, "_call_gemini", side_effect=fake_call):
+            return subtitle_extract.extract_subtitles(
+                self.job_id, upload_root=self.upload_root
+            )
+
+    def test_whisper_primary_timing_and_text_source(self):
+        gemini = lambda key, prompt, path, offset: [
+            {"text": "你好世界", "start_sec": 0.6, "end_sec": 1.4},
+        ]
+        segments = [
+            {"text": "你好世界", "start": 0.5, "end": 1.5},
+            {"text": "今天天气不错", "start": 1.7, "end": 2.8},
+        ]
+        with self._fake_whisper({"source_audio.wav": segments}):
+            result = self._run_extract(gemini)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["whisper_used"])
+        self.assertEqual(result["whisper_segments_count"], 2)
+        self.assertEqual(result["gemini_hallucinated_dropped"], 0)
+        subs = result["subtitles"]
+        self.assertEqual(len(subs), 2)
+        # Whisper timing wins for the matched line; Gemini text is kept.
+        self.assertEqual(subs[0]["text"], "你好世界")
+        self.assertAlmostEqual(subs[0]["start_sec"], 0.5, places=2)
+        self.assertAlmostEqual(subs[0]["end_sec"], 1.5, places=2)
+        self.assertEqual(subs[0]["text_source"], "gemini_cleaned")
+        # No overlapping Gemini line -> raw whisper text + timing.
+        self.assertEqual(subs[1]["text"], "今天天气不错")
+        self.assertEqual(subs[1]["text_source"], "whisper_raw")
+
+    def test_whisper_primary_drops_zero_overlap_gemini_lines(self):
+        gemini = lambda key, prompt, path, offset: [
+            {"text": "你好", "start_sec": 0.6, "end_sec": 1.4},
+            {"text": "幻听字幕", "start_sec": 2.1, "end_sec": 2.9},
+        ]
+        segments = [{"text": "你好", "start": 0.5, "end": 1.5}]
+        with self._fake_whisper({"source_audio.wav": segments}):
+            result = self._run_extract(gemini)
+
+        self.assertEqual(result["whisper_used"], True)
+        self.assertEqual(result["gemini_hallucinated_dropped"], 1)
+        texts = [s["text"] for s in result["subtitles"]]
+        self.assertEqual(texts, ["你好"])
+        self.assertTrue((self.job_dir / "source_audio.wav").exists())
+
+    def test_whisper_raw_when_texts_differ(self):
+        # Overlap is fine but the texts are unrelated (ratio < 0.3) -> the
+        # Gemini line's text must not be used.
+        gemini = lambda key, prompt, path, offset: [
+            {"text": "完全无关的文本", "start_sec": 0.6, "end_sec": 1.4},
+        ]
+        segments = [{"text": "你好世界", "start": 0.5, "end": 1.5}]
+        with self._fake_whisper({"source_audio.wav": segments}):
+            result = self._run_extract(gemini)
+        self.assertEqual(result["whisper_used"], True)
+        sub = result["subtitles"][0]
+        self.assertEqual(sub["text"], "你好世界")
+        self.assertEqual(sub["text_source"], "whisper_raw")
+
+    def test_falsy_whisper_segments_keeps_pure_gemini(self):
+        gemini = lambda key, prompt, path, offset: [
+            {"text": "你好", "start_sec": 0.6, "end_sec": 1.4},
+        ]
+        with self._fake_whisper({"source_audio.wav": []}):
+            result = self._run_extract(gemini)
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["whisper_used"])
+        sub = result["subtitles"][0]
+        self.assertEqual(sub["text"], "你好")
+        self.assertNotIn("text_source", sub)
+
+    def test_whisper_unavailable_keeps_pure_gemini(self):
+        gemini = lambda key, prompt, path, offset: [
+            {"text": "你好", "start_sec": 0.6, "end_sec": 1.4},
+        ]
+        with mock.patch.dict(sys.modules, {"whisper": None}):
+            result = self._run_extract(gemini)
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["whisper_used"])
+        self.assertEqual(result["subtitles"][0]["text"], "你好")
+        self.assertNotIn("text_source", result["subtitles"][0])
+
+    def test_chunked_whisper_merge_runs_per_chunk_before_dedup(self):
+        gemini = lambda key, prompt, path, offset: [
+            {"text": "dup", "start_sec": offset + 0.5, "end_sec": offset + 1.5},
+        ]
+        by_name = {
+            "seg_000.wav": [{"text": "dup", "start": 0.5, "end": 1.5}],
+            "seg_001.wav": [{"text": "dup", "start": 1.5, "end": 2.4}],
+        }
+        (self.job_dir / "source.mp4").write_bytes(self.video.read_bytes())
+        self._write_meta(3.0)
+        self._set_keys(["key-one"])
+        with (
+            mock.patch.object(subtitle_extract, "_call_gemini", side_effect=gemini),
+            self._fake_whisper(by_name),
+            mock.patch("pipeline.config.LONG_VIDEO_CHUNK_THRESHOLD_SEC", 2.0),
+            mock.patch("pipeline.config.SUBTITLE_OVERLAP_SEC", 1.0),
+        ):
+            result = subtitle_extract.extract_subtitles(
+                self.job_id, upload_root=self.upload_root
+            )
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["chunked"])
+        self.assertTrue(result["whisper_used"])
+        # Each chunk merged onto its whisper segment; the chunked duplicate is
+        # then de-duplicated into a single entry.
+        self.assertEqual(len(result["subtitles"]), 1)
+        sub = result["subtitles"][0]
+        self.assertEqual(sub["text"], "dup")
+        self.assertEqual(sub["text_source"], "gemini_cleaned")
+        self.assertAlmostEqual(sub["start_sec"], 0.5, places=2)
 
 
 class SubtitleExtractFailureTest(SubtitleExtractBase):

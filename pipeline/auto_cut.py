@@ -357,14 +357,32 @@ def build_draft_video(job_id, upload_root=None):
         out_path = clips_dir / f"serial_{index:05d}.mp4"
 
         seg_duration = end_sec - start_sec
-        if seg_duration <= config.RENDER_MIN_SEGMENT_DURATION_SEC:
-            target_duration = target_end_sec - target_start_sec
+        target_duration = target_end_sec - target_start_sec
+        if (
+            seg_duration <= config.RENDER_MIN_SEGMENT_DURATION_SEC
+            or target_duration <= config.RENDER_MIN_SEGMENT_DURATION_SEC
+        ):
+            # Degenerate window (E7: zero/negative source; F8: collapsed
+            # target): ffmpeg aborts with "-to value smaller than -ss" on a
+            # zero/negative cut, and a collapsed target must render near-zero
+            # instead of the full untouched source clip. Cut a minimal real
+            # window and let the guideline multiplier (or the target, when
+            # large enough) size it.
+            if (
+                seg_duration <= config.RENDER_MIN_SEGMENT_DURATION_SEC
+                and target_duration <= config.RENDER_MIN_SEGMENT_DURATION_SEC
+            ):
+                degenerate_side = "degenerate source and target segment"
+            elif seg_duration <= config.RENDER_MIN_SEGMENT_DURATION_SEC:
+                degenerate_side = "degenerate source segment"
+            else:
+                degenerate_side = "degenerate target segment"
             logger.warning(
-                "job %s: serial %s degenerate source segment [%.3f..%.3f] "
-                "(%.4fs <= %.4fs); cutting minimal window and stretching to "
-                "target %.3fs so ffmpeg does not abort",
-                job_id, serial, start_sec, end_sec, seg_duration,
-                config.RENDER_MIN_SEGMENT_DURATION_SEC, target_duration,
+                "job %s: serial %s %s [%.3f..%.3f] -> target %.3fs; "
+                "cutting minimal window so ffmpeg does not abort and the "
+                "clip does not render full-length",
+                job_id, serial, degenerate_side, start_sec, end_sec,
+                target_duration,
             )
             min_window = config.RENDER_MIN_SEGMENT_DURATION_SEC
             if expected_duration_sec > min_window:

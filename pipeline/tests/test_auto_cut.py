@@ -19,13 +19,17 @@ def _ok_result(stdout=""):
     return types.SimpleNamespace(stdout=stdout, stderr="", returncode=0)
 
 
-def _entry(serial, start, end, mult):
+def _entry(serial, start, end, mult, target_start=0.0, target_end=None):
+    # Target span defaults to mult * source duration so the guideline entry
+    # has a healthy (non-degenerate) target like production D2/D3 output.
+    if target_end is None:
+        target_end = target_start + mult * (end - start)
     return {
         "serial": serial,
         "source_start_sec": start,
         "source_end_sec": end,
-        "target_start_sec": 0.0,
-        "target_end_sec": 0.0,
+        "target_start_sec": target_start,
+        "target_end_sec": target_end,
         "pts_multiplier": mult,
         "flagged": False,
         "flag_reason": None,

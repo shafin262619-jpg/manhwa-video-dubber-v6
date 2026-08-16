@@ -111,7 +111,9 @@ class WhisperFallbackTest(VoiceoverUploadBase):
         {"word": "दिन", "start": 3.0, "end": 3.6},
     ]
 
-    def test_gemini_failure_triggers_whisper_and_flags(self):
+    def test_whisper_primary_matches_every_serial(self):
+        # F8: Whisper is the primary authority. When it matches every line,
+        # Gemini failing is irrelevant and the alignment is a clean "ok".
         _make_subtitles(
             self.job_dir,
             [
@@ -131,14 +133,14 @@ class WhisperFallbackTest(VoiceoverUploadBase):
         ):
             result = self._align()
 
-        self.assertEqual(result["status"], "whisper")
+        self.assertEqual(result["status"], "ok")
         self.assertEqual(result["alignment_source"], "whisper")
-        self.assertTrue(result["fallback_used"])
-        self.assertEqual(result["fallback_serials"], [1, 2])
+        self.assertFalse(result["fallback_used"])
+        self.assertEqual(result["fallback_serials"], [])
 
         timestamps = self._timestamps()
         for entry in timestamps:
-            self.assertTrue(entry["alignment_fallback"])
+            self.assertFalse(entry["alignment_fallback"])
         self.assertEqual(timestamps[0]["alignment_source"], "whisper")
         self.assertAlmostEqual(timestamps[0]["start_sec"], 0.1, places=2)
         self.assertAlmostEqual(timestamps[0]["end_sec"], 1.6, places=2)
@@ -146,7 +148,9 @@ class WhisperFallbackTest(VoiceoverUploadBase):
         self.assertAlmostEqual(timestamps[1]["start_sec"], 2.0, places=2)
         self.assertAlmostEqual(timestamps[1]["end_sec"], 3.6, places=2)
 
-    def test_malformed_gemini_response_triggers_fallback(self):
+    def test_whisper_primary_ignores_bad_gemini_when_fully_matched(self):
+        # F8: with Whisper matching every serial, Gemini (even a malformed
+        # response) is never consulted — unmatched is empty.
         _make_subtitles(
             self.job_dir,
             [
@@ -155,7 +159,8 @@ class WhisperFallbackTest(VoiceoverUploadBase):
             ],
         )
         _make_audio(self.job_dir / "voiceover_hi.wav", 6.0)
-        # Gemini only returned serial 1 -> incomplete -> must fall back.
+        # Gemini only returned serial 1 -> incomplete, but Whisper already
+        # matched everything so this must not change the outcome.
         with mock.patch.object(
             voiceover_upload,
             "_call_gemini_align",
@@ -166,10 +171,78 @@ class WhisperFallbackTest(VoiceoverUploadBase):
             voiceover_upload, "_transcribe_words", return_value=self.WHISPER_WORDS
         ):
             result = self._align()
-        self.assertEqual(result["status"], "whisper")
-        self.assertTrue(result["fallback_used"])
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["fallback_used"])
         timestamps = self._timestamps()
         self.assertAlmostEqual(timestamps[1]["start_sec"], 2.0, places=2)
+
+    def test_unmatched_serial_resolved_by_gemini_within_speech_tail(self):
+        # F8 secondary pass: Whisper hears only serial 1 (speech_end = 1.6s);
+        # Gemini resolves serial 2 inside the speech tail -> gemini_assisted.
+        words = self.WHISPER_WORDS[:2]  # "नमस्ते दुनिया" only
+        _make_subtitles(
+            self.job_dir,
+            [
+                {"serial": 1, "text_zh": "A", "text_hi": "नमस्ते दुनिया"},
+                {"serial": 2, "text_zh": "B", "text_hi": "आज का दिन"},
+            ],
+        )
+        _make_audio(self.job_dir / "voiceover_hi.wav", 6.0)
+        with mock.patch.object(
+            voiceover_upload, "_transcribe_words", return_value=words
+        ), mock.patch.object(
+            voiceover_upload,
+            "_call_gemini_align",
+            side_effect=lambda key, path, entries: [
+                {"serial": 2, "start_sec": 1.7, "end_sec": 2.5}
+            ],
+        ):
+            result = self._align()
+
+        self.assertEqual(result["status"], "gemini_assisted")
+        self.assertEqual(result["alignment_source"], "whisper")
+        self.assertTrue(result["fallback_used"])
+        self.assertEqual(result["fallback_serials"], [2])
+
+        timestamps = self._timestamps()
+        self.assertEqual(timestamps[0]["alignment_source"], "whisper")
+        self.assertFalse(timestamps[0]["alignment_fallback"])
+        self.assertEqual(timestamps[1]["alignment_source"], "gemini_assisted")
+        self.assertTrue(timestamps[1]["alignment_fallback"])
+        self.assertAlmostEqual(timestamps[1]["start_sec"], 1.7, places=2)
+        self.assertAlmostEqual(timestamps[1]["end_sec"], 2.5, places=2)
+        self.assertTrue(
+            any("resolved by Gemini" in w for w in result["warnings"])
+        )
+
+    def test_unmatched_serial_gemini_past_speech_tail_rejected(self):
+        # F8: Gemini can never place audio past the Whisper speech tail
+        # (speech_end 1.6 + WHISPER_TAIL_TOLERANCE_SEC 1.0 = 2.6). A proposed
+        # end of 5.0s is rejected -> the serial stays equal_split.
+        words = self.WHISPER_WORDS[:2]
+        _make_subtitles(
+            self.job_dir,
+            [
+                {"serial": 1, "text_zh": "A", "text_hi": "नमस्ते दुनिया"},
+                {"serial": 2, "text_zh": "B", "text_hi": "आज का दिन"},
+            ],
+        )
+        _make_audio(self.job_dir / "voiceover_hi.wav", 6.0)
+        with mock.patch.object(
+            voiceover_upload, "_transcribe_words", return_value=words
+        ), mock.patch.object(
+            voiceover_upload,
+            "_call_gemini_align",
+            side_effect=lambda key, path, entries: [
+                {"serial": 2, "start_sec": 4.5, "end_sec": 5.0}
+            ],
+        ):
+            result = self._align()
+
+        self.assertEqual(result["status"], "whisper")
+        timestamps = self._timestamps()
+        self.assertEqual(timestamps[1]["alignment_source"], "equal_split")
+        self.assertTrue(timestamps[1]["alignment_fallback"])
 
     def test_whisper_partial_match_fills_gap(self):
         _make_subtitles(
@@ -388,6 +461,60 @@ class DurationDriftRegressionTest(VoiceoverUploadBase):
         self.assertEqual(result["clamped_serials"], [])
         self.assertFalse(result["warnings"])
         self.assertAlmostEqual(result["target_total_sec"], 4.6, places=2)
+
+
+class WhisperPrimaryRegressionTest(VoiceoverUploadBase):
+    """F8 acceptance: with Whisper as the primary authority, the written
+    per-serial timestamps must never run past the probed audio duration —
+    ``max(end_sec) <= total_sec + epsilon`` for the file — and the E9 clamp
+    still protects the whisper-primary path."""
+
+    def test_whisper_primary_timestamps_never_exceed_audio(self):
+        words = [
+            {"word": "एक", "start": 0.1, "end": 1.2},
+            {"word": "दो", "start": 1.5, "end": 4.9},
+        ]
+        _make_subtitles(
+            self.job_dir,
+            [{"serial": 1, "text_hi": "एक"}, {"serial": 2, "text_hi": "दो"}],
+        )
+        _make_audio(self.job_dir / "voiceover_hi.wav", 5.0)
+        with mock.patch.object(
+            voiceover_upload, "_transcribe_words", return_value=words
+        ):
+            result = self._align()
+
+        self.assertEqual(result["status"], "ok")
+        total = result["total_sec"]
+        timestamps = self._timestamps()
+        for entry in timestamps:
+            self.assertLessEqual(entry["end_sec"], total + 1e-6)
+        self.assertLessEqual(result["target_total_sec"], total + 1e-6)
+
+    def test_whisper_primary_clamped_to_audio_length(self):
+        # Whisper words (from the same file) end past the probed duration: the
+        # E9 clamp must still pull the targets back inside the audio.
+        words = [
+            {"word": "एक", "start": 0.1, "end": 1.2},
+            {"word": "दो", "start": 1.5, "end": 5.5},
+        ]
+        _make_subtitles(
+            self.job_dir,
+            [{"serial": 1, "text_hi": "एक"}, {"serial": 2, "text_hi": "दो"}],
+        )
+        _make_audio(self.job_dir / "voiceover_hi.wav", 5.0)
+        with mock.patch.object(
+            voiceover_upload, "_transcribe_words", return_value=words
+        ):
+            result = self._align()
+
+        total = result["total_sec"]
+        self.assertTrue(result["clamped_serials"])
+        timestamps = self._timestamps()
+        for entry in timestamps:
+            self.assertLessEqual(entry["end_sec"], total + 1e-6)
+        self.assertAlmostEqual(timestamps[-1]["end_sec"], total, places=2)
+        self.assertLessEqual(result["target_total_sec"], total + 1e-6)
 
 
 class SaveUploadTest(VoiceoverUploadBase):

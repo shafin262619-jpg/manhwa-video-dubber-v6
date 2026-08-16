@@ -83,11 +83,36 @@ GEMINI_RETRY_BACKOFF_SEC = (10, 30, 60)
 # NOTE (U2b): superseded by gemini_rotation.classify_error's marker rules.
 GEMINI_TRANSIENT_HTTP_CODES = (408, 429, 500, 502, 503, 504)
 
-# Local Whisper model used as the alignment fallback when Gemini fails (D3).
-WHISPER_MODEL = "base"
+# Local Whisper model used as the timing authority for Chinese subtitle
+# extraction (F1-F3) and user-uploaded Hindi voiceover alignment (D3), and as
+# the alignment fallback when Gemini fails (D3).
+#
+# DELIBERATE (chunk F8): upgraded from "base" to "small". Whisper is now the
+# primary timing authority (F8), so segment/word boundaries must be reliable;
+# "base" gives coarse, often merged boundaries. "small" is a reasonable
+# accuracy/runtime trade-off on the pipeline machines.
+WHISPER_MODEL = "small"
+
+# Optional per-language Whisper model overrides. None = fall back to
+# WHISPER_MODEL. The language itself is passed explicitly to Whisper where the
+# target language is known (D3 always transcribes the Hindi voiceover with
+# language="hi"); ZH extraction relies on Whisper's auto language detection.
+WHISPER_MODEL_ZH = None
+WHISPER_MODEL_HI = None
 
 # Minimum difflib similarity ratio for a Whisper text match to be accepted.
 WHISPER_MATCH_MIN_RATIO = 0.55
+
+# F1-F3: a Gemini subtitle line is merged onto a Whisper segment (using the
+# segment's timing and Gemini's text) only when at least this fraction of the
+# line's span overlaps the segment AND their texts are similar enough
+# (SequenceMatcher ratio >= 0.3, see subtitle_extract._whisper_merge_subtitles).
+SUBTITLE_OVERLAP_MATCH_MIN = 0.5
+
+# D3: a Gemini-resolved (secondary-pass) serial is accepted only when its
+# reported end_sec is within this many seconds of the last Whisper-detected
+# speech end. Gemini can never place audio past what Whisper actually heard.
+WHISPER_TAIL_TOLERANCE_SEC = 1.0
 
 # Deterministic output for structured extraction.
 GEMINI_TEMPERATURE = 0.0
