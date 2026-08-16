@@ -135,6 +135,18 @@ class ExtremeRatioTest(EditGuidelineBase):
         self.assertEqual(entries[0]["flag_reason"], "extreme_speed_ratio")
         self.assertFalse(entries[1]["flagged"])
 
+    def test_20x_speed_up_keeps_real_multiplier_no_cap(self):
+        # Duration-drift invariant (E9): there is NO cap on the multiplier —
+        # the source clip must be stretched to exactly the target duration no
+        # matter how extreme the ratio. A 20x target is kept at its real value
+        # and only flagged for the review UI.
+        self._write_zh([_zh_entry(1, 0.0, 2.0)])
+        self._write_hi([_hi_entry(1, 0.0, 40.0)])
+        entry = self._guideline_from_build()[0]
+        self.assertAlmostEqual(entry["pts_multiplier"], 20.0, places=4)
+        self.assertTrue(entry["flagged"])
+        self.assertEqual(entry["flag_reason"], "extreme_speed_ratio")
+
 
 class EdgeCaseTest(EditGuidelineBase):
     def test_zero_source_duration_safe_default(self):

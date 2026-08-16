@@ -25,6 +25,15 @@ Every line whose timing did not come from the primary Gemini pass is flagged
 only alignment failure it treats as blocking is an audio file with no
 measurable content (``total_sec <= 0``), which raises
 :class:`~pipeline.voiceover_unify.VoiceoverAlignmentError`.
+
+Duration-drift invariant (E9): whatever the alignment source, the per-serial
+target timestamps are clamped to the probed audio duration (``total_sec``)
+before they are written, so the sum of the target durations can never exceed
+the uploaded voiceover length. This is what keeps "final video duration ==
+voiceover audio duration" true — alignment models occasionally report end
+times past the real audio, and unclamped targets used to stretch every clip
+to an inflated length (real-media QA job 6b2c0929-...: 797.8s of video from
+a 522s audio).
 """
 
 import json
@@ -41,7 +50,7 @@ from google.genai import types as genai_types
 from pipeline import config, job_logging, key_store, video_ingest
 from pipeline.subtitle_extract import _extract_json, call_with_rotation
 from pipeline.voiceover_auto import _probe_audio_duration, _run
-from pipeline.voiceover_unify import VoiceoverAlignmentError
+from pipeline.voiceover_unify import VoiceoverAlignmentError, _clamp_timestamps_to_audio
 
 logger = logging.getLogger(__name__)
 
@@ -339,6 +348,8 @@ def align_uploaded_voiceover(job_id, upload_root=None):
             "fallback_serials": [],
             "entries_count": 0,
             "total_sec": 0.0,
+            "target_total_sec": 0.0,
+            "clamped_serials": [],
             "warnings": [],
             "voiceover_path": str(audio_path),
             "timestamps_path": str(timestamps_path),
@@ -374,6 +385,15 @@ def align_uploaded_voiceover(job_id, upload_root=None):
                             job_id, len(matches), len(entries))
             timestamps = _finalize_timestamps(entries, matches, total_sec)
 
+    # Duration-drift guard (E9): alignment models can return end times past
+    # the real audio length, so the per-serial target durations would sum to
+    # more than the uploaded voiceover and E2 would stretch every clip to an
+    # inflated target (real-media QA job 6b2c0929-...: 797.8s video from a
+    # 522s audio). Clamp to the probed audio duration so the target durations
+    # always tile inside the audio and the final video can never be longer
+    # than the voiceover.
+    timestamps, clamped_serials = _clamp_timestamps_to_audio(timestamps, total_sec)
+
     sources = {entry["alignment_source"] for entry in timestamps}
     if sources == {"gemini"}:
         status, source = "ok", "gemini"
@@ -387,6 +407,12 @@ def align_uploaded_voiceover(job_id, upload_root=None):
     ]
 
     warnings = []
+    if clamped_serials:
+        warnings.append(
+            f"{len(clamped_serials)} aligned segment(s) ran past the uploaded "
+            "audio's real duration and were clamped to it, so the final video "
+            "can never exceed the voiceover length."
+        )
     if status == "equal_split":
         warnings.append(
             "Uploaded audio could not be matched to any subtitle line; "
@@ -413,6 +439,10 @@ def align_uploaded_voiceover(job_id, upload_root=None):
         "fallback_serials": fallback_serials,
         "entries_count": len(entries),
         "total_sec": round(total_sec, 3),
+        "target_total_sec": round(
+            sum(e["end_sec"] - e["start_sec"] for e in timestamps), 3
+        ),
+        "clamped_serials": clamped_serials,
         "warnings": warnings,
         "voiceover_path": str(audio_path),
         "timestamps_path": str(timestamps_path),

@@ -314,6 +314,82 @@ class EdgeCaseTest(VoiceoverUploadBase):
             self._align()
 
 
+class DurationDriftRegressionTest(VoiceoverUploadBase):
+    """Duration-drift fix (E9): the real-media QA job
+    (6b2c0929-607f-4f79-a99a-76e0ed0dd5f1) rendered a 797.8s final video from
+    a 522s voiceover (~53% longer, 111/226 segments flagged
+    extreme_speed_ratio). Root cause: the alignment reported per-serial end
+    times past the real audio length, so the target durations summed to more
+    than the voiceover and E2 stretched every clip to an inflated target.
+    Alignment must clamp to the probed audio duration so
+    ``sum(target durations) == voiceover audio duration``."""
+
+    def test_alignment_past_audio_end_is_clamped(self):
+        # 522s of real audio (the QA job) but Gemini hallucinated timestamps
+        # covering 0..797.8s. After clamping, targets must tile inside 522s.
+        serials = list(range(1, 11))
+        n = len(serials)
+        total_sec = 522.0
+        bad_total = 797.8
+        _make_subtitles(
+            self.job_dir,
+            [{"serial": s, "text_zh": "A", "text_hi": "कुछ"} for s in serials],
+        )
+        (self.job_dir / "voiceover_hi.wav").write_bytes(b"\x00" * 16)
+        seg = bad_total / n
+        gemini_out = [
+            {"serial": s, "start_sec": round((i - 1) * seg, 3),
+             "end_sec": round(i * seg, 3)}
+            for i, s in enumerate(serials, start=1)
+        ]
+        with mock.patch.object(
+            voiceover_upload, "_probe_audio_duration", return_value=total_sec
+        ), mock.patch.object(
+            voiceover_upload,
+            "_call_gemini_align",
+            side_effect=lambda key, path, entries: gemini_out,
+        ):
+            result = self._align()
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["clamped_serials"])
+        self.assertTrue(
+            any("clamped" in w for w in result["warnings"]),
+            "clamping must be surfaced as a warning",
+        )
+        timestamps = self._timestamps()
+        for entry in timestamps:
+            self.assertGreaterEqual(entry["start_sec"], 0.0)
+            self.assertLessEqual(entry["start_sec"], total_sec)
+            self.assertLessEqual(entry["end_sec"], total_sec)
+        self.assertAlmostEqual(timestamps[-1]["end_sec"], total_sec, places=2)
+        target_total = sum(e["end_sec"] - e["start_sec"] for e in timestamps)
+        self.assertAlmostEqual(target_total, total_sec, places=2)
+        self.assertAlmostEqual(result["target_total_sec"], total_sec, places=2)
+
+    def test_within_audio_alignment_is_not_clamped(self):
+        _make_subtitles(
+            self.job_dir,
+            [
+                {"serial": 1, "text_zh": "A", "text_hi": "कुछ"},
+                {"serial": 2, "text_zh": "B", "text_hi": "और"},
+            ],
+        )
+        _make_audio(self.job_dir / "voiceover_hi.wav", 6.0)
+        with mock.patch.object(
+            voiceover_upload,
+            "_call_gemini_align",
+            side_effect=lambda key, path, entries: [
+                {"serial": 1, "start_sec": 0.2, "end_sec": 2.4},
+                {"serial": 2, "start_sec": 2.6, "end_sec": 5.0},
+            ],
+        ):
+            result = self._align()
+        self.assertEqual(result["clamped_serials"], [])
+        self.assertFalse(result["warnings"])
+        self.assertAlmostEqual(result["target_total_sec"], 4.6, places=2)
+
+
 class SaveUploadTest(VoiceoverUploadBase):
     def _wav_bytes(self, duration_sec):
         with tempfile.TemporaryDirectory() as tmp:

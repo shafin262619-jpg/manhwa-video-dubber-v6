@@ -16,6 +16,7 @@ import logging
 from pathlib import Path
 
 from pipeline import video_ingest
+from pipeline.voiceover_auto import _probe_audio_duration
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,43 @@ def _map_timestamp_entry(entry):
         "flagged": tts_failed or alignment_fallback,
         "flag_reason": flag_reason,
     }
+
+
+def _clamp_timestamps_to_audio(timestamps, total_sec):
+    """Clamp per-serial timestamps so their durations never exceed the audio.
+
+    Alignment models (Gemini) can return per-serial end times that run past
+    the real voiceover length; the sum of those target durations would then
+    be longer than the audio, so E2 stretches every clip to an inflated
+    target and the final video drifts long (real-media QA job
+    6b2c0929-607f-4f79-a99a-76e0ed0dd5f1: a 797.8s video from a 522s
+    audio). Every start/end is clamped into ``[0, total_sec]`` and each
+    consecutive start is pulled up to the previous entry's end
+    (deterministic), so the target durations always tile inside the audio
+    and the draft can never be longer than the voiceover.
+
+    Returns ``(clamped, clamped_serials)``. ``clamped`` preserves every
+    other key on each entry; only ``start_sec``/``end_sec`` change (rounded
+    to 3dp).
+    """
+    ordered = sorted(timestamps, key=lambda entry: int(entry.get("serial", 0)))
+    out = []
+    clamped_serials = []
+    prev_end = 0.0
+    for entry in ordered:
+        start = max(0.0, min(float(entry["start_sec"]), float(total_sec)))
+        end = max(0.0, min(float(entry["end_sec"]), float(total_sec)))
+        if start < prev_end:
+            start = prev_end
+        if end < start:
+            end = start
+        if start != float(entry["start_sec"]) or end != float(entry["end_sec"]):
+            clamped_serials.append(entry["serial"])
+        out.append(
+            {**entry, "start_sec": round(start, 3), "end_sec": round(end, 3)}
+        )
+        prev_end = end
+    return out, clamped_serials
 
 
 def _clamp_consecutive_overlaps(entries):
@@ -240,6 +278,33 @@ def unify_voiceover_timestamps(job_id, upload_root=None):
     entries.sort(key=lambda entry: int(entry.get("serial", 0)))
     mapped = [_map_timestamp_entry(entry) for entry in entries]
     final, clamped_serials = _clamp_consecutive_overlaps(mapped)
+
+    # Duration-drift guard (E9): for the user_upload path the alignment target
+    # durations must never sum to more than the real voiceover length (D3
+    # already clamps at alignment time; this is defense-in-depth for a stale or
+    # edited timestamps file). The auto_tts path is untouched — its clip
+    # durations are measured/precise. Clamping is skipped when the audio
+    # cannot be probed (defensive; never blocks).
+    if mode == "user_upload":
+        try:
+            audio_total_sec = _probe_audio_duration(audio_path)
+        except Exception as exc:  # noqa: BLE001 - defensive guard
+            logger.warning(
+                "job %s: cannot probe voiceover duration for target clamp: %s",
+                job_id, exc,
+            )
+            audio_total_sec = 0.0
+        if audio_total_sec and audio_total_sec > 0:
+            final, audio_clamped = _clamp_timestamps_to_audio(
+                final, audio_total_sec
+            )
+            if audio_clamped:
+                clamped_serials = sorted(set(clamped_serials + audio_clamped))
+                logger.warning(
+                    "job %s: %d unified timestamp(s) clamped to the real "
+                    "voiceover duration %.3fs: %s",
+                    job_id, len(audio_clamped), audio_total_sec, audio_clamped,
+                )
 
     missing = _missing_serials(job_dir, final)
     if missing:

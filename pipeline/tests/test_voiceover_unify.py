@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -327,6 +328,85 @@ class VoiceoverUnifyTimestampsTest(VoiceoverUnifyTimestampsBase):
         self._make_audio()
         with self.assertRaises(FileNotFoundError):
             self._unify()
+
+
+class VoiceoverDurationClampTest(VoiceoverUnifyTimestampsBase):
+    """Duration-drift guard (E9): on the user_upload path, unified timestamps
+    must never sum to more than the real voiceover duration — defense in depth
+    for a stale or edited ``timestamps_hi_upload.json`` (D3 already clamps at
+    alignment time). The auto_tts path is untouched."""
+
+    def test_user_upload_timestamps_past_audio_are_clamped(self):
+        self._set_mode("user_upload")
+        self._write_source(
+            "timestamps_hi_upload.json",
+            [
+                {
+                    "serial": 1, "start_sec": 0.0, "end_sec": 3.0,
+                    "alignment_fallback": False, "alignment_source": "gemini",
+                },
+                {
+                    "serial": 2, "start_sec": 3.0, "end_sec": 8.0,
+                    "alignment_fallback": False, "alignment_source": "gemini",
+                },
+            ],
+        )
+        self._make_audio()
+        with mock.patch.object(
+            voiceover_unify, "_probe_audio_duration", return_value=5.0
+        ):
+            result = self._unify()
+
+        self.assertIn(2, result["clamped_serials"])
+        final = self._final()
+        self.assertEqual(final[0]["end_sec"], 3.0)
+        self.assertEqual(final[1]["start_sec"], 3.0)
+        self.assertEqual(final[1]["end_sec"], 5.0)
+        target_total = sum(e["end_sec"] - e["start_sec"] for e in final)
+        self.assertEqual(target_total, 5.0)
+
+    def test_within_audio_user_upload_is_not_clamped(self):
+        self._set_mode("user_upload")
+        self._write_source(
+            "timestamps_hi_upload.json",
+            [
+                {
+                    "serial": 1, "start_sec": 0.0, "end_sec": 3.0,
+                    "alignment_fallback": False, "alignment_source": "gemini",
+                },
+                {
+                    "serial": 2, "start_sec": 3.0, "end_sec": 5.0,
+                    "alignment_fallback": False, "alignment_source": "gemini",
+                },
+            ],
+        )
+        self._make_audio()
+        with mock.patch.object(
+            voiceover_unify, "_probe_audio_duration", return_value=5.0
+        ):
+            result = self._unify()
+        self.assertEqual(result["clamped_serials"], [])
+        self.assertEqual([e["end_sec"] for e in self._final()], [3.0, 5.0])
+
+    def test_unprobeable_audio_skips_clamp_gracefully(self):
+        # If the audio cannot be measured, the clamp is skipped (never blocks).
+        self._set_mode("user_upload")
+        self._write_source(
+            "timestamps_hi_upload.json",
+            [
+                {
+                    "serial": 1, "start_sec": 0.0, "end_sec": 8.0,
+                    "alignment_fallback": False, "alignment_source": "gemini",
+                },
+            ],
+        )
+        self._make_audio()
+        with mock.patch.object(
+            voiceover_unify, "_probe_audio_duration", side_effect=RuntimeError("boom")
+        ):
+            result = self._unify()
+        self.assertEqual(result["clamped_serials"], [])
+        self.assertEqual(self._final()[0]["end_sec"], 8.0)
 
 
 class VoiceoverAlignmentCompletenessTest(VoiceoverUnifyTimestampsBase):

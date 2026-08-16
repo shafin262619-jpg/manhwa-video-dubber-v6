@@ -2,34 +2,42 @@
 
 গ্রুপ A-E (subtitle-QA-fix, A1-E4) + E5 (real-media QA-writeback fix) +
 E6 (draft duration-validation fix) + E7 (cascade-crash fix) +
-E8 (user_upload duration-check removal) সম্পূর্ণ।
+E8 (user_upload duration-check removal) + E9 (duration-drift fix) সম্পূর্ণ।
 
-E8 (`manhwa-video-dubber-v6-duration-check-removed`): E6-এর ডিজাইন সংশোধন —
+E9 (`manhwa-video-dubber-v6-duration-drift-fix`): user_upload ডিউরেশন-ড্রিফট বাগ
 
-- **E6-এর মূল ভিত্তিই ভুল ছিল**: draft validation-এ `user_upload` অডিওর মোট
-  দৈর্ঘ্য source ভিডিওর মোট দৈর্ঘ্যের সাথে tolerance-ভিত্তিক তুলনা করে ব্লক
-  করা হচ্ছিল। কিন্তু পাইপলাইনের উদ্দেশ্যই হলো প্রতিটা scene-clip-কে সেই
-  সেগমেন্টের ভয়েসওভারের দৈর্ঘ্যের সাথে মেলানো (pts stretch); অনুবাদের কারণে
-  দৈর্ঘ্য কম/বেশি হওয়া সম্পূর্ণ স্বাভাবিক (real-media টেস্ট: ৩০৩s ভিডিওতে
-  ৫২৩s অডিও — বৈধ)। মোট দৈর্ঘ্যের পার্থক্যে আর কখনো প্রসেসিং ব্লক হয় না।
-- **আসল সঠিকতা-চেক = per-segment alignment**: `voiceover_unify.py`-এর D4 স্টেপ
-  এখন প্রতিটা সাবটাইটেল serial-এর জন্য voiceover timestamp থাকাটা যাচাই করে;
-  কোনো segment-এর অডিও না পেলে `VoiceoverAlignmentError`-এ ব্লক। এছাড়া
-  `align_uploaded_voiceover` অডিওর measurable content না থাকলে ব্লক করে।
-- **Optional non-blocking warning**: draft দৈর্ঘ্য source-এর ৫x+/১/৫x-
-  থেকে চরমভাবে আলাদা হলে ফলাফল পেজে সতর্কতা-ব্যানার দেখায় ("ঠিক ফাইল
-  আপলোড হয়েছে তো?") — কখনো ব্লক নয়।
-- **Tests**: full suite **৩৯৫ টেস্ট OK** (was ৩৮২; +১৩) — user_upload পাথে
-  ৫০%+ লম্বা/ছোট অডিও সফলভাবে এগিয়ে যায়, শুধু per-segment alignment
-  failure-এই ব্লক হয়।
+- **বাগ**: real-media QA job `6b2c0929-607f-4f79-a99a-76e0ed0dd5f1`-এ ৫২২s
+  ভয়েসওভার অডিও থেকে **৭৯৭.৮s** ফাইনাল ভিডিও রেন্ডার হয়েছিল (~৫৩% বেশি,
+  ২২৬-এর মধ্যে ১১১ segment `extreme_speed_ratio`)।
+- **রুট-কজ (কোনো cap ছিল না)**: `pts_multiplier`-এর উপর কোনো ক্যাপ/ক্ল্যাম্প
+  ছিল না — `edit_guideline.py` আসল মান রাখে (`target_duration / source_duration`),
+  `auto_cut.py` সেটা সরাসরি `setpts=<multiplier>*PTS`-এ দেয়; `SPEED_RATIO_MIN/MAX`
+  (0.5/2.0) শুধু QA-flag। E7-এর `_redistribute_collision_cluster` +
+  `SUBTITLE_MIN_SERIAL_DURATION_SEC` এবং `RENDER_MIN_SEGMENT_DURATION_SEC`
+  min-window সবই source-side — অডিও-সাইড target-কে ছোঁয় না।
+- **আসল কারণ**: D3 alignment (Gemini/Whisper) প্রতিটা serial-এর জন্য আসল
+  অডিও দৈর্ঘ্যের (৫২২s) বাইরে end-time দিচ্ছিল, ফলে target duration-গুলোর
+  যোগফল অডিওর চেয়ে বেশি হচ্ছিল এবং E2 প্রতিটা clip-কে স্ফীত target-এ
+  stretch করে ভিডিও লম্বা করে দিচ্ছিল।
+- **ফিক্স**: `_clamp_timestamps_to_audio` (এখন `voiceover_unify.py`-তে, D3
+  ইমপোর্ট করে) সব alignment-টাইমস্ট্যাম্পকে `[0, total_sec]`-এর মধ্যে
+  ক্ল্যাম্প করে + কনসিকিউটিভ start-কে আগের end-এ টেনে আনে — target duration
+  কখনো অডিওর চেয়ে বেশি যোগফল দিতে পারে না। D3-তে (প্রাইমারি) + D4-তে
+  (user_upload পাথে defense-in-depth) দুই জায়গাতেই প্রযোজ্য। ফলাফলে এখন
+  `target_total_sec` + `clamped_serials` থাকে, ক্ল্যাম্প হলে non-blocking
+  warning আসে। `auto_tts` পাথ অপরিবর্তিত।
+- **Tests**: full suite **৪০৩ টেস্ট OK** (was ৩৯৫; +৮) — 522s/797.8s
+  real-media প্যাটার্ন রিপ্লিকেট করা টেস্ট, 20x+ multiplier uncapped
+  (শুধু flagged), D4 ক্ল্যাম্প-গার্ড, draft == voiceover দৈর্ঘ্য।
 
 বাকি কাজ:
 - ব্যবহারকারীর নিজের real-media QA রান:
   - docs/FINAL_SUMMARY.md → "Subtitle QA Fixes (A1-E4)" → "The user must do this"
-  - যে jobগুলো আগে cascade-crash/zero-duration দিয়েছিল (যেমন
-    `97a9b90e-...`) সেগুলো রি-রান করে confirm করো যে এখন final `.srt`-এ আর
-    zero/negative duration নেই এবং draft render-এর সময় কোনো ffmpeg
+  - যে jobগুলো আগে cascade-crash/zero-duration/duration-drift দিয়েছিল
+    (যেমন `6b2c0929-607f-4f79-a99a-76e0ed0dd5f1`, `97a9b90e-...`) সেগুলো
+    রি-রান করে confirm করো যে এখন ফাইনাল ভিডিওর দৈর্ঘ্য == ভয়েসওভার অডিওর
+    দৈর্ঘ্য, `.srt`-এ আর zero/negative duration নেই এবং কোনো ffmpeg
     abort/crash নেই।
 - E6-এর `expected_duration_sec` (draft ≈ source duration) ধারণাটা এখন শুধু
   auto-TTS পাথেই প্রযোজ্য; `user_upload` পাথে draft-এর মোট দৈর্ঘ্য source-এর
-  চেয়ে আলাদা হওয়াই প্রত্যাশিত।
+  চেয়ে আলাদা হওয়াই প্রত্যাশিত (কিন্তু ভয়েসওভার অডিও দৈর্ঘ্যের সমান থাকবে)।

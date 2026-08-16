@@ -1,5 +1,66 @@
 # Manhwa Video Dubber — Changelog
 
+## [E9] — 2026-08-15 — duration-drift fix for user_upload: alignment targets are clamped to the real voiceover length so the final video can never be longer than the audio
+
+Real-media QA job `6b2c0929-607f-4f79-a99a-76e0ed0dd5f1` rendered a **797.8s
+final video from a 522s voiceover** (~53% longer, 111 of ~226 segments flagged
+`extreme_speed_ratio`). The design invariant is: each serial's source clip is
+pts-stretched to exactly its voiceover segment target duration — **with no cap
+on the multiplier** — so the concatenated final video must equal the voiceover
+audio duration. The bug was not a cap: tracing the multiplier path showed
+`edit_guideline.py` keeps the real value (`target_duration / source_duration`)
+and `auto_cut.py` passes it straight to `setpts=<multiplier>*PTS`;
+`SPEED_RATIO_MIN/MAX` are flag-only QA thresholds. The drift came from the
+**targets themselves**: D3 alignment (Gemini/Whisper) reported per-serial end
+times that ran past the actual audio length, so the target durations summed to
+more than the voiceover and E2 faithfully stretched every clip to an inflated
+target.
+
+- **Problem**: alignment target durations could sum to more than the uploaded
+  voiceover's real duration → the draft video (sum of stretched clips) was
+  longer than the audio, breaking the invariant.
+- **Fix 1 — clamp at alignment time (D3)**:
+  `pipeline/voiceover_upload.align_uploaded_voiceover` now runs
+  `_clamp_timestamps_to_audio` over whatever alignment source was used
+  (Gemini / Whisper / equal-split): every `start_sec`/`end_sec` is clamped into
+  `[0, total_sec]`, consecutive starts are pulled up to the previous end
+  (deterministic), so the target durations always tile inside the audio. The
+  result now reports `target_total_sec` (sum of target durations, `==`
+  voiceover duration after clamping) and `clamped_serials`; a non-blocking
+  warning is added when clamping happened.
+- **Fix 2 — defense-in-depth at unify time (D4)**:
+  `pipeline/voiceover_unify.unify_voiceover_timestamps` applies the same clamp
+  to the `user_upload` path against the probed voiceover duration (protects a
+  stale or edited `timestamps_hi_upload.json`); skipped gracefully when the
+  audio cannot be probed and never applied to the precise `auto_tts` path.
+- **Shared helper**: `_clamp_timestamps_to_audio` lives in
+  `pipeline/voiceover_unify.py` (reused by D3 via import, mirroring the
+  existing cross-module helper pattern).
+- **Verified no cap exists**: `SPEED_RATIO_MIN/MAX` (0.5/2.0) remain
+  flag-only in `edit_guideline.py` / `review.py`; E7's
+  `_redistribute_collision_cluster` + `SUBTITLE_MIN_SERIAL_DURATION_SEC` and
+  the `RENDER_MIN_SEGMENT_DURATION_SEC` min-window fallback are source-side
+  only and untouched.
+- **Regression tests** (+8, full suite 403 OK):
+  - `test_voiceover_upload.py` — `DurationDriftRegressionTest`: replicates the
+    real-media pattern (522s audio, Gemini timestamps covering 0..797.8s) and
+    asserts every timestamp is clamped to ≤ 522s, the last end lands on 522s,
+    `sum(target durations) == 522s`, and clamping surfaces a warning;
+    within-audio alignments are not clamped.
+  - `test_voiceover_unify.py` — `VoiceoverDurationClampTest`: user_upload
+    timestamps past the audio length are clamped in D4; unprobeable audio
+    skips the clamp gracefully.
+  - `test_edit_guideline.py` — a 20x speed-up keeps its real multiplier (no
+    cap) and is only flagged `extreme_speed_ratio`.
+  - `test_auto_cut.py` — `DurationDriftRegressionTest`: a 20x multiplier flows
+    through `build_clip_command` uncapped (`setpts=20.000000*PTS`); the draft
+    reports exactly the voiceover duration (`final video duration == voiceover
+    audio duration`).
+- **Files**: `pipeline/voiceover_upload.py`, `pipeline/voiceover_unify.py`,
+  `pipeline/tests/test_voiceover_upload.py`, `pipeline/tests/test_voiceover_unify.py`,
+  `pipeline/tests/test_edit_guideline.py`, `pipeline/tests/test_auto_cut.py`,
+  `docs/CHANGELOG.md`, `docs/HANDOFF_NEXT.md`.
+
 ## [E8] — 2026-08-15 — duration-check removed for user_upload: total-length differences are normal translation drift, never a block
 
 Design correction of the E6 fix. E6 made the draft video validation compare the

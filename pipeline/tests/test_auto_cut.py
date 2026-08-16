@@ -518,5 +518,45 @@ class DegenerateSegmentTest(AutoCutBase):
         self.assertTrue(any(arg == "setpts=1.000000*PTS" for arg in clip))
 
 
+class DurationDriftRegressionTest(AutoCutBase):
+    """Duration-drift invariant (E9): the final video duration must equal the
+    voiceover audio duration. E2 stretches each clip to its exact target
+    duration (no cap on the multiplier) and concatenates, so the draft equals
+    the sum of the targets — which D3/D4 clamp to the real audio length. These
+    tests pin that no cap creeps into the render command and that the draft
+    lands on the voiceover length."""
+
+    def test_extreme_20x_multiplier_passes_uncapped(self):
+        self._write_inputs()
+        self._write_guideline([_entry(1, 0.0, 2.0, 20.0)])
+        result, calls = self._run_with()
+        self.assertEqual(result["status"], "ok")
+        clip = [c for c in calls if c[0] == "ffmpeg"][0]
+        self.assertTrue(any(arg == "setpts=20.000000*PTS" for arg in clip))
+
+    def test_draft_lands_on_voiceover_duration(self):
+        # Given a guideline whose target durations sum to the voiceover length
+        # (12.0s), the rendered draft reports exactly that length — the
+        # invariant "final video duration == voiceover audio duration".
+        self._write_inputs()
+        self._write_guideline([_entry(1, 0.0, 6.0, 2.0)])
+        self._write_choice("user_upload")
+
+        def probe_override(path):
+            name = Path(path).name
+            if name == "draft_final_video.mp4":
+                return {
+                    "format": {"duration": "12.0"},
+                    "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
+                }
+            return self._probe_for(path)
+
+        result, _ = self._run_with(probe_override=probe_override)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["duration_sec"], 12.0)
+        self.assertEqual(result["voiceover_duration_sec"], 12.0)
+        self.assertEqual(result["duration_sec"], result["voiceover_duration_sec"])
+
+
 if __name__ == "__main__":
     unittest.main()
