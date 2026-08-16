@@ -30,6 +30,17 @@ E9 (`manhwa-video-dubber-v6-duration-drift-fix`): user_upload ডিউরেশ
   real-media প্যাটার্ন রিপ্লিকেট করা টেস্ট, 20x+ multiplier uncapped
   (শুধু flagged), D4 ক্ল্যাম্প-গার্ড, draft == voiceover দৈর্ঘ্য।
 
+টেস্ট-আইসোলেশন ফিক্স (E9 audit-এর সময় পাওয়া):
+- `test_video_ingest`-এর `/upload` টেস্টটি FA-C1 বেহেভিয়রের কারণে ব্যাকগ্রাউন্ড
+  ডেমন থ্রেডে auto-full-render চালু করে (app.py: `/upload` ডিফল্ট `auto_tts` +
+  একই থ্রেডে `_run_auto_full_render`)। টেস্ট শুধু `upload_pipeline` stage-এর
+  "done" পর্যন্ত অপেক্ষা করত, তাই থ্রেডটি টেস্ট শেষ হওয়ার পরেও বেঁচে থেকে
+  পরবর্তী টেস্টে লিক করত — `test_voiceover_auto`-এর `_call_tts` mock-কে কল করে
+  `fake.assert_not_called()` ফেল করত (সিরিয়াল রানে flaky failure)।
+- ফিক্স: টেস্টে `full_auto_chain.run_auto_tts_chain` mock করা + `_wait_for_stage_done`
+  দিয়ে `auto_full_render` stage settle হওয়া পর্যন্ত অপেক্ষা — থ্রেড টেস্টের
+  `with` ব্লক বন্ধ হওয়ার আগেই পুরোপুরি শেষ হয়, নেটওয়ার্ক কলও হয় না।
+
 বাকি কাজ:
 - ব্যবহারকারীর নিজের real-media QA রান:
   - docs/FINAL_SUMMARY.md → "Subtitle QA Fixes (A1-E4)" → "The user must do this"

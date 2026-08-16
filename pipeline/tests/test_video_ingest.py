@@ -12,7 +12,13 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from app import app
-from pipeline import key_store, subtitle_extract, translator, video_ingest
+from pipeline import (
+    full_auto_chain,
+    key_store,
+    subtitle_extract,
+    translator,
+    video_ingest,
+)
 
 
 def _require_tools():
@@ -141,6 +147,23 @@ class UploadEndpointTest(unittest.TestCase):
             time.sleep(interval)
         self.fail(f"upload pipeline for {job_id} did not finish in {timeout}s")
 
+    def _wait_for_stage_done(self, job_id, stage, timeout=15.0, interval=0.1):
+        """Poll until a specific background stage settles (done/error).
+
+        Used to drain the FA-C1 auto-render thread (which /upload starts on
+        the same daemon thread right after the upload pipeline) before the
+        test's mocks are unpatched — otherwise that thread leaks into later
+        tests and calls their patched functions.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            body = self.client.get(f"/api/jobs/{job_id}/status").json()
+            stage_status = (body.get("stages") or {}).get(stage) or {}
+            if stage_status.get("state") in ("done", "error"):
+                return body
+            time.sleep(interval)
+        self.fail(f"stage {stage!r} for job {job_id} did not finish in {timeout}s")
+
     def test_upload_blocked_without_active_key(self):
         res = self._upload()
         self.assertEqual(res.status_code, 400)
@@ -162,6 +185,14 @@ class UploadEndpointTest(unittest.TestCase):
             translator,
             "_call_gemini_text",
             return_value="नमस्ते",
+        ), mock.patch.object(
+            # FA-C1: /upload defaults the voice source to auto_tts, so the
+            # upload thread continues into the full-auto render. Mock the
+            # chain so it cannot hit the network, and drain the stage below
+            # so the daemon thread fully exits before the mocks are restored.
+            full_auto_chain,
+            "run_auto_tts_chain",
+            return_value={},
         ):
             res = self._upload()
             self.assertEqual(res.status_code, 200)
@@ -171,6 +202,7 @@ class UploadEndpointTest(unittest.TestCase):
             self.assertEqual(body["status"], "processing")
             self.assertNotIn("pipeline", body)
             status = self._wait_for_upload_done(job_id)
+            self._wait_for_stage_done(job_id, "auto_full_render")
         upload_stage = status["stages"]["upload_pipeline"]
         # G1 wiring: the upload endpoint must chain the subtitle pipeline so
         # the next phase has its inputs ready; the summary now comes from the

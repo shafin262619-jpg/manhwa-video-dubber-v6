@@ -1,5 +1,29 @@
 # Manhwa Video Dubber — Changelog
 
+## [E10] — 2026-08-16 — test-isolation fix: drain the FA-C1 auto-render thread so `/upload` tests cannot leak into later suites
+
+Found while running the full suite as part of the E9 duration-drift verification.
+Not a product bug — a flaky cross-test leak.
+
+- **Problem**: `test_video_ingest.test_upload_success_creates_job` posts a real
+  upload, and `/upload` defaults the voice source to `auto_tts` (FA-A1), so
+  `_run_upload_pipeline` continues into `_run_auto_full_render` **on the same
+  background daemon thread** (FA-C1). The test's `_wait_for_upload_done` only
+  polls until the `upload_pipeline` stage reaches `"done"`, so the thread is
+  still running the full-auto chain when the test ends and the mocks are
+  unpatched. That thread then leaks into later tests: when `test_voiceover_auto`
+  patches `voiceover_auto._call_tts`, the leaked thread calls it with the
+  invalid test key, so `test_call_budget_cap_uses_silence_without_raising` fails
+  with `Expected '_call_tts' to not have been called` / a `MagicMock` written to
+  a clip file. Order- and timing-dependent (only manifests in the full-suite run).
+- **Fix**: in `test_video_ingest`, mock `full_auto_chain.run_auto_tts_chain`
+  (no network) and add a `_wait_for_stage_done` helper so the test waits for the
+  `auto_full_render` stage to settle **inside** the mock `with` block — the
+  daemon thread fully exits before any mock is restored.
+- **Regression**: full suite is deterministic green (403 passed, 42 subtests).
+- **Files**: `pipeline/tests/test_video_ingest.py`, `docs/CHANGELOG.md`,
+  `docs/HANDOFF_NEXT.md`.
+
 ## [E9] — 2026-08-15 — duration-drift fix for user_upload: alignment targets are clamped to the real voiceover length so the final video can never be longer than the audio
 
 Real-media QA job `6b2c0929-607f-4f79-a99a-76e0ed0dd5f1` rendered a **797.8s
