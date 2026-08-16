@@ -28,6 +28,30 @@ from pipeline import config
 logger = logging.getLogger(__name__)
 
 
+def engine_allows_whisper(job_id, upload_root=None):
+    """Whether the job's configured engine permits local-Whisper use (F9).
+
+    - ``gemini_only`` jobs never call Whisper, even when it is installed
+      (phone/Termux users who skip the heavy torch/whisper install, or who
+      prefer speed/cost over local timing accuracy).
+    - ``whisper_primary`` jobs call Whisper; when it is not installed the
+      transcription helpers already fail gracefully into the pure-Gemini path.
+    - Jobs with no ``job_config.json`` yet (pre-F9 uploads) keep the F8
+      behavior: Whisper is always tried — the config-file *existence*, not the
+      informational default engine, decides — so existing callers and mocks
+      are unaffected.
+
+    Imported lazily to keep ``whisper_align`` the single owner of every
+    Whisper interaction without a top-level import cycle with ``job_config``.
+    """
+    from pipeline import job_config
+
+    if not job_config.config_path(job_id, upload_root).exists():
+        return True
+    cfg = job_config.read_config(job_id, upload_root)
+    return cfg.get("engine") == "whisper_primary"
+
+
 def transcribe_segments(audio_path, language=None, model=None, logger_=None):
     """Transcribe an audio file with local Whisper, segment-level.
 

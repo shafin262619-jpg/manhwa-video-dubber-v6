@@ -1,5 +1,76 @@
 # Manhwa Video Dubber — Changelog
 
+## [F9] — 2026-08-16 — per-job engine/language config, 3-job history with confirm-based eviction, resume-from-interruption
+
+Every job now carries a per-job config written once at creation, the app keeps
+the last 3 jobs in a history index that never evicts silently, and an
+interrupted job can be resumed from the exact stage it stopped at. F10
+(progress bar / log panel / history-tab UI) and F11 (Bengali error text) are
+**not** part of this chunk — they are separate, not-started.
+
+- **New module `pipeline/job_config.py`** — `uploads/<job_id>/job_config.json`
+  written once at job creation, before any Gemini/Whisper stage runs. Records
+  the processing engine (`whisper_primary` vs `gemini_only`), the target
+  language (`target_lang`, `"hi"` today; `source_lang` is schema-only until
+  F12 auto-detection), and the voice source. `write_config` validates the
+  engine / voice source (ValueError), `read_config` never raises and returns
+  the F9 defaults for pre-F9 jobs (dir exists, no config file) or `None` for a
+  missing job dir. `default_engine()` = `whisper_primary` when local Whisper is
+  importable, else `gemini_only`; `whisper_importable()` is the probe.
+- **Engine-gated Whisper (F9 §2)** — `whisper_align.engine_allows_whisper()`
+  reads the per-job config: a `gemini_only` job skips Whisper even when it IS
+  installed, for phone/Termux users who avoid the heavy torch/whisper install.
+  Pre-F9 jobs with no `job_config.json` keep F8 behavior (Whisper allowed).
+  Gated call sites: `subtitle_extract._whisper_merge` and
+  `voiceover_upload.align_uploaded_voiceover`. The engine radio on the upload
+  form (`GET /`) is pre-selected from `default_engine()`.
+- **Per-stage status + progress** — `job_status.run_stage()` writes
+  `running` → runs the stage → writes `done` (preserving a `progress` dict the
+  stage wrote) or `error` + re-raise (status writes are best-effort). Every
+  stage of `full_auto_chain.run_auto_tts_chain()` /
+  `run_user_upload_chain()` is wrapped, so each records its own status entry
+  (D2_voiceover / D3_align / D4_unify / E1_guideline / E2_draft / F3_final) in
+  order. `subtitle_extract.extract_subtitles` and `auto_cut.build_draft_video`
+  take an optional `progress_cb(processed, total)`. The app's `_run_upload_pipeline`
+  wraps F1_extract and C1_translate with `run_stage` (F1 gets per-chunk progress).
+- **Resume-from-interruption (F9 §5)** — new module `pipeline/resume.py`:
+  `find_resume_point(job_id)` derives the next stage from which artifacts
+  exist (`"upload_pipeline"` when `subtitles_hi.json` is missing, then the
+  first missing of timestamps → edit_guideline → draft_final_video.mp4 →
+  `outputs/<job_id>/final_video.mp4`; `None` when complete). `resume_job` runs
+  the chain from that point via `start_from` on
+  `run_auto_tts_chain` / `run_user_upload_chain` (earlier stages skipped, their
+  result keys `None` — a completed stage is never re-run), and raises
+  `RuntimeError` for complete / not-yet-uploaded jobs. New endpoint
+  `POST /jobs/{job_id}/resume` returns `{"resume_point", "status":
+  "processing"}` and runs `_run_resume` on a background thread persisting
+  `resume` stage status; 409 when there is nothing to resume.
+- **3-job history with confirm-based eviction (F9 §4)** — new module
+  `pipeline/history_store.py`: index at `uploads/_history_index.json`, capped
+  at `HISTORY_LIMIT` (3). `register_job` adds newest-first; when the index is
+  already full it does **not** evict — it returns `{"added": False,
+  "would_evict": <oldest>, "needs_confirm": True}`. `evict_job(job_id,
+  delete_files=...)` drops the job, optionally deleting its files — only ever
+  called after the user confirms. `list_history` returns the jobs newest-first
+  with live metadata (job_config, voice source, status, target video name),
+  skipping missing dirs. Endpoint `GET /history` returns
+  `{"history": [...], "limit": 3}`.
+- **Browser `confirm()` eviction flow on history-full** — on the upload form,
+  when `POST /upload` returns 409 with `needs_confirm`, the page shows a
+  two-step `window.confirm()` dialog naming the oldest job to be evicted;
+  accepting calls `POST /jobs/{job_id}/confirm-start?evict_job_id=<oldest>&
+  delete_files=true`, which evicts, registers the pending job and starts its
+  pipeline; declining cancels without evicting anything. `POST /upload` also
+  accepts the engine and target_lang form fields (validated) and writes
+  `job_config.json` before any Gemini/Whisper work.
+- **Tests**: full suite **৪৭১ টেস্ট OK** (was ৪৩০; +৪১) — new
+  `test_job_config.py`, `test_history_store.py`, `test_resume.py`,
+  `test_f9_endpoints.py` (HTTP: 409 confirm flow, confirm-start, /history,
+  resume endpoint); extended `test_full_auto_chain.py` (per-stage status
+  order), `test_subtitle_extract.py` + `test_voiceover_upload.py` (engine
+  gating: `gemini_only` never transcribes). The resume acceptance test proves
+  a stage that wrote its artifact then crashed is not re-run.
+
 ## [F8] — 2026-08-16 — Whisper becomes the primary timing authority (F1-F3, D3) + target-collapse render fix (F7 item 4)
 
 Every source-video subtitle line has real spoken audio, so local Whisper is now

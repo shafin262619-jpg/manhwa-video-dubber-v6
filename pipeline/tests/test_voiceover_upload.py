@@ -9,7 +9,7 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from app import app
-from pipeline import key_store, video_ingest, voiceover_auto, voiceover_upload
+from pipeline import job_config, key_store, video_ingest, voiceover_auto, voiceover_upload
 
 
 def _make_audio(path, duration_sec):
@@ -271,6 +271,49 @@ class WhisperFallbackTest(VoiceoverUploadBase):
         self.assertEqual(timestamps[1]["alignment_source"], "equal_split")
         self.assertAlmostEqual(timestamps[1]["start_sec"], 1.6, places=2)
         self.assertAlmostEqual(timestamps[1]["end_sec"], 6.0, places=2)
+
+
+class EngineGatingTest(VoiceoverUploadBase):
+    """F9: a ``gemini_only`` job skips the Whisper primary pass entirely even
+    when Whisper is importable; only the pure-Gemini flow runs."""
+
+    def _write_config(self, engine):
+        job_config.write_config(
+            self.job_id, engine=engine, upload_root=self.upload_root
+        )
+
+    def test_gemini_only_skips_whisper_primary(self):
+        _make_subtitles(
+            self.job_dir,
+            [
+                {"serial": 1, "text_zh": "A", "text_hi": "नमस्ते दुनिया"},
+                {"serial": 2, "text_zh": "B", "text_hi": "आज का दिन"},
+            ],
+        )
+        _make_audio(self.job_dir / "voiceover_hi.wav", 6.0)
+        self._write_config("gemini_only")
+
+        with mock.patch.object(
+            voiceover_upload,
+            "_transcribe_words",
+            side_effect=AssertionError("whisper must not run for gemini_only"),
+        ), mock.patch.object(
+            voiceover_upload,
+            "_call_gemini_align",
+            side_effect=lambda key, path, entries: [
+                {"serial": 1, "start_sec": 0.2, "end_sec": 1.0},
+                {"serial": 2, "start_sec": 1.1, "end_sec": 1.9},
+            ],
+        ):
+            result = self._align()
+
+        self.assertEqual(result["alignment_source"], "gemini")
+        self.assertFalse(result["fallback_used"])
+        timestamps = self._timestamps()
+        self.assertEqual(timestamps[0]["alignment_source"], "gemini")
+        self.assertFalse(timestamps[0]["alignment_fallback"])
+        self.assertAlmostEqual(timestamps[0]["start_sec"], 0.2, places=2)
+        self.assertAlmostEqual(timestamps[1]["end_sec"], 1.9, places=2)
 
 
 class EqualSplitFallbackTest(VoiceoverUploadBase):

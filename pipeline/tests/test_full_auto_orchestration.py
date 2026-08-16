@@ -216,10 +216,25 @@ class FullAutoOrchestrationTest(unittest.TestCase):
         status = self._wait_stage(job_id, "auto_full_render")
         self.assertIn("upload_pipeline", status["stages"])
         self.assertIn("auto_full_render", status["stages"])
+        # F9: every stage records its own status entry, so the stage-through
+        # is now the granular chain (F1 -> C1 -> D2 -> D4 -> E1 -> E2 -> F3)
+        # under the upload_pipeline / auto_full_render umbrella stages. The
+        # final status dict's key order is deterministic (insertion order of
+        # first write), so assert it exactly.
         self.assertEqual(
-            self.stage_order,
-            ["upload_pipeline", "auto_full_render"],
-            "stage-through must be upload_pipeline then auto_full_render",
+            list(status["stages"].keys()),
+            [
+                "upload_pipeline",
+                "F1_extract",
+                "C1_translate",
+                "D2_voiceover",
+                "D4_unify",
+                "E1_guideline",
+                "E2_draft",
+                "F3_final",
+                "auto_full_render",
+            ],
+            "stage-through must run every pipeline stage in order",
         )
         self.assertTrue(self._final_path(job_id).exists())
 

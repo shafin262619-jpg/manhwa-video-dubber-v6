@@ -3,58 +3,83 @@
 গ্রুপ A-E (subtitle-QA-fix, A1-E4) + E5 (real-media QA-writeback fix) +
 E6 (draft duration-validation fix) + E7 (cascade-crash fix) +
 E8 (user_upload duration-check removal) + E9 (duration-drift fix) + E10
-(test-isolation fix) + F8 (Whisper timing authority) সম্পূর্ণ।
+(test-isolation fix) + F8 (Whisper timing authority) + F9 (per-job config,
+3-job history + confirm eviction, resume-from-interruption) সম্পূর্ণ।
 
-F8 (`whisper timing authority`): Whisper এখন টাইমিং-এর প্রাইমারি অথোরিটি
+F9 (`per-job config + history + resume`): job_config, 3-job history, resume
 
-- **F1-F3 (Chinese subtitle extraction)**: প্রতিটা চাঙ্কের Gemini extraction-এর
-  পরে চাঙ্ক-অডিও `-vn -ar 16000 -ac 1` দিয়ে বের করে Whisper দিয়ে
-  transcribe করা হয় (per-chunk, `_dedup_merge`-এর আগে; chunking/dedup
-  কাঠামো অপরিবর্তিত)। প্রতিটা Whisper segment একটা subtitle entry হয়
-  (টাইমিং Whisper-এর); Gemini-এর text তখনই ব্যবহার হয় যখন কোনো unused Gemini
-  line overlap_ratio ≥ 0.5 (SUBTITLE_OVERLAP_MATCH_MIN) **এবং** text
-  similarity ≥ 0.3 — তখন `text_source="gemini_cleaned"`, নাহলে
-  `text_source="whisper_raw"`। কোনো Whisper segment-এর সঙ্গে zero-overlap
-  Gemini line drop হয় + `gemini_hallucinated_dropped`-এ গোনা হয়। Whisper
-  unavailable/falsy হলে আজকের pure-Gemini আউটপুট অপরিবর্তিত (text_source নেই)।
-  F7-এর `timing_source` বাদ → `text_source`।
-- **D3 (user-uploaded voiceover)**: Whisper-primary — voiceover-টা
-  unconditionally transcribe (`language="hi"`), serial-গুলো sequential fuzzy
-  match (matched → `alignment_source="whisper"`)। Unmatched serial-গুলো
-  **bounded Gemini secondary pass**-এ যায়: Gemini শুধু ওই serial-গুলো দেখে, আর
-  একটা item তখনই মানা হয় যখন `end_sec <= last_speech_end +
-  WHISPER_TAIL_TOLERANCE_SEC (1.0)` (`alignment_source="gemini_assisted"`) —
-  Gemini কখনো Whisper-এর ধরা অডিওর বাইরে টাইম দিতে পারে না। নতুন status
-  `"gemini_assisted"`; `"ok"` = সব serial Whisper-matched (বা pure-Gemini
-  fallback-এ সব Gemini-matched); `"whisper"` = কিছু line match হয়নি / Gemini
-  সাহায্য করেনি; `"equal_split"` আগের মতো। Whisper unavailable হলে আজকের
-  pure-Gemini flow অপরিবর্তিত (Gemini → equal-split)। E9
-  `_clamp_timestamps_to_audio` গার্ড প্রতিটা পাথে আগের মতোই চলে।
-- **Config**: `WHISPER_MODEL` "base" → **"small"** (প্রাইমারি টাইমিং-এর জন্য
-  "base"-এর boundary ঢিলা), নতুন `WHISPER_MODEL_ZH`/`WHISPER_MODEL_HI` (None),
-  `SUBTITLE_OVERLAP_MATCH_MIN` (0.5), `WHISPER_TAIL_TOLERANCE_SEC` (1.0)।
-- **Target-collapse render fix (F7 item 4)**: near-zero target এখন near-zero
-  render করে, full source clip নয়।
-  - `edit_guideline._build_entry`: collapsed target (≤ 0) + healthy source →
-    `pts_multiplier = RENDER_MIN_SEGMENT_DURATION_SEC / source_duration` (আগে
-    1.0), এখনো `invalid_duration` flag।
-  - `auto_cut.py`: degenerate-segment guard এখন target-side-ও trigger করে
-    (`target_duration <= RENDER_MIN_SEGMENT_DURATION_SEC` + normal-length
-    source → minimal window কাটা হয়)। `extreme_speed_ratio` এখনো
-    soft/informational।
-- **New shared module `pipeline/whisper_align.py`** (F7 item 1, extended):
-  `transcribe_segments`, `transcribe_words`, `last_speech_end`,
-  `overlap_ratio`, `match_words_to_entries` (voiceover_upload-এর প্রাইভেট
-  `_transcribe_words`/`_match_words_to_entries` এখন alias; call site ও mocks
-  অপরিবর্তিত)। সব helper কখনো raise করে না।
-- **Tests**: full suite **৪৩০ টেস্ট OK + ৪২ subtest** (was ৪০৫; +২৫) —
-  test_whisper_align.py (নতুন), whisper-primary subtitle_extract
-  (text_source, hallucinated drop, per-chunk merge), D3 gemini_assisted
-  (speech-tail-এর ভিতরে/বাইরে), `max(end_sec) <= audio + epsilon` +
-  E9 clamp whisper-primary পাথেও, target-collapse render (edit_guideline /
-  auto_cut)।
+- **`pipeline/job_config.py` (নতুন)** — প্রতিটা job-এর জন্য
+  `uploads/<job_id>/job_config.json` creation-এর সময় একবার লেখা হয়, কোনো
+  Gemini/Whisper call-এর আগেই। লেখা থাকে: engine (`whisper_primary` /
+  `gemini_only`), target language (`target_lang`, আজ `"hi"`; `source_lang`
+  শুধু schema — F12-এ auto-detect), voice source। `write_config` engine /
+  voice source validate করে (ValueError); `read_config` কখনো raise করে না —
+  pre-F9 job (dir আছে, config নেই) → F9 defaults, missing job dir → `None`।
+  `default_engine()` = Whisper import করা গেলে `whisper_primary`, নাহলে
+  `gemini_only`। Upload ফর্মের engine radio `default_engine()` থেকে
+  pre-selected।
+- **Engine-gated Whisper (F9 §2)** — `whisper_align.engine_allows_whisper()`
+  job-এর config পড়ে: `gemini_only` job Whisper skip করে **যদিও** Whisper
+  installed থাকে (ফোন/Termux user-দের জন্য, যারা ভারী torch/whisper install
+  এড়াতে চায়)। pre-F9 job (config ফাইল নেই) F8 আচরণ রাখে (Whisper allowed)।
+  Gated call site: `subtitle_extract._whisper_merge` এবং
+  `voiceover_upload.align_uploaded_voiceover`।
+- **Per-stage status + progress** — `job_status.run_stage()` `running` →
+  stage চলে → `done` (stage নিজে লেখা `progress` dict সংরক্ষিত) বা `error` +
+  re-raise (status লেখা best-effort)। `full_auto_chain`-এর প্রতিটা stage
+  wrapped, তাই প্রতিটা stage-এর আলাদা status entry থাকে
+  (D2_voiceover / D3_align / D4_unify / E1_guideline / E2_draft / F3_final)
+  ক্রম অনুযায়ী। `subtitle_extract.extract_subtitles` ও
+  `auto_cut.build_draft_video` optional `progress_cb(processed, total)` নেয়।
+  App-এর `_run_upload_pipeline` F1_extract ও C1_translate `run_stage` দিয়ে
+  চালায় (F1-এ per-chunk progress)।
+- **Resume-from-interruption (F9 §5)** — নতুন `pipeline/resume.py`:
+  `find_resume_point(job_id)` আর্টিফ্যাক্ট থেকে পরের stage বের করে
+  (`subtitles_hi.json` নেই → `"upload_pipeline"`, তারপর প্রথম missing:
+  timestamps → edit_guideline → draft_final_video.mp4 →
+  `outputs/<job_id>/final_video.mp4`; সম্পূর্ণ হলে `None`)।
+  `resume_job` `start_from` দিয়ে chain চালায় (আগের stage skipped, result key
+  `None` — সম্পন্ন stage কখনো re-run হয় না), সম্পূর্ণ/আপলোড-অসম্পূর্ণ job-এ
+  `RuntimeError`। নতুন endpoint `POST /jobs/{job_id}/resume` →
+  `{"resume_point", "status": "processing"}`, background thread-এ `_run_resume`
+  চলে, `resume` stage status persist হয়; কিছু resume করার না থাকলে 409।
+  Acceptance test: যে stage নিজের artifact লিখে তারপর "crash" হয়েছে (raise),
+  resume-এ সেটা **আবার চলে না** (D3 `call_count` 1-ই থাকে)।
+- **3-job history + confirm-based eviction (F9 §4)** — নতুন
+  `pipeline/history_store.py`: index `uploads/_history_index.json`, cap
+  `HISTORY_LIMIT` (3)। `register_job` newest-first যোগ করে; index full হলে
+  **evict করে না** — `{"added": False, "would_evict": <oldest>,
+  "needs_confirm": True}` ফেরত দেয়। `evict_job(job_id, delete_files=...)`
+  drop করে, চাইলে ফাইল-ও মুছে — শুধু user confirm-এর পরে।
+  `list_history` newest-first, live metadata (job_config, voice source,
+  status, target video name) সহ, missing dir skip। Endpoint `GET /history` →
+  `{"history": [...], "limit": 3}`।
+- **Browser `confirm()` eviction flow** — upload ফর্মে, `POST /upload`-এর 409
+  (`needs_confirm`) এ `window.confirm()` dialog-এ oldest job-এর নাম দেখিয়ে
+  জিজ্ঞেস করে; accept করলে `POST /jobs/{job_id}/confirm-start?evict_job_id=
+  <oldest>&delete_files=true` → evict + register + pipeline start; decline
+  করলে কিছুই evict হয় না। `POST /upload` এখন engine/target_lang form field-ও
+  নেয় (validated) এবং কোনো Gemini/Whisper কাজের আগেই `job_config.json`
+  লেখে।
+- **Tests**: full suite **৪৭১ টেস্ট OK** (was ৪৩০; +৪১) —
+  test_job_config.py, test_history_store.py, test_resume.py,
+  test_f9_endpoints.py (HTTP: 409 confirm flow, confirm-start, /history,
+  resume endpoint) নতুন; test_full_auto_chain.py (per-stage status order),
+  test_subtitle_extract.py + test_voiceover_upload.py (engine gating —
+  `gemini_only` কখনো transcribe করে না) বাড়ানো হয়েছে।
 
 বাকি কাজ:
+- **F10 (progress bar / log panel / history-tab UI) শুরু হয়নি** — `progress_cb`,
+  per-stage status data, `GET /history`-এর ডেটা সবই server-side তৈরি আছে,
+  কিন্তু ব্রাউজার-side UI (এনিমেটেড progress bar + polling, log panel +
+  auto-scroll, history tab) একটাও নেই। F10-এর আগে ব্রাউজারে ম্যানুয়াল
+  verify লাগবে।
+- **F11 (Bengali error text) শুরু হয়নি** — error-গুলো এখনো ইংরেজি;
+  Bengali `NO_ACTIVE_KEY_MESSAGE`-এর মতো user-facing error text localization
+  এখনো করা হয়নি। F9-এর `confirm()` dialog-ও এখনো ইংরেজি text-এ।
+- F9-এর ব্রাউজার-side `confirm()` eviction flow (409 → dialog → confirm-start)
+  শুধু HTTP-level টেস্টে (test_f9_endpoints.py) আচ্ছাদিত — রিয়েল ব্রাউজারে
+  ম্যানুয়াল verify বাকি।
 - ব্যবহারকারীর নিজের real-media QA রান:
   - docs/FINAL_SUMMARY.md → "Subtitle QA Fixes (A1-E4)" → "The user must do this"
   - Whisper-primary পাথ (যখন Whisper ইনস্টল করা থাকবে) দিয়ে একটা job রি-রান

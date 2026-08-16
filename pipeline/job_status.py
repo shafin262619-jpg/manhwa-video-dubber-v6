@@ -93,3 +93,39 @@ def write_status(job_id, stage, state, extra=None, upload_root=None):
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         os.replace(tmp, path)
+
+
+def run_stage(job_id, stage, func, *args, **kwargs):
+    """Run a pipeline stage with ``running`` / ``done`` / ``error`` status.
+
+    Writes ``stage`` running before calling ``func(*args, **kwargs)`` and
+    ``done`` after it returns; on exception writes ``error`` and re-raises so
+    the caller keeps its existing error handling. A ``progress`` dict written
+    into the stage entry by the func (via :func:`write_status`) is preserved
+    on the ``done`` entry so progress survives the state transition.
+
+    Status writes are best-effort: a failure to write status (e.g. disk
+    error) never hides the stage's result or its error.
+    """
+    try:
+        write_status(job_id, stage, "running")
+    except Exception:  # noqa: BLE001 - status is advisory, never blocking
+        pass
+    try:
+        result = func(*args, **kwargs)
+    except Exception:
+        try:
+            write_status(job_id, stage, "error")
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    try:
+        progress = read_status(job_id).get("stages", {}).get(stage, {}).get("progress")
+    except Exception:  # noqa: BLE001
+        progress = None
+    extra = {"progress": progress} if progress else None
+    try:
+        write_status(job_id, stage, "done", extra=extra)
+    except Exception:  # noqa: BLE001
+        pass
+    return result

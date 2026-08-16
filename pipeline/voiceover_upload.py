@@ -51,6 +51,7 @@ from pipeline.subtitle_extract import _extract_json, call_with_rotation
 from pipeline.voiceover_auto import _probe_audio_duration, _run
 from pipeline.voiceover_unify import VoiceoverAlignmentError, _clamp_timestamps_to_audio
 from pipeline.whisper_align import (
+    engine_allows_whisper,
     last_speech_end,
     match_words_to_entries as _match_words_to_entries,
     transcribe_words as _transcribe_words,
@@ -375,9 +376,14 @@ def align_uploaded_voiceover(job_id, upload_root=None):
 
     # Whisper is the primary timing authority (F8). When Whisper is
     # unavailable/fails entirely, we fall back to today's pure-Gemini flow.
-    words = _transcribe_words(
-        audio_path, language="hi", model=config.WHISPER_MODEL_HI,
-        logger_=job_logger,
+    # F9: a gemini_only job skips Whisper even when it is installed.
+    words = (
+        _transcribe_words(
+            audio_path, language="hi", model=config.WHISPER_MODEL_HI,
+            logger_=job_logger,
+        )
+        if engine_allows_whisper(job_id, upload_root)
+        else None
     )
 
     gemini_assisted_serials = []

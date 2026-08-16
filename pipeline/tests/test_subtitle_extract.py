@@ -13,7 +13,7 @@ from unittest import mock
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
-from pipeline import config, key_store, subtitle_extract, video_ingest
+from pipeline import config, job_config, key_store, subtitle_extract, video_ingest
 from pipeline.gemini_rotation import CallBudget
 
 
@@ -353,6 +353,79 @@ class WhisperPrimaryMergeTest(SubtitleExtractBase):
         self.assertEqual(sub["text"], "dup")
         self.assertEqual(sub["text_source"], "gemini_cleaned")
         self.assertAlmostEqual(sub["start_sec"], 0.5, places=2)
+
+
+class EngineGatingTest(SubtitleExtractBase):
+    """F9: the per-job engine (from job_config.json) gates the Whisper path.
+
+    ``gemini_only`` must skip Whisper entirely even when it is importable and
+    installed; ``whisper_primary`` (and pre-F9 jobs with no config file) still
+    transcribe.
+    """
+
+    def _write_config(self, engine):
+        job_config.write_config(
+            self.job_id, engine=engine, upload_root=self.upload_root
+        )
+
+    def test_gemini_only_never_transcribes(self):
+        _require_tools()
+        (self.job_dir / "source.mp4").write_bytes(self._make_video_bytes())
+        self._write_config("gemini_only")
+        self._write_meta(3.0)
+        self._set_keys(["key-one"])
+
+        with mock.patch.object(
+            subtitle_extract, "_call_gemini",
+            return_value=[{"text": "你好", "start_sec": 0.6, "end_sec": 1.4}],
+        ), mock.patch.object(
+            subtitle_extract, "_extract_audio",
+            side_effect=AssertionError("whisper audio extraction must not run"),
+        ), mock.patch.object(
+            subtitle_extract, "transcribe_segments",
+            side_effect=AssertionError("whisper transcription must not run"),
+        ):
+            result = subtitle_extract.extract_subtitles(
+                self.job_id, upload_root=self.upload_root
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["whisper_used"])
+        self.assertEqual(result["whisper_segments_count"], 0)
+        sub = result["subtitles"][0]
+        self.assertEqual(sub["text"], "你好")
+        self.assertNotIn("text_source", sub)
+        self.assertFalse((self.job_dir / "source_audio.wav").exists())
+
+    def test_whisper_primary_still_transcribes(self):
+        _require_tools()
+        (self.job_dir / "source.mp4").write_bytes(self._make_video_bytes())
+        self._write_config("whisper_primary")
+        self._write_meta(3.0)
+        self._set_keys(["key-one"])
+
+        with mock.patch.object(
+            subtitle_extract, "_call_gemini",
+            return_value=[{"text": "你好世界", "start_sec": 0.6, "end_sec": 1.4}],
+        ), mock.patch.object(
+            subtitle_extract,
+            "transcribe_segments",
+            return_value=[{"text": "你好世界", "start": 0.5, "end": 1.5}],
+        ):
+            result = subtitle_extract.extract_subtitles(
+                self.job_id, upload_root=self.upload_root
+            )
+
+        self.assertTrue(result["whisper_used"])
+        self.assertEqual(result["whisper_segments_count"], 1)
+
+    def _make_video_bytes(self):
+        if getattr(self, "_video_bytes", None) is None:
+            with tempfile.TemporaryDirectory() as tmp:
+                vid = Path(tmp) / "vid.mp4"
+                _make_video_with_audio(vid, seconds=3)
+                self._video_bytes = vid.read_bytes()
+        return self._video_bytes
 
 
 class SubtitleExtractFailureTest(SubtitleExtractBase):

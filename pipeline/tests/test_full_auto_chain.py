@@ -17,6 +17,7 @@ from unittest import mock
 from pipeline import (
     auto_cut,
     full_auto_chain,
+    job_status,
     key_store,
     render_final,
     video_ingest,
@@ -201,6 +202,73 @@ class UserUploadChainTest(FullAutoChainBase):
             "draft_final_video.mp4",
         ):
             self.assertTrue((self.job_dir / name).exists(), f"missing {name}")
+
+
+class StageStatusTest(FullAutoChainBase):
+    """F9: the chain records a per-stage status entry, in order, done."""
+
+    def test_auto_chain_writes_per_stage_status_in_order(self):
+        self._write_subtitles()
+        self._write_choice("auto_tts")
+        (self.job_dir / "source.mp4").write_bytes(b"fake-source")
+
+        calls = []
+        with mock.patch.object(
+            voiceover_auto, "_call_tts", return_value=_wav_bytes(1.0)
+        ), mock.patch.object(auto_cut, "_run", side_effect=self._mock_auto_run(calls)):
+            full_auto_chain.run_auto_tts_chain(self.job_id)
+
+        status = job_status.read_status(self.job_id)
+        self.assertEqual(
+            list(status.get("stages", {}).keys()),
+            [
+                "D2_voiceover",
+                "D4_unify",
+                "E1_guideline",
+                "E2_draft",
+                "F3_final",
+            ],
+            "each chain stage records its own status entry, in order",
+        )
+        for stage in ("D2_voiceover", "D4_unify", "E1_guideline", "E2_draft", "F3_final"):
+            self.assertEqual(status["stages"][stage]["state"], "done", stage)
+
+    def test_user_upload_chain_writes_per_stage_status_in_order(self):
+        self._write_subtitles()
+        self._write_choice("user_upload")
+        (self.job_dir / "source.mp4").write_bytes(b"fake-source")
+        (self.job_dir / "voiceover_hi.wav").write_bytes(_wav_bytes(2.0))
+
+        align_timestamps = [
+            {
+                "serial": 1, "start_sec": 0.0, "end_sec": 1.0,
+                "alignment_fallback": False, "alignment_source": "gemini",
+            },
+            {
+                "serial": 2, "start_sec": 1.0, "end_sec": 2.0,
+                "alignment_fallback": False, "alignment_source": "gemini",
+            },
+        ]
+        calls = []
+        with mock.patch.object(
+            voiceover_upload, "_gemini_align", return_value=align_timestamps
+        ), mock.patch.object(auto_cut, "_run", side_effect=self._mock_auto_run(calls)):
+            full_auto_chain.run_user_upload_chain(self.job_id)
+
+        status = job_status.read_status(self.job_id)
+        self.assertEqual(
+            list(status.get("stages", {}).keys()),
+            [
+                "D3_align",
+                "D4_unify",
+                "E1_guideline",
+                "E2_draft",
+                "F3_final",
+            ],
+            "each chain stage records its own status entry, in order",
+        )
+        for stage in ("D3_align", "D4_unify", "E1_guideline", "E2_draft", "F3_final"):
+            self.assertEqual(status["stages"][stage]["state"], "done", stage)
 
 
 class FailureCaseTest(FullAutoChainBase):

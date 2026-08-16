@@ -140,9 +140,10 @@ class UploadEndpointTest(unittest.TestCase):
         deadline = time.time() + timeout
         while time.time() < deadline:
             body = self.client.get(f"/api/jobs/{job_id}/status").json()
-            if body.get("state") == "done":
+            upload_stage = (body.get("stages") or {}).get("upload_pipeline") or {}
+            if upload_stage.get("state") == "done":
                 return body
-            if body.get("state") == "error":
+            if upload_stage.get("state") == "error":
                 self.fail(f"upload pipeline errored: {body}")
             time.sleep(interval)
         self.fail(f"upload pipeline for {job_id} did not finish in {timeout}s")

@@ -294,8 +294,12 @@ def _duration_warning(expected_duration_sec, actual_duration_sec):
     return None
 
 
-def build_draft_video(job_id, upload_root=None):
+def build_draft_video(job_id, upload_root=None, progress_cb=None):
     """Render ``draft_final_video.mp4`` for a job. Returns a result dict.
+
+    ``progress_cb(processed, total)`` (optional) is called after every serial
+    clip is rendered, with the 1-based count over the total guideline entries,
+    so the job-status wiring can report per-clip progress (F9).
 
     Raises FileNotFoundError when the job, ``edit_guideline.json``,
     ``source.mp4`` or ``voiceover_hi.wav`` is missing; RuntimeError when an
@@ -401,6 +405,8 @@ def build_draft_video(job_id, upload_root=None):
         )
         _run(build_clip_command(source, out_path, start_sec, end_sec, pts_multiplier))
         clip_paths.append(out_path)
+        if progress_cb is not None:
+            progress_cb(index + 1, len(guideline))
 
     concat_list = clips_dir / "concat.txt"
     concat_list.write_text(

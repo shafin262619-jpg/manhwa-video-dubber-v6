@@ -21,10 +21,13 @@ from pipeline import (
     edit_guideline,
     full_auto_chain,
     gemini_rotation,
+    history_store,
+    job_config,
     job_logging,
     job_status as job_status_store,
     key_store,
     render_final,
+    resume,
     review,
     subtitle_builder,
     subtitle_extract,
@@ -114,14 +117,21 @@ def _continue_from_voiceover(job_id):
     """Run D4 -> E1 -> E2 once the voiceover timing exists (G1 wiring).
 
     Gated on the voice source choice: without a valid choice there is nothing
-    to unify, so the job stays where it is. Raises FileNotFoundError /
-    RuntimeError / DraftValidationError when a stage fails.
+    to unify, so the job stays where it is. F9: each stage records its own
+    status entry (``D4_unify`` / ``E1_guideline`` / ``E2_draft``). Raises
+    FileNotFoundError / RuntimeError / DraftValidationError when a stage fails.
     """
     if voiceover_unify.get_voice_source(job_id) not in voiceover_unify.ALLOWED_MODES:
         return
-    voiceover_unify.unify_voiceover_timestamps(job_id)
-    edit_guideline.build_edit_guideline(job_id)
-    auto_cut.build_draft_video(job_id)
+    job_status_store.run_stage(
+        job_id, "D4_unify", voiceover_unify.unify_voiceover_timestamps, job_id
+    )
+    job_status_store.run_stage(
+        job_id, "E1_guideline", edit_guideline.build_edit_guideline, job_id
+    )
+    job_status_store.run_stage(
+        job_id, "E2_draft", auto_cut.build_draft_video, job_id
+    )
 
 
 def _process_auto_tts(job_id):
@@ -168,6 +178,18 @@ def _resume_pipeline_extra(job_id):
     return extra
 
 
+def _stage_progress(job_id, stage):
+    """Return a ``progress_cb(processed, total)`` writing stage progress (F9)."""
+
+    def cb(processed, total):
+        job_status_store.write_status(
+            job_id, stage, "running",
+            extra={"progress": {"processed": processed, "total": total}},
+        )
+
+    return cb
+
+
 def _run_upload_pipeline(job_id):
     """Run the upload chain B1 -> B2 -> C1 on a background thread (G1 wiring).
 
@@ -176,6 +198,10 @@ def _run_upload_pipeline(job_id):
     exception escape the thread — an uncaught exception in a bare thread
     silently kills it without a log, so the whole body is wrapped in
     try/except and failures are recorded as ``error`` status.
+
+    F9: the two heavy Gemini stages get their own status entries — ``F1_extract``
+    (per-chunk progress via ``progress_cb``) and ``C1_translate`` — under the
+    umbrella ``upload_pipeline`` stage.
 
     Idempotent resume: if ``subtitles_hi.json`` already exists the chain is
     not re-run; ``done`` is recorded from the existing files instead. This is
@@ -190,8 +216,13 @@ def _run_upload_pipeline(job_id):
             # CallBudget so a runaway Gemini rotation can never burn more than
             # config.MAX_API_CALLS_PER_JOB calls for a single job run.
             budget = gemini_rotation.CallBudget(config.MAX_API_CALLS_PER_JOB)
-            extraction = subtitle_extract.extract_subtitles(
-                job_id, call_budget=budget
+            extraction = job_status_store.run_stage(
+                job_id,
+                "F1_extract",
+                subtitle_extract.extract_subtitles,
+                job_id,
+                call_budget=budget,
+                progress_cb=_stage_progress(job_id, "F1_extract"),
             )
             subtitle_builder.build_subtitle_list(job_id, call_budget=budget)
             try:
@@ -205,8 +236,12 @@ def _run_upload_pipeline(job_id):
                     job_id, exc,
                 )
                 whisper_check = {"status": "skipped"}
-            translation = translator.translate_subtitles(
-                job_id, call_budget=budget
+            translation = job_status_store.run_stage(
+                job_id,
+                "C1_translate",
+                translator.translate_subtitles,
+                job_id,
+                call_budget=budget,
             )
             extra = {
                 "extraction_status": extraction["status"],
@@ -257,8 +292,12 @@ def _run_voiceover_auto(job_id):
         # U2b: the auto-TTS chain shares the same per-job CallBudget pattern as
         # the upload chain (one cap across extraction/translation/TTS calls).
         budget = gemini_rotation.CallBudget(config.MAX_API_CALLS_PER_JOB)
-        result = voiceover_auto.generate_auto_voiceover(
-            job_id, call_budget=budget
+        result = job_status_store.run_stage(
+            job_id,
+            "D2_voiceover",
+            voiceover_auto.generate_auto_voiceover,
+            job_id,
+            call_budget=budget,
         )
         _continue_from_voiceover(job_id)
         job_status_store.write_status(
@@ -448,7 +487,14 @@ def _polling_page(job_id, page_title, result_url, stage):
 
 @app.get("/", response_class=HTMLResponse)
 def home() -> HTMLResponse:
-    body = """<h1>Manhwa Video Dubber</h1>
+    default_engine = job_config.default_engine()
+    engine_checked_primary = (
+        'checked' if default_engine == "whisper_primary" else ''
+    )
+    engine_checked_gemini = (
+        'checked' if default_engine == "gemini_only" else ''
+    )
+    body = f"""<h1>Manhwa Video Dubber</h1>
   <p>Upload a Chinese-subtitled manhwa explain video to start auto-dubbing.</p>
   <form id="upload-form" enctype="multipart/form-data">
     <label for="file">Video (mp4/mkv/mov/avi/webm/flv/wmv/m4v)</label>
@@ -461,46 +507,88 @@ def home() -> HTMLResponse:
       <label><input type="radio" name="voice_source" value="user_upload">
         আমি নিজের/অন্য AI দিয়ে বানানো অডিও দেব</label>
     </fieldset>
+    <fieldset>
+      <legend>Processing engine</legend>
+      <label><input type="radio" name="engine" value="whisper_primary" {engine_checked_primary}>
+        Whisper + Gemini (recommended — better timing)</label>
+      <label><input type="radio" name="engine" value="gemini_only" {engine_checked_gemini}>
+        Gemini only (skip local Whisper — lighter, no Whisper install needed)</label>
+    </fieldset>
     <button type="submit" id="upload-submit">System Start</button>
   </form>
   <div id="upload-error" class="error-banner" hidden></div>
   <p><a href="/settings">Gemini API key settings</a></p>
+  <p><a href="/history">Job history (last {history_store.HISTORY_LIMIT})</a></p>
   <script>
     var form = document.getElementById('upload-form');
     var submitBtn = document.getElementById('upload-submit');
     var errorBox = document.getElementById('upload-error');
-    form.addEventListener('submit', function (event) {
+    function showError(message) {{
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'System Start';
+      var heading = document.createElement('p');
+      heading.className = 'error-banner-title';
+      heading.textContent = 'Upload failed';
+      var msg = document.createElement('p');
+      msg.textContent = message;
+      errorBox.appendChild(heading);
+      errorBox.appendChild(msg);
+      errorBox.hidden = false;
+    }}
+    function startJob(jobId) {{
+      window.location.href = '/upload/' + encodeURIComponent(jobId);
+    }}
+    form.addEventListener('submit', function (event) {{
       event.preventDefault();
       errorBox.hidden = true;
       errorBox.innerHTML = '';
       submitBtn.disabled = true;
       submitBtn.textContent = 'Uploading…';
       var data = new FormData(form);
-      fetch('/upload', { method: 'POST', body: data })
-        .then(function (res) {
-          return res.json().then(function (body) {
-            if (!res.ok) {
-              throw new Error(body.detail || 'Upload failed.');
-            }
+      fetch('/upload', {{ method: 'POST', body: data }})
+        .then(function (res) {{
+          return res.json().then(function (body) {{
+            if (!res.ok) throw {{ status: res.status, body: body }};
             return body;
-          });
-        })
-        .then(function (body) {
-          window.location.href = '/upload/' + encodeURIComponent(body.job_id);
-        })
-        .catch(function (err) {
-          submitBtn.disabled = false;
-          submitBtn.textContent = 'System Start';
-          var heading = document.createElement('p');
-          heading.className = 'error-banner-title';
-          heading.textContent = 'Upload failed';
-          var msg = document.createElement('p');
-          msg.textContent = err.message;
-          errorBox.appendChild(heading);
-          errorBox.appendChild(msg);
-          errorBox.hidden = false;
-        });
-    });
+          }});
+        }})
+        .then(function (body) {{
+          startJob(body.job_id);
+        }})
+        .catch(function (err) {{
+          var body = (err && err.body) || {{}};
+          if (body && body.needs_confirm) {{
+            var oldest = body.target_video_name || body.would_evict;
+            var ok = window.confirm(
+              'Job history is full (max ' + {history_store.HISTORY_LIMIT} + ' jobs). ' +
+              'To start this new job, the oldest job "' + oldest + '" will be ' +
+              'removed from history and its files deleted. Continue?'
+            );
+            if (ok) {{
+              return fetch(
+                '/jobs/' + encodeURIComponent(body.job_id) + '/confirm-start' +
+                '?evict_job_id=' + encodeURIComponent(body.would_evict) +
+                '&delete_files=true',
+                {{ method: 'POST' }}
+              ).then(function (r) {{
+                return r.json().then(function (b) {{
+                  if (!r.ok) throw {{ status: r.status, body: b }};
+                  return b;
+                }});
+              }}).then(function (b) {{
+                startJob(b.job_id);
+              }}).catch(function (err2) {{
+                var b2 = (err2 && err2.body) || {{}};
+                showError(typeof b2.detail === 'string' ? b2.detail : 'Could not start the job.');
+              }});
+            }}
+            showError('New job cancelled — no job was evicted.');
+            return;
+          }}
+          var detail = typeof body.detail === 'string' ? body.detail : 'Upload failed.';
+          showError(detail);
+        }});
+    }});
   </script>"""
     return HTMLResponse(ui.page("Manhwa Video Dubber", body))
 
@@ -733,6 +821,8 @@ def delete_key(key_id: str) -> dict:
 async def upload_video(
     file: UploadFile = File(...),
     voice_source: str = Form("auto_tts"),
+    engine: str | None = Form(None),
+    target_lang: str | None = Form(None),
 ) -> dict:
     try:
         video_ingest.ensure_active_key(key_store.get_active_keys())
@@ -745,6 +835,14 @@ async def upload_video(
             detail=(
                 f"invalid voice source: {voice_source!r} "
                 f"(allowed: {', '.join(voiceover_unify.ALLOWED_MODES)})"
+            ),
+        )
+    if engine is not None and engine not in job_config.ALLOWED_ENGINES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"invalid engine: {engine!r} "
+                f"(allowed: {', '.join(job_config.ALLOWED_ENGINES)})"
             ),
         )
 
@@ -775,6 +873,38 @@ async def upload_video(
     # mode, so a bad value would have already been rejected above.
     voiceover_unify.set_voice_source(job_id, voice_source)
 
+    # F9: job_config.json is written once, at job creation, before any
+    # Gemini/Whisper call runs (the pipeline runs on a background thread
+    # below). Engine ("whisper_primary" | "gemini_only") and target_lang
+    # (schema-only until F12) are recorded here; source_lang stays None until
+    # auto-detection lands (F12).
+    job_config.write_config(
+        job_id,
+        engine=engine,
+        target_lang=target_lang,
+        source_lang=None,
+        voice_source=voice_source,
+    )
+
+    # F9: history is capped at HISTORY_LIMIT (3) jobs and never evicts
+    # silently. When the index is full the new job is NOT started; the client
+    # gets a 409 and must confirm the eviction of the oldest job first
+    # (two-step confirm flow, POST /jobs/{job_id}/confirm-start).
+    registered = history_store.register_job(
+        job_id, meta={"target_video_name": file.filename}
+    )
+    if not registered.get("added"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "needs_confirm": True,
+                "job_id": job_id,
+                "would_evict": registered["would_evict"],
+                "target_video_name": file.filename,
+                "delete_files": True,
+            },
+        )
+
     # G1 wiring (U1b): the heavy B1 -> B2 -> C1 chain now runs on a daemon
     # background thread so the upload returns immediately with
     # {"status": "processing"}. Progress is persisted via job_status — poll
@@ -785,6 +915,102 @@ async def upload_video(
     ).start()
 
     return {"job_id": job_id, "meta": job_meta, "status": "processing"}
+
+
+@app.post("/jobs/{job_id}/confirm-start")
+def confirm_start(
+    job_id: str,
+    evict_job_id: str | None = Query(None),
+    delete_files: bool = Query(True),
+) -> dict:
+    """Second step of the two-step confirm flow (F9).
+
+    Called after the user accepts evicting the oldest job to make room for
+    ``job_id`` (whose source.mp4 + job_config were already saved by /upload).
+    Evicts ``evict_job_id`` (deleting its files when requested), registers the
+    pending job in history and starts its pipeline.
+    """
+    if not (video_ingest.UPLOAD_ROOT / job_id).is_dir():
+        raise HTTPException(status_code=404, detail=f"unknown job {job_id}")
+
+    if evict_job_id:
+        history_store.evict_job(evict_job_id, delete_files=delete_files)
+
+    registered = history_store.register_job(job_id)
+    if not registered.get("added"):
+        raise HTTPException(
+            status_code=409,
+            detail="job history is still full after eviction — no job was started",
+        )
+
+    job_status_store.write_status(job_id, "upload_pipeline", "running")
+    threading.Thread(
+        target=_run_upload_pipeline, args=(job_id,), daemon=True
+    ).start()
+    return {"job_id": job_id, "status": "processing"}
+
+
+@app.get("/history")
+def history_page() -> dict:
+    """List the recent jobs (history tab data, F9). The UI tab is F10."""
+    return {"history": history_store.list_history(), "limit": history_store.HISTORY_LIMIT}
+
+
+@app.post("/jobs/{job_id}/resume")
+def resume_job_endpoint(job_id: str) -> dict:
+    """Resume a job interrupted mid-chain (F9).
+
+    The resume point is derived from which artifacts exist (see
+    ``resume.find_resume_point``); the chain is re-run from that point on a
+    background thread, with completed stages skipped (never re-run). Returns a
+    409 when there is nothing to resume yet.
+    """
+    try:
+        point = resume.find_resume_point(job_id)
+    except Exception as exc:  # noqa: BLE001 - guard; find_resume_point never raises normally
+        raise HTTPException(status_code=500, detail=str(exc))
+    if point is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"job {job_id} is already complete — nothing to resume",
+        )
+    if point == "upload_pipeline":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"job {job_id} has not finished subtitle extraction/translation "
+                "yet — resume is available once the dubbing chain has started"
+            ),
+        )
+    _start_stage(job_id, "resume", _run_resume)
+    return {"job_id": job_id, "resume_point": point, "status": "processing"}
+
+
+def _run_resume(job_id):
+    """Run the resume chain on a background thread (F9).
+
+    Persists ``resume`` status (running/done/error) so the polling page can
+    surface the outcome. Never lets an exception escape the thread.
+    """
+    try:
+        result = resume.resume_job(job_id)
+        job_status_store.write_status(job_id, "resume", "done", extra={"result": result})
+    except (
+        FileNotFoundError,
+        ValueError,
+        RuntimeError,
+        auto_cut.DraftValidationError,
+        voiceover_unify.VoiceoverAlignmentError,
+    ) as exc:
+        logger.error("resume failed for job %s: %s", job_id, exc)
+        job_status_store.write_status(
+            job_id, "resume", "error", extra={"detail": _friendly_error(exc)}
+        )
+    except Exception as exc:  # noqa: BLE001 — daemon thread must never die
+        logger.exception("unexpected resume failure for job %s", job_id)
+        job_status_store.write_status(
+            job_id, "resume", "error", extra={"detail": _friendly_error(exc)}
+        )
 
 
 @app.get("/api/jobs/{job_id}/status")

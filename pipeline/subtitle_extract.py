@@ -49,7 +49,11 @@ from pipeline.gemini_rotation import (
     CallBudgetExceeded,
     call_with_rotation_v2,
 )
-from pipeline.whisper_align import overlap_ratio, transcribe_segments
+from pipeline.whisper_align import (
+    engine_allows_whisper,
+    overlap_ratio,
+    transcribe_segments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -482,20 +486,22 @@ def _extract_audio(video_path):
     return wav_path
 
 
-def _whisper_merge(job_dir, video_path, subtitles, offset_sec, job_logger):
+def _whisper_merge(job_dir, video_path, subtitles, offset_sec, job_logger,
+                   allow_whisper=True):
     """Whisper-primary merge for one video (whole source or a chunk).
 
     ``video_path`` is the video Whisper transcribes; ``subtitles`` are the
     Gemini lines for it with ABSOLUTE timing; ``offset_sec`` is the video's
     start offset (0.0 for the whole source, the chunk start for a segment) so
     the Whisper segment times (relative to the video) are shifted to absolute
-    before merging.
+    before merging. ``allow_whisper=False`` (``gemini_only`` engine, F9)
+    skips Whisper entirely — the pure-Gemini output is returned unchanged.
 
     Returns ``(merged_subtitles, stats)`` — on Whisper unavailability / no
     usable segments / failed audio extraction, returns ``(subtitles, None)``
     so the caller keeps today's pure-Gemini output unchanged.
     """
-    if not subtitles:
+    if not subtitles or not allow_whisper:
         return subtitles, None
     try:
         wav_path = _extract_audio(video_path)
@@ -599,8 +605,13 @@ def extract_window(job_id, start_sec, end_sec, upload_root=None,
     return subs
 
 
-def extract_subtitles(job_id, upload_root=None, call_budget=None):
-    """Extract Chinese subtitles for a job. Never raises on Gemini failures."""
+def extract_subtitles(job_id, upload_root=None, call_budget=None, progress_cb=None):
+    """Extract Chinese subtitles for a job. Never raises on Gemini failures.
+
+    ``progress_cb(processed, total)`` (optional) is called after every
+    segment/chunk is handled, with the 1-based count of handled segments over
+    the total, so the job-status wiring can report per-chunk progress (F9).
+    """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = upload_root / job_id
     source = job_dir / "source.mp4"
@@ -612,6 +623,10 @@ def extract_subtitles(job_id, upload_root=None, call_budget=None):
     duration = meta.get("duration_sec")
     if duration is None:
         duration = video_ingest.probe_video(source).get("duration_sec")
+
+    # F9: the per-job engine decides whether local Whisper may run at all.
+    # gemini_only jobs skip Whisper even when it is installed.
+    allow_whisper = engine_allows_whisper(job_id, upload_root)
 
     keys = key_store.get_active_keys()
     if not keys:
@@ -639,10 +654,14 @@ def extract_subtitles(job_id, upload_root=None, call_budget=None):
             failed_segments.append(0)
             errors[0] = error
         else:
-            subs, stats = _whisper_merge(job_dir, source, subs, 0.0, job_logger)
+            subs, stats = _whisper_merge(
+                job_dir, source, subs, 0.0, job_logger, allow_whisper
+            )
             if stats:
                 whisper_stats.append(stats)
             segment_results.append(subs)
+        if progress_cb is not None:
+            progress_cb(1, segments_count)
     else:
         segments = _segment_video(job_dir, source, duration)
         segments_count = len(segments)
@@ -655,10 +674,14 @@ def extract_subtitles(job_id, upload_root=None, call_budget=None):
                 failed_segments.append(seg["index"])
                 errors[seg["index"]] = error
             else:
-                subs, stats = _whisper_merge(job_dir, seg["path"], subs, seg["start"], job_logger)
+                subs, stats = _whisper_merge(
+                    job_dir, seg["path"], subs, seg["start"], job_logger, allow_whisper
+                )
                 if stats:
                     whisper_stats.append(stats)
                 segment_results.append(subs)
+            if progress_cb is not None:
+                progress_cb(len(segment_results) + len(failed_segments), segments_count)
 
     if len(failed_segments) == segments_count:
         status = "extraction_failed"
