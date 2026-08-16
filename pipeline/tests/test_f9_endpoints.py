@@ -193,7 +193,7 @@ class UploadConfirmFlowTest(F9EndpointsTest):
         self.assertEqual(status["state"], "not_started")
 
         # No silent eviction: history still holds exactly the 3 old jobs.
-        hist = self.client.get("/history").json()["history"]
+        hist = self.client.get("/api/history").json()["history"]
         self.assertEqual([e["job_id"] for e in hist], ["job-2", "job-1", "job-0"])
         self.assertTrue((self.upload_root / "job-0").is_dir())
 
@@ -212,7 +212,7 @@ class UploadConfirmFlowTest(F9EndpointsTest):
 
         # Oldest job's files were deleted and the new job is in history.
         self.assertFalse((self.upload_root / "job-0").exists())
-        hist = self.client.get("/history").json()["history"]
+        hist = self.client.get("/api/history").json()["history"]
         self.assertEqual([e["job_id"] for e in hist], [new_id, "job-2", "job-1"])
 
         # The pipeline actually started: it completes down to the final video.
@@ -231,7 +231,7 @@ class UploadConfirmFlowTest(F9EndpointsTest):
         self.assertEqual(confirm.status_code, 200, confirm.text)
         # Oldest job dropped from history but its files are kept on disk.
         self.assertTrue((self.upload_root / "job-0").is_dir())
-        hist = self.client.get("/history").json()["history"]
+        hist = self.client.get("/api/history").json()["history"]
         self.assertNotIn("job-0", [e["job_id"] for e in hist])
         # Drain the background pipeline within this test so no thread leaks
         # into the next test after the mocks are torn down.
@@ -266,7 +266,7 @@ class HistoryEndpointTest(F9EndpointsTest):
             history_store.register_job(
                 job_id, meta={"target_video_name": f"{job_id}.mp4"}
             )
-        res = self.client.get("/history")
+        res = self.client.get("/api/history")
         self.assertEqual(res.status_code, 200)
         body = res.json()
         self.assertEqual(body["limit"], 3)
@@ -277,7 +277,7 @@ class HistoryEndpointTest(F9EndpointsTest):
         self.assertEqual(entries[0]["voice_source"], "auto_tts")
 
     def test_history_empty(self):
-        body = self.client.get("/history").json()
+        body = self.client.get("/api/history").json()
         self.assertEqual(body["history"], [])
         self.assertEqual(body["limit"], 3)
 

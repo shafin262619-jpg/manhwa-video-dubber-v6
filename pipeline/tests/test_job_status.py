@@ -86,6 +86,24 @@ class JobStatusModuleTest(unittest.TestCase):
                 self.job_id, "extract", "hacked", upload_root=self.upload_root
             )
 
+    def test_write_status_preserves_detail_and_detail_bn(self):
+        # F11 contract: every error-status write carries the English ``detail``
+        # and its Bengali ``detail_bn`` mirror; the store must persist both.
+        job_status.write_status(
+            self.job_id,
+            "voiceover",
+            "error",
+            extra={
+                "detail": "All Gemini keys failed",
+                "detail_bn": "সব Gemini key ব্যর্থ হয়েছে",
+            },
+            upload_root=self.upload_root,
+        )
+        data = job_status.read_status(self.job_id, upload_root=self.upload_root)
+        entry = data["stages"]["voiceover"]
+        self.assertEqual(entry["detail"], "All Gemini keys failed")
+        self.assertEqual(entry["detail_bn"], "সব Gemini key ব্যর্থ হয়েছে")
+
     def test_concurrent_write_no_race_or_corruption(self):
         stages = [f"stage-{i}" for i in range(8)]
         barrier = threading.Barrier(len(stages))

@@ -1,5 +1,65 @@
 # Manhwa Video Dubber — Changelog
 
+## [F10+F11] — 2026-08-16 — animated progress bar + live log panel + history tab UI + Bengali error text
+
+F10 replaces the polling page's lone spinner with an animated progress bar and
+per-stage Bengali rows, adds a docked live-log panel (new
+`GET /api/jobs/{job_id}/logs`), turns `/history` into a real HTML page with
+cards/badges/resume buttons (nav link "ইতিহাস"), and rewrites the history-full
+`confirm()` dialog in Bengali with OK = delete files / Cancel = keep files.
+F11 adds a Bengali `detail_bn` next to every error status `detail` and shows it
+first in the error banner, with the English text behind a collapsed toggle.
+Transcript upload/language-dropdown (F12) and retry-with-escalation UI (F13)
+remain separate, not started.
+
+- **`pipeline/stages.py` (নতুন)** — single source of truth for the progress
+  bar: `STAGE_SEQUENCE` (F1_extract, C1_translate, D2_voiceover_or_D3_align,
+  D4_unify, E1_guideline, E2_draft, F3_final), `STAGE_LABELS_BN` (Bengali
+  labels), `STAGE_KEY_GROUPS` (status-file keys per slot — D2/D3 share one
+  slot) and `UMBRELLA_TO_SEQUENCE` (`final_render` owns the F3 slot).
+- **Progress bar + stage rows in `_polling_page` (F10.1)** — the spinner is
+  replaced (the "Processing…" banner text stays) by a `.progress-track` /
+  `.progress-fill` bar whose width = (done stages + in-stage fraction) /
+  len(STAGE_SEQUENCE) * 100, fraction from `extra.progress.processed/total`
+  else 0.5. Seven rows below it show ✓/spinner/✗/○ + the Bengali label per
+  stage, rebuilt inside the existing 2s `poll()` loop. No framework/CDN — the
+  existing inline vanilla-JS fetch pattern is extended.
+- **Live log panel + `GET /api/jobs/{job_id}/logs` (F10.2)** — the endpoint
+  never raises (missing file → `{"lines": [], "next_line": 0}`), clamps
+  negative/past-end `since_line`, and returns new lines plus `next_line`. The
+  polling page docks a fixed-bottom panel (max-height ~30vh, monospace dark)
+  that polls the endpoint every 3s, appends new lines, and auto-scrolls only
+  when the user is already at the bottom (`scrollTop` vs `scrollHeight`).
+- **History page + nav (F10.3)** — `site_header` now carries a "ইতিহাস" nav
+  link; `GET /history` returns an HTML page (cards with short job_id,
+  created_at, target_lang, voice_source, colored done/running/error badge),
+  "দেখুন" → `/review/{job_id}`, and "রিজিউম করুন" → POST
+  `/jobs/{job_id}/resume` → redirect to the new `/resume/{job_id}` polling
+  page → `/final/{job_id}`. Resume buttons are shown for error jobs and for
+  stale-running jobs (no status update for 10+ min, via status-file mtime).
+  The machine-readable JSON moved to `GET /api/history`.
+- **Bengali history-full confirm (F10.4)** — on HTTP 409 `needs_confirm` the
+  upload form shows the Bengali `confirm()` dialog ("OK = হ্যাঁ ফাইলসহ ডিলিট
+  করো, Cancel = শুধু History লিস্ট থেকে সরাও, ফাইল থাকুক"); OK posts
+  `confirm-start?delete_files=true`, Cancel `delete_files=false`, then proceeds
+  to the polling page either way.
+- **`pipeline/error_bn.py` (নতুন) + `detail_bn` wiring (F11)** —
+  `error_bn.explain_bn(exc, stage)` mirrors `_friendly_error`: CallBudgetExceeded,
+  AllKeysExhausted (empty + populated), ffmpeg/ffprobe/subprocess failures,
+  whisper import/runtime errors, malformed-transcript placeholder (F12), and
+  timeout/network; falls back to a generic message naming the stage (Bengali
+  label) with the truncated English text. It never raises. All 11 app error
+  sites now write via `_write_error_status` so every error status carries both
+  `detail` and `detail_bn`; the polling error banner shows `detail_bn` first
+  with "বিস্তারিত (English)" collapsing the English `detail`.
+- **Tests**: full suite **৫০২ টেস্ট OK** (was ৪৭১; +৩১) — new
+  `test_error_bn.py` (one case per mapped exception + never-raises),
+  `test_f10_endpoints.py` (logs incremental `since_line` + clamping, /history
+  HTML for 0/1/3 jobs, badges + resume buttons incl. stale-running, keep-files
+  confirm, error-path `detail_bn`); extended `test_f9_endpoints.py` (history
+  JSON assertions retargeted to `/api/history`) and `test_job_status.py`
+  (`detail`/`detail_bn` persisted together on error entries).
+
 ## [F9] — 2026-08-16 — per-job engine/language config, 3-job history with confirm-based eviction, resume-from-interruption
 
 Every job now carries a per-job config written once at creation, the app keeps

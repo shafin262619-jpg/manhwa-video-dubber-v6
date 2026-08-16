@@ -4,82 +4,57 @@
 E6 (draft duration-validation fix) + E7 (cascade-crash fix) +
 E8 (user_upload duration-check removal) + E9 (duration-drift fix) + E10
 (test-isolation fix) + F8 (Whisper timing authority) + F9 (per-job config,
-3-job history + confirm eviction, resume-from-interruption) সম্পূর্ণ।
+3-job history + confirm eviction, resume-from-interruption) + F10 (progress
+bar / log panel / history-tab UI) + F11 (Bengali error text) সম্পূর্ণ।
 
-F9 (`per-job config + history + resume`): job_config, 3-job history, resume
+F10/F11 (progress bar + log panel + history tab UI + Bengali errors):
 
-- **`pipeline/job_config.py` (নতুন)** — প্রতিটা job-এর জন্য
-  `uploads/<job_id>/job_config.json` creation-এর সময় একবার লেখা হয়, কোনো
-  Gemini/Whisper call-এর আগেই। লেখা থাকে: engine (`whisper_primary` /
-  `gemini_only`), target language (`target_lang`, আজ `"hi"`; `source_lang`
-  শুধু schema — F12-এ auto-detect), voice source। `write_config` engine /
-  voice source validate করে (ValueError); `read_config` কখনো raise করে না —
-  pre-F9 job (dir আছে, config নেই) → F9 defaults, missing job dir → `None`।
-  `default_engine()` = Whisper import করা গেলে `whisper_primary`, নাহলে
-  `gemini_only`। Upload ফর্মের engine radio `default_engine()` থেকে
-  pre-selected।
-- **Engine-gated Whisper (F9 §2)** — `whisper_align.engine_allows_whisper()`
-  job-এর config পড়ে: `gemini_only` job Whisper skip করে **যদিও** Whisper
-  installed থাকে (ফোন/Termux user-দের জন্য, যারা ভারী torch/whisper install
-  এড়াতে চায়)। pre-F9 job (config ফাইল নেই) F8 আচরণ রাখে (Whisper allowed)।
-  Gated call site: `subtitle_extract._whisper_merge` এবং
-  `voiceover_upload.align_uploaded_voiceover`।
-- **Per-stage status + progress** — `job_status.run_stage()` `running` →
-  stage চলে → `done` (stage নিজে লেখা `progress` dict সংরক্ষিত) বা `error` +
-  re-raise (status লেখা best-effort)। `full_auto_chain`-এর প্রতিটা stage
-  wrapped, তাই প্রতিটা stage-এর আলাদা status entry থাকে
-  (D2_voiceover / D3_align / D4_unify / E1_guideline / E2_draft / F3_final)
-  ক্রম অনুযায়ী। `subtitle_extract.extract_subtitles` ও
-  `auto_cut.build_draft_video` optional `progress_cb(processed, total)` নেয়।
-  App-এর `_run_upload_pipeline` F1_extract ও C1_translate `run_stage` দিয়ে
-  চালায় (F1-এ per-chunk progress)।
-- **Resume-from-interruption (F9 §5)** — নতুন `pipeline/resume.py`:
-  `find_resume_point(job_id)` আর্টিফ্যাক্ট থেকে পরের stage বের করে
-  (`subtitles_hi.json` নেই → `"upload_pipeline"`, তারপর প্রথম missing:
-  timestamps → edit_guideline → draft_final_video.mp4 →
-  `outputs/<job_id>/final_video.mp4`; সম্পূর্ণ হলে `None`)।
-  `resume_job` `start_from` দিয়ে chain চালায় (আগের stage skipped, result key
-  `None` — সম্পন্ন stage কখনো re-run হয় না), সম্পূর্ণ/আপলোড-অসম্পূর্ণ job-এ
-  `RuntimeError`। নতুন endpoint `POST /jobs/{job_id}/resume` →
-  `{"resume_point", "status": "processing"}`, background thread-এ `_run_resume`
-  চলে, `resume` stage status persist হয়; কিছু resume করার না থাকলে 409।
-  Acceptance test: যে stage নিজের artifact লিখে তারপর "crash" হয়েছে (raise),
-  resume-এ সেটা **আবার চলে না** (D3 `call_count` 1-ই থাকে)।
-- **3-job history + confirm-based eviction (F9 §4)** — নতুন
-  `pipeline/history_store.py`: index `uploads/_history_index.json`, cap
-  `HISTORY_LIMIT` (3)। `register_job` newest-first যোগ করে; index full হলে
-  **evict করে না** — `{"added": False, "would_evict": <oldest>,
-  "needs_confirm": True}` ফেরত দেয়। `evict_job(job_id, delete_files=...)`
-  drop করে, চাইলে ফাইল-ও মুছে — শুধু user confirm-এর পরে।
-  `list_history` newest-first, live metadata (job_config, voice source,
-  status, target video name) সহ, missing dir skip। Endpoint `GET /history` →
-  `{"history": [...], "limit": 3}`।
-- **Browser `confirm()` eviction flow** — upload ফর্মে, `POST /upload`-এর 409
-  (`needs_confirm`) এ `window.confirm()` dialog-এ oldest job-এর নাম দেখিয়ে
-  জিজ্ঞেস করে; accept করলে `POST /jobs/{job_id}/confirm-start?evict_job_id=
-  <oldest>&delete_files=true` → evict + register + pipeline start; decline
-  করলে কিছুই evict হয় না। `POST /upload` এখন engine/target_lang form field-ও
-  নেয় (validated) এবং কোনো Gemini/Whisper কাজের আগেই `job_config.json`
-  লেখে।
-- **Tests**: full suite **৪৭১ টেস্ট OK** (was ৪৩০; +৪১) —
-  test_job_config.py, test_history_store.py, test_resume.py,
-  test_f9_endpoints.py (HTTP: 409 confirm flow, confirm-start, /history,
-  resume endpoint) নতুন; test_full_auto_chain.py (per-stage status order),
-  test_subtitle_extract.py + test_voiceover_upload.py (engine gating —
-  `gemini_only` কখনো transcribe করে না) বাড়ানো হয়েছে।
+- **`pipeline/stages.py` (নতুন)** — progress bar-এর single source of truth:
+  `STAGE_SEQUENCE` (F1_extract → C1_translate → D2_voiceover_or_D3_align →
+  D4_unify → E1_guideline → E2_draft → F3_final), `STAGE_LABELS_BN` (বাংলা
+  label), `STAGE_KEY_GROUPS` (প্রতিটা slot-এর status-file stage key — D2/D3 এক
+  slot শেয়ার করে), `UMBRELLA_TO_SEQUENCE` (`final_render` → F3 slot)।
+- **Progress bar (F10.1)** — `_polling_page`-এর spinner-এর জায়গায়
+  `.progress-track`/`.progress-fill` বার (width = done stages + in-stage
+  fraction, fraction = `extra.progress.processed/total`, না থাকলে 0.5),
+  নিচে ৭টা stage row (✓/spinner/✗/○ + বাংলা label)। সব বিদ্যমান ২-সেকেন্ড
+  `poll()` লুপের ভেতরেই, কোনো framework/CDN ছাড়াই। "Processing…" banner টেক্সট
+  রাখা হয়েছে (পুরনো টেস্ট ভাঙবে না)।
+- **Live log panel + `GET /api/jobs/{job_id}/logs` (F10.2)** — endpoint কখনো
+  raise করে না (ফাইল নেই → `{"lines": [], "next_line": 0}`), negative /
+  past-end `since_line` clamp করে, নতুন লাইন + `next_line` দেয়। Polling
+  page-এ fixed-bottom docked panel (~30vh, monospace dark), প্রতি ৩ সেকেন্ডে
+  poll, নতুন লাইন append, শুধু bottom-এ থাকলে auto-scroll।
+- **History page + nav (F10.3)** — `site_header`-এ "ইতিহাস" nav link; `GET
+  /history` এখন HTML page (card: job_id, created_at, target_lang,
+  voice_source, colored done/running/error badge; "দেখুন" → `/review/{job_id}`;
+  "রিজিউম করুন" → POST `/jobs/{job_id}/resume` → `/resume/{job_id}` polling →
+  `/final/{job_id}`)। Resume button error job-এ + stale-running job-এ (10+
+  মিনিট status update নেই, status-file mtime থেকে)। Machine-readable JSON
+  `/api/history`-তে স্থানান্তরিত (test_f9_endpoints-এর `/history` JSON
+  assertion-গুলো `/api/history`-তে retarget করা হয়েছে)।
+- **Bengali history-full confirm (F10.4)** — upload-form JS-এ 409
+  `needs_confirm`-এ বাংলা `confirm()` dialog: OK → `confirm-start`?
+  `delete_files=true`, Cancel → `delete_files=false`, দুটোতেই polling page-এ
+  চলে যায়।
+- **`pipeline/error_bn.py` + `detail_bn` (F11)** — `explain_bn(exc, stage)`
+  `_friendly_error`-এর mirror: CallBudgetExceeded, AllKeysExhausted (empty +
+  populated), ffmpeg/ffprobe/subprocess failure, whisper import/runtime error,
+  malformed-transcript placeholder (F12), timeout/network; fallback generic —
+  stage-এর বাংলা label + truncated English text। কখনো raise করে না। সব ১১টা
+  app error site এখন `_write_error_status` দিয়ে `detail` + `detail_bn` দুইটাই
+  লেখে; error banner-এ `detail_bn` primary, English `detail` "বিস্তারিত
+  (English)" toggle-এর পেছনে।
+- **Tests**: full suite **৫০২ টেস্ট OK** (was ৪৭১; +৩১) —
+  test_error_bn.py (per-exception case + never-raises), test_f10_endpoints.py
+  (logs incremental `since_line` + clamping, /history HTML 0/1/3 job, badge +
+  resume button incl. stale-running, keep-files confirm, error-path
+  `detail_bn`) নতুন; test_f9_endpoints.py (/api/history), test_job_status.py
+  (detail/detail_bn একসাথে persist) বাড়ানো হয়েছে।
 
 বাকি কাজ:
-- **F10 (progress bar / log panel / history-tab UI) শুরু হয়নি** — `progress_cb`,
-  per-stage status data, `GET /history`-এর ডেটা সবই server-side তৈরি আছে,
-  কিন্তু ব্রাউজার-side UI (এনিমেটেড progress bar + polling, log panel +
-  auto-scroll, history tab) একটাও নেই। F10-এর আগে ব্রাউজারে ম্যানুয়াল
-  verify লাগবে।
-- **F11 (Bengali error text) শুরু হয়নি** — error-গুলো এখনো ইংরেজি;
-  Bengali `NO_ACTIVE_KEY_MESSAGE`-এর মতো user-facing error text localization
-  এখনো করা হয়নি। F9-এর `confirm()` dialog-ও এখনো ইংরেজি text-এ।
 - F9-এর ব্রাউজার-side `confirm()` eviction flow (409 → dialog → confirm-start)
-  শুধু HTTP-level টেস্টে (test_f9_endpoints.py) আচ্ছাদিত — রিয়েল ব্রাউজারে
-  ম্যানুয়াল verify বাকি।
+  এখন বাংলা dialog-এ রূপান্তরিত — রিয়েল ব্রাউজারে ম্যানুয়াল verify বাকি।
 - ব্যবহারকারীর নিজের real-media QA রান:
   - docs/FINAL_SUMMARY.md → "Subtitle QA Fixes (A1-E4)" → "The user must do this"
   - Whisper-primary পাথ (যখন Whisper ইনস্টল করা থাকবে) দিয়ে একটা job রি-রান
@@ -92,3 +67,9 @@ F9 (`per-job config + history + resume`): job_config, 3-job history, resume
 - E6-এর `expected_duration_sec` (draft ≈ source duration) ধারণাটা এখন শুধু
   auto-TTS পাথেই প্রযোজ্য; `user_upload` পাথে draft-এর মোট দৈর্ঘ্য source-এর
   চেয়ে আলাদা হওয়াই প্রত্যাশিত (কিন্তু ভয়েসওভার অডিও দৈর্ঘ্যের সমান থাকবে)।
+- **F12 (transcript upload / language dropdown / auto-detect) শুরু হয়নি** —
+  `error_bn`-এ malformed-transcript placeholder আছে মাত্র; upload form-এ
+  transcript upload, language dropdown, auto-detect এখনো নেই।
+- **F13 (retry-with-escalation UI) শুরু হয়নি** — "আবার চেষ্টা করুন" লিঙ্কটাই
+  এখনো একমাত্র retry পাথ; escalation (fresh budget / more keys / smaller
+  model) সহ retry UI নেই।

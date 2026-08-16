@@ -9,6 +9,7 @@ import html
 import json
 import logging
 import threading
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
@@ -19,6 +20,7 @@ from pipeline import (
     auto_cut,
     config,
     edit_guideline,
+    error_bn,
     full_auto_chain,
     gemini_rotation,
     history_store,
@@ -29,6 +31,7 @@ from pipeline import (
     render_final,
     resume,
     review,
+    stages,
     subtitle_builder,
     subtitle_extract,
     subtitle_qa,
@@ -86,6 +89,27 @@ def _friendly_error(exc: Exception) -> str:
     text = str(exc).strip()
     first_line = text.splitlines()[0] if text else "unknown error"
     return first_line[:280] + ("…" if len(first_line) > 280 else "")
+
+
+# A job stuck in "running" with no status update for this long is treated as
+# stale on the history page (F10.3): the resume button is shown for it.
+STALE_RUNNING_SECONDS = 10 * 60
+
+
+def _write_error_status(job_id, stage, exc):
+    """Persist a stage failure with both English + Bengali detail (F11).
+
+    Every error-status write in this module goes through this helper so the
+    ``detail_bn`` mirror can never drift out of sync with ``detail``. The
+    Bengali mapper is best-effort: if it raises (it should not), the English
+    detail is reused so the banner still has something to show.
+    """
+    extra = {"detail": _friendly_error(exc)}
+    try:
+        extra["detail_bn"] = error_bn.explain_bn(exc, stage)
+    except Exception:  # noqa: BLE001 - the Bengali mirror must never break a write
+        extra["detail_bn"] = extra["detail"]
+    job_status_store.write_status(job_id, stage, "error", extra=extra)
 
 app = FastAPI(
     title="Manhwa Video Dubber",
@@ -264,9 +288,7 @@ def _run_upload_pipeline(job_id):
             _run_auto_full_render(job_id)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         logger.error("post-upload pipeline failed for job %s: %s", job_id, exc)
-        job_status_store.write_status(
-            job_id, "upload_pipeline", "error", extra={"detail": _friendly_error(exc)}
-        )
+        _write_error_status(job_id, "upload_pipeline", exc)
 
 
 def _start_stage(job_id, stage, target):
@@ -314,14 +336,10 @@ def _run_voiceover_auto(job_id):
         voiceover_unify.VoiceoverAlignmentError,
     ) as exc:
         logger.error("auto voiceover failed for job %s: %s", job_id, exc)
-        job_status_store.write_status(
-            job_id, "voiceover_auto", "error", extra={"detail": _friendly_error(exc)}
-        )
+        _write_error_status(job_id, "voiceover_auto", exc)
     except Exception as exc:  # noqa: BLE001 — daemon thread must never die
         logger.exception("unexpected auto-voiceover failure for job %s", job_id)
-        job_status_store.write_status(
-            job_id, "voiceover_auto", "error", extra={"detail": _friendly_error(exc)}
-        )
+        _write_error_status(job_id, "voiceover_auto", exc)
 
 
 def _run_final_render(job_id):
@@ -340,14 +358,10 @@ def _run_final_render(job_id):
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         logger.error("final render failed for job %s: %s", job_id, exc)
-        job_status_store.write_status(
-            job_id, "final_render", "error", extra={"detail": _friendly_error(exc)}
-        )
+        _write_error_status(job_id, "final_render", exc)
     except Exception as exc:  # noqa: BLE001 — daemon thread must never die
         logger.exception("unexpected final-render failure for job %s", job_id)
-        job_status_store.write_status(
-            job_id, "final_render", "error", extra={"detail": _friendly_error(exc)}
-        )
+        _write_error_status(job_id, "final_render", exc)
 
 
 def _run_user_audio_pipeline(job_id):
@@ -371,20 +385,10 @@ def _run_user_audio_pipeline(job_id):
         voiceover_unify.VoiceoverAlignmentError,
     ) as exc:
         logger.error("user audio pipeline failed for job %s: %s", job_id, exc)
-        job_status_store.write_status(
-            job_id,
-            "user_audio_pipeline",
-            "error",
-            extra={"detail": _friendly_error(exc)},
-        )
+        _write_error_status(job_id, "user_audio_pipeline", exc)
     except Exception as exc:  # noqa: BLE001 — daemon thread must never die
         logger.exception("unexpected user-audio-pipeline failure for job %s", job_id)
-        job_status_store.write_status(
-            job_id,
-            "user_audio_pipeline",
-            "error",
-            extra={"detail": _friendly_error(exc)},
-        )
+        _write_error_status(job_id, "user_audio_pipeline", exc)
 
 
 def _run_auto_full_render(job_id):
@@ -411,22 +415,16 @@ def _run_auto_full_render(job_id):
         voiceover_unify.VoiceoverAlignmentError,
     ) as exc:
         logger.error("auto full render failed for job %s: %s", job_id, exc)
-        job_status_store.write_status(
-            job_id, "auto_full_render", "error",
-            extra={"detail": _friendly_error(exc)},
-        )
+        _write_error_status(job_id, "auto_full_render", exc)
     except Exception as exc:  # noqa: BLE001 — daemon thread must never die
         logger.exception(
             "unexpected auto full render failure for job %s", job_id
         )
-        job_status_store.write_status(
-            job_id, "auto_full_render", "error",
-            extra={"detail": _friendly_error(exc)},
-        )
+        _write_error_status(job_id, "auto_full_render", exc)
 
 
 def _polling_page(job_id, page_title, result_url, stage):
-    """Intermediate HTML shown while a background stage runs (U1c).
+    """Intermediate HTML shown while a background stage runs (U1c/F10).
 
     No external framework/CDN: a small inline <script> polls
     ``/api/jobs/{job_id}/status`` every 2 seconds. On ``done`` it redirects to
@@ -434,6 +432,12 @@ def _polling_page(job_id, page_title, result_url, stage):
     page); on ``error`` it shows the error detail plus a "আবার চেষ্টা করুন"
     link back to the same endpoint — safe because every stage is idempotent
     and resumable.
+
+    F10: replaces the lone spinner with an animated progress bar (width = done
+    stages + in-stage fraction over ``stages.STAGE_SEQUENCE``) and one row per
+    stage with a Bengali label, plus a docked live-log panel fed by
+    ``/api/jobs/{job_id}/logs``. F11: the error banner shows ``detail_bn``
+    first with the English ``detail`` behind a collapsed toggle.
     """
     body = f"""
   <h1>{page_title}</h1>
@@ -441,11 +445,177 @@ def _polling_page(job_id, page_title, result_url, stage):
     <span class="spinner" aria-hidden="true"></span>
     <span>Processing… this page updates automatically, no need to refresh.</span>
   </div>
+  <div id="progress-panel" class="progress-panel" hidden>
+    <div class="progress-track"
+         role="progressbar" aria-valuemin="0" aria-valuemax="100"
+         aria-valuenow="0" aria-label="Job progress">
+      <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
+    </div>
+    <p id="progress-pct" class="progress-pct">0%</p>
+    <ol id="stage-list" class="stage-list"></ol>
+  </div>
   <div id="job-error" class="error-banner" hidden></div>
+  <div id="log-panel" class="log-panel" hidden>
+    <div class="log-panel-head">
+      <span class="log-panel-title">লাইভ লগ</span>
+      <button type="button" id="log-toggle">Hide</button>
+    </div>
+    <pre id="log-output" class="log-output"></pre>
+  </div>
   <script>
     var JOB_ID = {json.dumps(job_id)};
     var RESULT_URL = {json.dumps(result_url)};
     var STAGE = {json.dumps(stage)};
+    var STAGE_SEQUENCE = {json.dumps(stages.STAGE_SEQUENCE)};
+    var STAGE_LABELS_BN = {json.dumps(stages.STAGE_LABELS_BN)};
+    var STAGE_KEY_GROUPS = {json.dumps(stages.STAGE_KEY_GROUPS)};
+    var UMBRELLA_TO_SEQUENCE = {json.dumps(stages.UMBRELLA_TO_SEQUENCE)};
+    var LOG_URL = '/api/jobs/' + encodeURIComponent(JOB_ID) + '/logs';
+    var nextLogLine = 0;
+    var logToggled = false;
+
+    function stateRank(s) {{
+      return s === 'done' ? 3 : s === 'running' ? 2 : s === 'error' ? 1 : 0;
+    }}
+
+    function stageEntryFor(status, seqStage) {{
+      var all = status.stages || {{}};
+      var entry = null;
+      var keys = STAGE_KEY_GROUPS[seqStage] || [seqStage];
+      for (var i = 0; i < keys.length; i++) {{
+        var e = all[keys[i]];
+        if (e && (!entry || stateRank(e.state) > stateRank(entry.state))) {{
+          entry = e;
+        }}
+      }}
+      if (!entry && status.stage && UMBRELLA_TO_SEQUENCE[status.stage] === seqStage) {{
+        return {{state: 'running'}};
+      }}
+      return entry;
+    }}
+
+    function stageFraction(entry) {{
+      var prog = entry && entry.progress;
+      if (prog && typeof prog.total === 'number' && prog.total > 0 &&
+          typeof prog.processed === 'number') {{
+        var f = prog.processed / prog.total;
+        return Math.max(0, Math.min(1, f));
+      }}
+      return 0.5;
+    }}
+
+    function computeProgress(status) {{
+      var n = STAGE_SEQUENCE.length;
+      var doneCount = 0, frac = 0;
+      for (var i = 0; i < n; i++) {{
+        var e = stageEntryFor(status, STAGE_SEQUENCE[i]);
+        var st = e ? e.state : null;
+        if (st === 'done') {{ doneCount = i + 1; frac = 0; }}
+        else if (st === 'running') {{ doneCount = i; frac = stageFraction(e); break; }}
+        else {{ doneCount = i; frac = 0; break; }}
+      }}
+      var width = Math.round(((doneCount + frac) / n) * 100);
+      return Math.max(0, Math.min(100, width));
+    }}
+
+    function buildStageRows(status) {{
+      var list = document.getElementById('stage-list');
+      list.innerHTML = '';
+      for (var i = 0; i < STAGE_SEQUENCE.length; i++) {{
+        var seq = STAGE_SEQUENCE[i];
+        var e = stageEntryFor(status, seq);
+        var st = e ? e.state : 'not_started';
+        var li = document.createElement('li');
+        li.className = 'stage-row stage-' + st;
+        var icon = document.createElement('span');
+        icon.className = 'stage-icon';
+        if (st === 'done') {{ icon.textContent = '✓'; }}
+        else if (st === 'error') {{ icon.textContent = '✗'; }}
+        else if (st === 'running') {{ icon.className += ' spinner'; }}
+        else {{ icon.textContent = '○'; }}
+        li.appendChild(icon);
+        var label = document.createElement('span');
+        label.className = 'stage-label';
+        label.textContent = STAGE_LABELS_BN[seq] || seq;
+        li.appendChild(label);
+        if (st === 'running') {{
+          var pct = document.createElement('span');
+          pct.className = 'stage-pct';
+          pct.textContent = Math.round(stageFraction(e) * 100) + '%';
+          li.appendChild(pct);
+        }}
+        list.appendChild(li);
+      }}
+    }}
+
+    function renderProgress(status) {{
+      var width = computeProgress(status);
+      document.getElementById('progress-fill').style.width = width + '%';
+      var track = document.querySelector('.progress-track');
+      if (track) {{ track.setAttribute('aria-valuenow', String(width)); }}
+      document.getElementById('progress-pct').textContent = width + '%';
+      buildStageRows(status);
+    }}
+
+    function showError(status) {{
+      document.getElementById('job-processing').hidden = true;
+      var el = document.getElementById('job-error');
+      el.hidden = false;
+      el.innerHTML = '';
+      var stageInfo = (status.stages || {{}})[STAGE]
+        || (status.stages || {{}})[status.stage];
+      var detailBn = stageInfo && stageInfo.detail_bn;
+      var detail = stageInfo && stageInfo.detail;
+      var heading = document.createElement('p');
+      heading.className = 'error-banner-title';
+      heading.textContent = 'Something went wrong';
+      el.appendChild(heading);
+      var p = document.createElement('p');
+      p.textContent = detailBn || detail || 'Unknown error.';
+      el.appendChild(p);
+      if (detail && detailBn && detail !== detailBn) {{
+        var a = document.createElement('a');
+        a.href = '#';
+        a.className = 'error-detail-toggle';
+        a.textContent = 'বিস্তারিত (English)';
+        var pre = document.createElement('pre');
+        pre.className = 'error-detail-en';
+        pre.textContent = detail;
+        pre.hidden = true;
+        a.addEventListener('click', function (ev) {{
+          ev.preventDefault();
+          pre.hidden = !pre.hidden;
+          a.textContent = pre.hidden ? 'বিস্তারিত (English)' : 'English detail লুকাও';
+        }});
+        el.appendChild(a);
+        el.appendChild(pre);
+      }}
+      var retry = document.createElement('a');
+      retry.className = 'error-banner-retry';
+      retry.href = RESULT_URL;
+      retry.textContent = 'আবার চেষ্টা করুন';
+      el.appendChild(retry);
+    }}
+
+    function pollLogs() {{
+      fetch(LOG_URL + '?since_line=' + nextLogLine)
+        .then(function (r) {{ return r.json(); }})
+        .then(function (data) {{
+          var lines = data.lines || [];
+          if (lines.length) {{
+            document.getElementById('log-panel').hidden = false;
+            var pre = document.getElementById('log-output');
+            var atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+            for (var i = 0; i < lines.length; i++) {{
+              pre.textContent += String(lines[i]).replace(/\\n$/, '') + '\\n';
+            }}
+            if (atBottom) {{ pre.scrollTop = pre.scrollHeight; }}
+          }}
+          nextLogLine = typeof data.next_line === 'number' ? data.next_line : nextLogLine;
+        }})
+        .catch(function () {{ /* transient — retried on the next tick */ }});
+    }}
+
     function poll() {{
       fetch('/api/jobs/' + encodeURIComponent(JOB_ID) + '/status')
         .then(function (r) {{ return r.json(); }})
@@ -455,30 +625,36 @@ def _polling_page(job_id, page_title, result_url, stage):
             return;
           }}
           if (status.state === 'error') {{
-            document.getElementById('job-processing').hidden = true;
-            var el = document.getElementById('job-error');
-            el.hidden = false;
-            var stageInfo = (status.stages || {{}})[STAGE]
-              || (status.stages || {{}})[status.stage];
-            var detail = stageInfo && stageInfo.detail
-              ? stageInfo.detail : 'Unknown error.';
-            var heading = document.createElement('p');
-            heading.className = 'error-banner-title';
-            heading.textContent = 'Something went wrong';
-            var p = document.createElement('p');
-            p.textContent = detail;
-            var a = document.createElement('a');
-            a.className = 'error-banner-retry';
-            a.href = RESULT_URL;
-            a.textContent = 'আবার চেষ্টা করুন';
-            el.appendChild(heading);
-            el.appendChild(p);
-            el.appendChild(a);
+            showError(status);
             return;
           }}
+          document.getElementById('progress-panel').hidden = false;
+          renderProgress(status);
           setTimeout(poll, 2000);
-        }});
+        }})
+        .catch(function () {{ setTimeout(poll, 2000); }});
     }}
+
+    document.getElementById('log-toggle').addEventListener('click', function () {{
+      var panel = document.getElementById('log-panel');
+      var output = document.getElementById('log-output');
+      var btn = document.getElementById('log-toggle');
+      if (logToggled) {{
+        panel.classList.remove('log-collapsed');
+        btn.textContent = 'Hide';
+        logToggled = false;
+      }} else {{
+        panel.classList.add('log-collapsed');
+        btn.textContent = 'Show';
+        logToggled = true;
+      }}
+      if (!output.hidden) {{
+        output.scrollTop = output.scrollHeight;
+      }}
+    }});
+
+    pollLogs();
+    setInterval(pollLogs, 3000);
     poll();
   </script>
   <p><a href="/">Back to home</a></p>"""
@@ -518,7 +694,7 @@ def home() -> HTMLResponse:
   </form>
   <div id="upload-error" class="error-banner" hidden></div>
   <p><a href="/settings">Gemini API key settings</a></p>
-  <p><a href="/history">Job history (last {history_store.HISTORY_LIMIT})</a></p>
+  <p><a href="/history">ইতিহাস (last {history_store.HISTORY_LIMIT} jobs)</a></p>
   <script>
     var form = document.getElementById('upload-form');
     var submitBtn = document.getElementById('upload-submit');
@@ -560,30 +736,28 @@ def home() -> HTMLResponse:
           if (body && body.needs_confirm) {{
             var oldest = body.target_video_name || body.would_evict;
             var ok = window.confirm(
-              'Job history is full (max ' + {history_store.HISTORY_LIMIT} + ' jobs). ' +
-              'To start this new job, the oldest job "' + oldest + '" will be ' +
-              'removed from history and its files deleted. Continue?'
+              'History-তে জায়গা নেই। সবচেয়ে পুরনো জব (' + oldest +
+              ') মুছে ফেলতে হবে চালিয়ে যেতে হলে। ফাইলও ডিলিট করতে চান? ' +
+              'OK = হ্যাঁ ফাইলসহ ডিলিট করো, Cancel = শুধু History লিস্ট থেকে ' +
+              'সরাও, ফাইল থাকুক'
             );
-            if (ok) {{
-              return fetch(
-                '/jobs/' + encodeURIComponent(body.job_id) + '/confirm-start' +
-                '?evict_job_id=' + encodeURIComponent(body.would_evict) +
-                '&delete_files=true',
-                {{ method: 'POST' }}
-              ).then(function (r) {{
-                return r.json().then(function (b) {{
-                  if (!r.ok) throw {{ status: r.status, body: b }};
-                  return b;
-                }});
-              }}).then(function (b) {{
-                startJob(b.job_id);
-              }}).catch(function (err2) {{
-                var b2 = (err2 && err2.body) || {{}};
-                showError(typeof b2.detail === 'string' ? b2.detail : 'Could not start the job.');
+            var deleteFiles = ok ? 'true' : 'false';
+            return fetch(
+              '/jobs/' + encodeURIComponent(body.job_id) + '/confirm-start' +
+              '?evict_job_id=' + encodeURIComponent(body.would_evict) +
+              '&delete_files=' + deleteFiles,
+              {{ method: 'POST' }}
+            ).then(function (r) {{
+              return r.json().then(function (b) {{
+                if (!r.ok) throw {{ status: r.status, body: b }};
+                return b;
               }});
-            }}
-            showError('New job cancelled — no job was evicted.');
-            return;
+            }}).then(function (b) {{
+              startJob(b.job_id);
+            }}).catch(function (err2) {{
+              var b2 = (err2 && err2.body) || {{}};
+              showError(typeof b2.detail === 'string' ? b2.detail : 'Could not start the job.');
+            }});
           }}
           var detail = typeof body.detail === 'string' ? body.detail : 'Upload failed.';
           showError(detail);
@@ -950,10 +1124,139 @@ def confirm_start(
     return {"job_id": job_id, "status": "processing"}
 
 
-@app.get("/history")
-def history_page() -> dict:
-    """List the recent jobs (history tab data, F9). The UI tab is F10."""
+@app.get("/api/jobs/{job_id}/logs")
+def job_logs(job_id: str, since_line: int = Query(0)) -> dict:
+    """Return new log lines for a job from ``since_line`` onward (F10).
+
+    Feeds the polling page's docked log panel. Never raises: a missing or
+    unreadable log file yields ``{"lines": [], "next_line": 0}``. ``since_line``
+    is an index into the log file's lines; ``next_line`` is the index to pass
+    back on the next poll. Negative or out-of-range indexes are clamped.
+    """
+    if since_line < 0:
+        since_line = 0
+    path = video_ingest.UPLOAD_ROOT / job_id / "logs" / "pipeline.log"
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            all_lines = fh.readlines()
+    except (OSError, ValueError):
+        return {"lines": [], "next_line": 0}
+    if since_line > len(all_lines):
+        since_line = len(all_lines)
+    lines = all_lines[since_line:]
+    return {"lines": lines, "next_line": since_line + len(lines)}
+
+
+@app.get("/history", response_class=HTMLResponse)
+def history_page() -> HTMLResponse:
+    """HTML history page (F10.3): one card per recent job with badges."""
+    entries = history_store.list_history()
+    cards = "\n".join(_history_card(e) for e in entries)
+    empty = '<p class="meta">No jobs yet.</p>' if not entries else ""
+    body = f"""<h1>Job history</h1>
+  <p>Recent jobs (max {history_store.HISTORY_LIMIT}).</p>
+  {empty}
+  <div class="history-list">{cards}</div>
+  <p><a href="/">Back to home</a></p>
+  <script>
+    var forms = document.querySelectorAll('.resume-form');
+    forms.forEach(function (form) {{
+      form.addEventListener('submit', function (ev) {{
+        ev.preventDefault();
+        var jobId = form.getAttribute('data-job');
+        fetch('/jobs/' + encodeURIComponent(jobId) + '/resume', {{ method: 'POST' }})
+          .then(function (r) {{
+            return r.json().then(function (b) {{
+              if (!r.ok) throw {{ status: r.status, body: b }};
+              return b;
+            }});
+          }})
+          .then(function () {{
+            window.location.href = '/resume/' + encodeURIComponent(jobId);
+          }})
+          .catch(function (err) {{
+            var b = (err && err.body) || {{}};
+            alert(typeof b.detail === 'string' ? b.detail : 'Could not resume the job.');
+          }});
+      }});
+    }});
+  </script>"""
+    return HTMLResponse(ui.page("Job history — Manhwa Video Dubber", body))
+
+
+def _job_is_stale_running(job_id, status):
+    """Whether a job is stuck "running" with no update for 10+ minutes (F10.3).
+
+    The status file's mtime is a cheap proxy for "last progress write": a
+    genuinely running job updates it as its stages transition. Jobs that
+    silently died (process crash, stale thread) keep an old mtime and get the
+    resume button on the history page.
+    """
+    if status.get("state") != "running":
+        return False
+    path = job_status_store.status_path(job_id)
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return False
+    return age > STALE_RUNNING_SECONDS
+
+
+def _history_card(entry):
+    """Render one history card (F10.3): meta + badge + দেখুন / রিজিউম করুন."""
+    job_id = entry.get("job_id", "")
+    state = entry.get("state") or "unknown"
+    badge_class = {
+        "done": "badge-done",
+        "error": "badge-error",
+        "running": "badge-running",
+        "not_started": "badge-idle",
+    }.get(state, "badge-idle")
+    created = (entry.get("created_at") or "")[:19].replace("T", " ")
+    name = html.escape(entry.get("target_video_name") or "—")
+    target_lang = html.escape(entry.get("target_lang") or "—")
+    voice_source = html.escape(entry.get("voice_source") or "—")
+    status = {"state": state, "stage": entry.get("stage")}
+    resume_form = ""
+    if state == "error" or _job_is_stale_running(job_id, status):
+        resume_form = (
+            f'<form class="resume-form" method="post" data-job="{job_id}">'
+            '<button type="submit">রিজিউম করুন</button></form>'
+        )
+    return f"""
+    <div class="history-card">
+      <div class="history-card-top">
+        <span class="history-id"><code>{html.escape(job_id)}</code></span>
+        <span class="history-badge {badge_class}">{state}</span>
+      </div>
+      <p class="history-meta">{created} · {name}</p>
+      <p class="history-meta">target_lang: {target_lang} ·
+        voice_source: {voice_source}</p>
+      <div class="history-actions">
+        <a class="history-view" href="/review/{job_id}">দেখুন</a>
+        {resume_form}
+      </div>
+    </div>"""
+
+
+@app.get("/api/history")
+def history_api() -> dict:
+    """JSON history feed (machine-readable sibling of the HTML page)."""
     return {"history": history_store.list_history(), "limit": history_store.HISTORY_LIMIT}
+
+
+@app.get("/resume/{job_id}", response_class=HTMLResponse)
+def resume_polling_page(job_id: str) -> HTMLResponse:
+    """Polling page shown after clicking "রিজিউম করুন" on the history page.
+
+    Redirects to the final-video page once the resume chain completes.
+    """
+    status = job_status_store.read_status(job_id)
+    if status.get("stage") == "unknown":
+        raise HTTPException(status_code=404, detail=f"unknown job {job_id}")
+    return _polling_page(
+        job_id, "Resuming job", f"/final/{job_id}", "resume"
+    )
 
 
 @app.post("/jobs/{job_id}/resume")
@@ -1003,14 +1306,10 @@ def _run_resume(job_id):
         voiceover_unify.VoiceoverAlignmentError,
     ) as exc:
         logger.error("resume failed for job %s: %s", job_id, exc)
-        job_status_store.write_status(
-            job_id, "resume", "error", extra={"detail": _friendly_error(exc)}
-        )
+        _write_error_status(job_id, "resume", exc)
     except Exception as exc:  # noqa: BLE001 — daemon thread must never die
         logger.exception("unexpected resume failure for job %s", job_id)
-        job_status_store.write_status(
-            job_id, "resume", "error", extra={"detail": _friendly_error(exc)}
-        )
+        _write_error_status(job_id, "resume", exc)
 
 
 @app.get("/api/jobs/{job_id}/status")

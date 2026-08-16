@@ -107,6 +107,31 @@ a:hover {
   letter-spacing: .04em;
 }
 
+.site-nav {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.nav-link {
+  font-family: var(--font-body);
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: var(--text);
+  text-decoration: none;
+  padding: 0.35rem 0.9rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  transition: color .15s ease, background-color .15s ease, border-color .15s ease;
+}
+
+.nav-link:hover {
+  color: var(--amber);
+  border-color: var(--hairline);
+  background: var(--surface-2);
+}
+
 main.site-content {
   max-width: 900px;
   margin: 0 auto;
@@ -397,6 +422,261 @@ code {
 .error-banner-retry:hover {
   background: #ff6a6e;
   color: #1a1410;
+}
+
+/* F10: progress panel — animated track + one row per stage */
+.progress-panel {
+  border: 1px solid var(--hairline);
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 1.1rem 1.2rem 1.2rem;
+  margin-bottom: 1.5rem;
+}
+
+.progress-track {
+  background: var(--surface-3);
+  border-radius: 999px;
+  overflow: hidden;
+  height: 14px;
+  border: 1px solid var(--hairline);
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  background-color: var(--amber);
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgba(255, 255, 255, 0.18) 0 8px,
+    rgba(255, 255, 255, 0) 8px 16px
+  );
+  background-size: 22.6px 22.6px;
+  transition: width 0.4s ease;
+  animation: progress-stripes 0.8s linear infinite;
+}
+
+@keyframes progress-stripes {
+  from { background-position: 0 0; }
+  to   { background-position: 22.6px 0; }
+}
+
+.progress-pct {
+  margin: 0.5rem 0 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.stage-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.stage-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.45rem 0.6rem;
+  border-radius: 10px;
+  color: var(--text-muted);
+  font-size: 0.92rem;
+}
+
+.stage-row.stage-running {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.stage-row.stage-done {
+  color: var(--text);
+}
+
+.stage-row.stage-error {
+  color: #ffb3b5;
+}
+
+.stage-icon {
+  flex: none;
+  width: 1.2rem;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+}
+
+.stage-row.stage-done .stage-icon { color: var(--teal); }
+.stage-row.stage-error .stage-icon { color: var(--red); }
+.stage-row.stage-not_started .stage-icon { color: var(--hairline); }
+
+.stage-label {
+  flex: 1;
+}
+
+.stage-pct {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--amber);
+}
+
+/* F10: docked live-log panel */
+.log-panel {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  z-index: 6;
+  max-height: 30vh;
+  display: flex;
+  flex-direction: column;
+  background: #0c0a09;
+  border-top: 1px solid var(--hairline);
+  font-family: var(--font-mono);
+}
+
+.log-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.4rem 0.9rem;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--surface-2);
+}
+
+.log-panel-title {
+  font-family: var(--font-body);
+  font-weight: 600;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  letter-spacing: .04em;
+}
+
+.log-panel button {
+  padding: 0.2rem 0.8rem;
+  font-size: 0.78rem;
+}
+
+.log-output {
+  flex: 1;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0.6rem 0.9rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: #c8c2b8;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-panel.log-collapsed {
+  max-height: none;
+}
+
+.log-panel.log-collapsed .log-output {
+  display: none;
+}
+
+/* F11: English detail behind a collapsed toggle */
+.error-detail-toggle {
+  display: inline-block;
+  margin: 0.3rem 0 0.6rem;
+  font-size: 0.85rem;
+  color: var(--amber);
+  text-decoration: none;
+  border-bottom: 1px dashed rgba(232, 163, 61, .4);
+}
+
+.error-detail-en {
+  margin: 0 0 0.8rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* F10.3: history page cards */
+.history-list {
+  display: grid;
+  gap: 1rem;
+  margin: 1.25rem 0;
+}
+
+.history-card {
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 1rem 1.2rem;
+  box-shadow: var(--card-shadow);
+}
+
+.history-card-top {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+.history-id code {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.history-badge {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  padding: 0.18rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  color: var(--text-muted);
+}
+
+.badge-done    { color: var(--teal);    border-color: rgba(63, 167, 150, .5); }
+.badge-running { color: var(--amber);   border-color: rgba(232, 163, 61, .5); }
+.badge-error   { color: #ffb3b5;        border-color: rgba(229, 72, 77, .6);  }
+.badge-idle    { color: var(--text-muted); border-color: var(--hairline); }
+
+.history-meta {
+  margin: 0.4rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.88rem;
+}
+
+.history-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  margin-top: 0.9rem;
+}
+
+.history-view {
+  display: inline-block;
+  padding: 0.5rem 1.1rem;
+  border-radius: 999px;
+  background: var(--teal);
+  color: #10201d;
+  text-decoration: none;
+  font-weight: 700;
+}
+
+.history-view:hover {
+  background: #57c0ad;
+  color: #10201d;
+}
+
+.resume-form {
+  margin: 0;
+}
+
+.resume-form button {
+  padding: 0.5rem 1.1rem;
 }
 
 /* Misc */

@@ -36,10 +36,13 @@ def page_head(title):
 
 
 def site_header(page_title):
-    """Shared header: home link + page title, then the main content wrapper."""
+    """Shared header: home link + page title + history nav, then content."""
     return f"""<header class="site-header">
   <a class="brand" href="/">Manhwa Video Dubber</a>
   <span class="page-title">{page_title}</span>
+  <nav class="site-nav">
+    <a class="nav-link" href="/history">ইতিহাস</a>
+  </nav>
 </header>
 <main class="site-content">
 """
