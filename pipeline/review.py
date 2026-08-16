@@ -209,8 +209,7 @@ def build_review_page(job_id, upload_root=None):
 
     blocks = "\n".join(_render_item_block(job_id, item) for item in items)
     body = f"""<h1>Per-clip review — job {job_id}</h1>
-  <p><a href="/final/{job_id}">Final Render →</a> |
-     <a href="/">Back to home</a></p>
+  <p><a href="/final/{job_id}">Final Render →</a></p>
   {flagged_banner}
   {blocks}
 """

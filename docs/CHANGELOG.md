@@ -1,5 +1,50 @@
 # Manhwa Video Dubber — Changelog
 
+## [F10.5] — 2026-08-16 — /review/{job_id} state handling (no raw-JSON 404) + consistent back-nav + card polish
+
+F10.5 fixes the crash where clicking "দেখুন" on a running job's history card
+landed on a raw JSON 404 (`{"detail": ...}`): the review page now checks the
+job state first — a running job redirects (302) to its live progress page
+`/upload/{job_id}`, and a missing artifact (e.g. no `edit_guideline.json`)
+renders a friendly Bengali HTML 404 page ("রিভিউ পাওয়া যায়নি" +
+"ইতিহাসে ফিরে যান") instead of a JSON body. History cards got state-aware
+primary links (running → polling page, done → `/review/{job_id}`, error →
+resume only), every page gained a consistent back/home footer in
+`ui.page()`, and a scoped CSS pass adds card shadows/borders, a subtle body
+gradient, button hover lift, per-state stage-row tints, h1 spacing, a nav
+header shadow + hover-underline, and color-tinted pill badges.
+
+- **`/review/{job_id}` state handling (F10.5.1)** — `review_page` reads
+  `job_status` first; `state == "running"` → `RedirectResponse` (302) to
+  `/upload/{job_id}` (the live polling page); `build_review_page`'s
+  `FileNotFoundError` → HTML 404 with `error_bn.explain_bn(exc, "review")` in
+  a banner, a "রিভিউ পাওয়া যায়নি" h1 and an "ইতিহাসে ফিরে যান" link. Unknown
+  jobs stay 404, now as HTML rather than JSON.
+- **State-aware history-card links (F10.5.2)** — `_history_card` no longer
+  always points at `/review/{job_id}`: running → `/upload/{job_id}`
+  ("চলমান — দেখুন"), done → `/review/{job_id}` ("দেখুন"), error/idle → no view
+  link (the রিজিউম করুন form only).
+- **Consistent back/home nav (F10.5.3)** — `ui.page()` now appends
+  "আগের পাতায় যান" (`javascript:history.back()`) + "হোমে যান" (`/`) to every
+  page; the 9 route-level "Back to home" links in `app.py` and the one in
+  `pipeline/review.py` were removed; the standalone settings page got the same
+  two links.
+- **Visual polish (F10.5.4)** — `static/style.css`: `--card-shadow` →
+  `0 2px 8px rgba(0,0,0,.4)` + lighter `--card-border` applied to
+  `.review-box` / `.history-card` / `.progress-panel` / `.keys-table` /
+  `fieldset`; subtle `linear-gradient(180deg, …)` added to `body`; buttons +
+  `.history-view` + `.error-banner-retry` get `transition` + hover lift
+  (`translateY(-1px)` + shadow); stage rows tinted per state (low-opacity
+  amber/teal/red backgrounds, running keeps its accent); h1 bigger spacing +
+  letter-spacing; `.site-header` bottom shadow + `.nav-link` hover underline;
+  badges (already pill-shaped) now get matching color-tinted backgrounds.
+- **Tests**: full suite **৫০৮ টেস্ট OK** (was ৫০২; +৬) — new
+  `test_app_review.py` (running → 302 → `/upload/{job_id}`; done + missing
+  artifact → HTML 404, not JSON; done + artifact → 200; unknown job → HTML
+  404; error + artifact → 200) and `test_history_card_links_are_state_aware`
+  in `test_f10_endpoints.py`; `test_app_orchestration.py`'s
+  review-before-voiceover case re-targeted to the no-raw-JSON contract.
+
 ## [F10+F11] — 2026-08-16 — animated progress bar + live log panel + history tab UI + Bengali error text
 
 F10 replaces the polling page's lone spinner with an animated progress bar and

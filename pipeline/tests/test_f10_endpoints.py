@@ -127,6 +127,27 @@ class HistoryPageTest(F9EndpointsTest):
         html = self.client.get("/history").text
         self.assertIn('data-job="job-stale"', html)
 
+    def test_history_card_links_are_state_aware(self):
+        # F10.5: running -> live progress page, done -> /review, error -> resume
+        # only. A running job must never get a dead /review/{id} link.
+        self._register("job-run")
+        self._register("job-done")
+        self._register("job-err")
+        job_status.write_status("job-run", "D2_voiceover", "running")
+        job_status.write_status("job-done", "F3_final", "done")
+        job_status.write_status("job-err", "D2_voiceover", "error")
+        html = self.client.get("/history").text
+        self.assertIn('href="/upload/job-run"', html)
+        self.assertIn("চলমান — দেখুন", html)
+        self.assertNotIn('href="/review/job-run"', html)
+        self.assertIn('href="/review/job-done"', html)
+        self.assertIn(">দেখুন</a>", html)
+        self.assertNotIn('href="/review/job-err"', html)
+        self.assertNotIn('href="/upload/job-err"', html)
+        self.assertIn('data-job="job-err"', html)
+        self.assertIn("রিজিউম করুন", html)
+
+
     def test_history_json_sibling_endpoint(self):
         self._register("job-json")
         res = self.client.get("/api/history")

@@ -276,9 +276,11 @@ class HttpWiringChainTest(unittest.TestCase):
         self.assertEqual(res.status_code, 400)
         self.assertIn("Gemini API key", res.json()["detail"])
 
-    def test_review_before_voiceover_404(self):
-        # A job that stopped before the voiceover phase has no edit_guideline,
-        # so the review page must say so (and not crash).
+    def test_review_before_voiceover_no_raw_json(self):
+        # A job that stopped before the voiceover phase has no edit_guideline.
+        # F10.5: a still-running job must land on the live progress page (302,
+        # then the 200 polling page) and a stopped job gets a friendly HTML
+        # 404 — either way it must never crash or return a raw JSON 404.
         self.client.post("/settings/keys", data={"key": "test-gemini-key"})
         res = self.client.post(
             "/upload",
@@ -286,8 +288,16 @@ class HttpWiringChainTest(unittest.TestCase):
         )
         job_id = res.json()["job_id"]
         self._wait_for_upload_done(job_id)
-        res = self.client.get(f"/review/{job_id}")
-        self.assertEqual(res.status_code, 404)
+        res = self.client.get(f"/review/{job_id}", follow_redirects=False)
+        if res.status_code == 302:
+            self.assertEqual(res.headers["location"], f"/upload/{job_id}")
+            page = self.client.get(f"/upload/{job_id}")
+            self.assertEqual(page.status_code, 200, page.text)
+        else:
+            self.assertEqual(res.status_code, 404, res.text)
+            self.assertIn("text/html", res.headers["content-type"])
+            self.assertNotIn('"detail"', res.text)
+            self.assertIn("রিভিউ পাওয়া যায়নি", res.text)
 
     def test_upload_pipeline_resume_skips_build_subtitle_list(self):
         # B4: when subtitles_hi.json already exists, _run_upload_pipeline()

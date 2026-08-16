@@ -5,7 +5,38 @@ E6 (draft duration-validation fix) + E7 (cascade-crash fix) +
 E8 (user_upload duration-check removal) + E9 (duration-drift fix) + E10
 (test-isolation fix) + F8 (Whisper timing authority) + F9 (per-job config,
 3-job history + confirm eviction, resume-from-interruption) + F10 (progress
-bar / log panel / history-tab UI) + F11 (Bengali error text) সম্পূর্ণ।
+bar / log panel / history-tab UI) + F11 (Bengali error text) + F10.5 (review
+page state handling, back-nav, card polish) সম্পূর্ণ।
+
+F10.5 (review-page state handling + consistent back-nav + card polish):
+
+- **`/review/{job_id}` state handling (F10.5.1)** — `review_page` এখন প্রথমে
+  `job_status` পড়ে: `state == "running"` → 302 `RedirectResponse` → লাইভ
+  progress page `/upload/{job_id}` (আগে raw JSON 404 ক্র্যাশ হতো);
+  `build_review_page`-এর `FileNotFoundError` → বাংলা HTML 404 page
+  ("রিভিউ পাওয়া যায়নি" + `error_bn.explain_bn(exc, "review")` banner +
+  "ইতিহাসে ফিরে যান" link)। Unknown job-ও এখন HTML 404 (JSON নয়)।
+- **State-aware history-card links (F10.5.2)** — `_history_card`: running →
+  `/upload/{job_id}` ("চলমান — দেখুন"), done → `/review/{job_id}` ("দেখুন"),
+  error/idle → view link নেই (শুধু রিজিউম করুন)। running job-এ আর ডেড
+  `/review/{id}` link নেই।
+- **Consistent back/home nav (F10.5.3)** — `ui.page()` প্রতিটা page-এর শেষে
+  "আগের পাতায় যান" (`history.back()`) + "হোমে যান" (`/`) যোগ করে; app.py-র ৯টা
+  + review.py-র ১টা route-level "Back to home" link সরানো হয়েছে; settings
+  page-ও দুটো link পায়।
+- **Visual polish (F10.5.4)** — `--card-shadow` → `0 2px 8px rgba(0,0,0,.4)`,
+  lighter `--card-border` (`.review-box`/`.history-card`/`.progress-panel`/
+  `.keys-table`/`fieldset`); body-তে subtle `linear-gradient(180deg, …)`;
+  button + `.history-view` + `.error-banner-retry` hover lift
+  (`translateY(-1px)` + shadow); stage-row per-state tint (running amber
+  accent রেখে); h1 spacing + letter-spacing; `.site-header` shadow +
+  `.nav-link` hover underline; pill badge-গুলো color-tinted background।
+- **Tests**: full suite **৫০৮ টেস্ট OK** (was ৫০২; +৬) — নতুন
+  `test_app_review.py` (running → 302 → `/upload/{job_id}`; done + missing
+  artifact → HTML 404, JSON নয়; done + artifact → 200; unknown → HTML 404;
+  error + artifact → 200) + `test_history_card_links_are_state_aware`
+  (test_f10_endpoints.py); test_app_orchestration-এর review-before-voiceover
+  case no-raw-JSON contract-এ retarget করা হয়েছে।
 
 F10/F11 (progress bar + log panel + history tab UI + Bengali errors):
 

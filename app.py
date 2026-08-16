@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from pipeline import (
@@ -657,7 +657,7 @@ def _polling_page(job_id, page_title, result_url, stage):
     setInterval(pollLogs, 3000);
     poll();
   </script>
-  <p><a href="/">Back to home</a></p>"""
+"""
     return HTMLResponse(ui.page(page_title + " — Manhwa Video Dubber", body))
 
 
@@ -886,8 +886,7 @@ def upload_status_page(job_id: str) -> HTMLResponse:
     <label for="audio">Audio file (mp3/wav/m4a)</label>
     <input type="file" id="audio" name="audio" accept=".mp3,.wav,.m4a" required>
     <button type="submit">Upload</button>
-  </form>
-  <p><a href="/">Back to home</a></p>"""
+  </form>"""
     return HTMLResponse(ui.page("Upload Complete — Manhwa Video Dubber", body))
 
 
@@ -957,7 +956,11 @@ def settings_page() -> HTMLResponse:
       }}
     }}
   </script>
-  <p><a href="/">Back to home</a></p>
+  <nav class="page-nav">
+    <a href="javascript:history.back()">আগের পাতায় যান</a>
+    <span class="page-nav-sep" aria-hidden="true">·</span>
+    <a href="/">হোমে যান</a>
+  </nav>
   </main>
 </body>
 </html>"""
@@ -1157,7 +1160,6 @@ def history_page() -> HTMLResponse:
   <p>Recent jobs (max {history_store.HISTORY_LIMIT}).</p>
   {empty}
   <div class="history-list">{cards}</div>
-  <p><a href="/">Back to home</a></p>
   <script>
     var forms = document.querySelectorAll('.resume-form');
     forms.forEach(function (form) {{
@@ -1223,6 +1225,17 @@ def _history_card(entry):
             f'<form class="resume-form" method="post" data-job="{job_id}">'
             '<button type="submit">রিজিউম করুন</button></form>'
         )
+    # F10.5: the primary card link is state-aware — a running job points at
+    # the live progress page (the review page would only 404/redirect anyway),
+    # a done job opens the review page, error/idle jobs have no view link.
+    if state == "running":
+        view_link = (
+            f'<a class="history-view" href="/upload/{job_id}">চলমান — দেখুন</a>'
+        )
+    elif state == "done":
+        view_link = f'<a class="history-view" href="/review/{job_id}">দেখুন</a>'
+    else:
+        view_link = ""
     return f"""
     <div class="history-card">
       <div class="history-card-top">
@@ -1233,7 +1246,7 @@ def _history_card(entry):
       <p class="history-meta">target_lang: {target_lang} ·
         voice_source: {voice_source}</p>
       <div class="history-actions">
-        <a class="history-view" href="/review/{job_id}">দেখুন</a>
+        {view_link}
         {resume_form}
       </div>
     </div>"""
@@ -1437,7 +1450,6 @@ def align_uploaded_page(job_id: str) -> HTMLResponse:
   <p>Audio:
     <a href="/download/{job_id}/voiceover_upload?format=wav">voiceover_hi.wav</a></p>
   <p><a href="/voiceover/{job_id}/choose">Change voice source</a></p>
-  <p><a href="/">Back to home</a></p>
 """
     return HTMLResponse(ui.page(f"Alignment — Manhwa Video Dubber", body))
 
@@ -1484,8 +1496,7 @@ def voiceover_choose_page(job_id: str) -> HTMLResponse:
     <button type="submit" name="mode" value="user_upload">
       আমি নিজে/অন্য AI দিয়ে বানানো অডিও ফাইল আপলোড করব
     </button>
-  </form>
-  <p><a href="/">Back to home</a></p>"""
+  </form>"""
     return HTMLResponse(ui.page("Voiceover Source — Manhwa Video Dubber", body))
 
 
@@ -1595,17 +1606,41 @@ def _render_auto_tts_result(job_id: str) -> HTMLResponse:
   {warning}
   {"".join(links)}
   <p><a href="/voiceover/{job_id}/choose">Change voice source</a></p>
-  <p><a href="/">Back to home</a></p>
 """
     return HTMLResponse(ui.page("Auto Voiceover — Manhwa Video Dubber", body))
 
 
 @app.get("/review/{job_id}", response_class=HTMLResponse)
 def review_page(job_id: str) -> HTMLResponse:
+    """Per-clip review page (F1) with F10.5 state handling.
+
+    A job still in ``running`` state has nothing to review yet — instead of
+    raising a raw-JSON 404 the browser lands on the live progress page
+    (``/upload/{job_id}``). Only once the job is done/error does the page get
+    built; a missing artifact (e.g. ``edit_guideline.json``) yields a friendly
+    HTML 404 in Bengali (F11 mirror), never a JSON body.
+    """
+    status = job_status_store.read_status(job_id)
+    if status.get("state") == "running":
+        return RedirectResponse(url=f"/upload/{job_id}", status_code=302)
     try:
         page = review.build_review_page(job_id)
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        detail_bn = error_bn.explain_bn(exc, "review")
+        body = (
+            "<h1>রিভিউ পাওয়া যায়নি</h1>"
+            f"<p>Job <code>{html.escape(job_id)}</code> এর রিভিউ পেজ লোড করা "
+            "যায়নি — ক্লিপ ডেটা (edit_guideline.json) পাওয়া যায় না।</p>"
+            '<div class="error-banner">'
+            '<p class="error-banner-title">কী হয়েছে</p>'
+            f"<p>{html.escape(detail_bn)}</p>"
+            "</div>"
+            '<p><a href="/history">ইতিহাসে ফিরে যান</a></p>'
+        )
+        return HTMLResponse(
+            ui.page("রিভিউ পাওয়া যায়নি — Manhwa Video Dubber", body),
+            status_code=404,
+        )
     return HTMLResponse(page)
 
 
@@ -1641,8 +1676,7 @@ def review_edit(
     [{result["source_start_sec"]}, {result["source_end_sec"]}], pts
     x{result["pts_multiplier"]}, flagged {result["flagged"]}
     ({result["flag_reason"] or "none"}).</p>
-  <p><a href="/review/{job_id}">Back to review</a></p>
-  <p><a href="/">Back to home</a></p>"""
+  <p><a href="/review/{job_id}">Back to review</a></p>"""
     return HTMLResponse(ui.page("Edit applied — Manhwa Video Dubber", body))
 
 
@@ -1701,8 +1735,7 @@ def _render_final_result(job_id: str, result=None, warnings=None) -> HTMLRespons
   {warning_html}
   <video controls src="/download/{job_id}"></video>
   <p><a href="/download/{job_id}">Download final video</a></p>
-  <p><a href="/review/{job_id}">Back to Review</a></p>
-  <p><a href="/">Back to home</a></p>"""
+  <p><a href="/review/{job_id}">Back to Review</a></p>"""
     return HTMLResponse(ui.page(f"Final Video — job {job_id} — Manhwa Video Dubber", body))
 
 

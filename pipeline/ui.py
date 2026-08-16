@@ -49,10 +49,20 @@ def site_header(page_title):
 
 
 def page(title, body):
-    """Full HTML document: shared head + header + body in a main wrapper."""
+    """Full HTML document: shared head + header + body in a main wrapper.
+
+    F10.5: every page ends with a consistent back/home nav so users never get
+    stranded — "আগের পাতায় যান" (``history.back()``) first, then "হোমে যান".
+    Route-level "Back to home" links were removed in favor of this one place.
+    """
     return (
         page_head(title)
         + site_header(title)
         + body
+        + '\n<nav class="page-nav">\n'
+        '  <a href="javascript:history.back()">আগের পাতায় যান</a>\n'
+        '  <span class="page-nav-sep" aria-hidden="true">·</span>\n'
+        '  <a href="/">হোমে যান</a>\n'
+        "</nav>\n"
         + "\n</main>\n</body>\n</html>\n"
     )
