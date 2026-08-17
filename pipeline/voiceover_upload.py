@@ -46,7 +46,7 @@ from pathlib import Path
 from google import genai
 from google.genai import types as genai_types
 
-from pipeline import config, job_logging, key_store, lang_files, video_ingest
+from pipeline import config, job_config, job_logging, key_store, lang_files, video_ingest
 from pipeline.subtitle_extract import _extract_json, call_with_rotation
 from pipeline.voiceover_auto import _probe_audio_duration, _run
 from pipeline.voiceover_unify import VoiceoverAlignmentError, _clamp_timestamps_to_audio
@@ -320,6 +320,27 @@ def _status_from_sources(sources):
     return "whisper", "whisper"
 
 
+def _resolve_whisper_language(target_lang, logger_=None):
+    """Whisper language hint for a job's ``target_lang`` (F12f, Part D).
+
+    ``target_lang`` codes (``hi`` / ``bn`` / ``en``) already match Whisper's
+    ISO-639-1 language codes, so the value passes through unchanged and a
+    ``hi`` job gets exactly the pre-F12f ``language="hi"`` hint. A missing or
+    unsupported code falls back to the default ``"hi"`` instead of passing
+    ``None``/empty to Whisper, and logs the fallback so it is visible in the
+    job log.
+    """
+    log = logger_ or logger
+    if target_lang in job_config.ALLOWED_TARGET_LANGS:
+        return target_lang
+    log.warning(
+        "whisper alignment: unsupported target_lang %r; "
+        "falling back to %r",
+        target_lang, job_config.DEFAULT_TARGET_LANG,
+    )
+    return job_config.DEFAULT_TARGET_LANG
+
+
 def align_uploaded_voiceover(job_id, upload_root=None):
     """Align ``text_hi`` lines to the uploaded voiceover. Never raises on
     Gemini/Whisper failures.
@@ -386,7 +407,9 @@ def align_uploaded_voiceover(job_id, upload_root=None):
     # F9: a gemini_only job skips Whisper even when it is installed.
     words = (
         _transcribe_words(
-            audio_path, language="hi", model=config.WHISPER_MODEL_HI,
+            audio_path,
+            language=_resolve_whisper_language(lang, logger_=job_logger),
+            model=config.WHISPER_MODEL_HI,
             logger_=job_logger,
         )
         if engine_allows_whisper(job_id, upload_root)

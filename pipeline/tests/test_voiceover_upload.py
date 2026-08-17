@@ -9,7 +9,7 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from app import app
-from pipeline import job_config, key_store, video_ingest, voiceover_auto, voiceover_upload
+from pipeline import job_config, key_store, lang_files, video_ingest, voiceover_auto, voiceover_upload
 
 
 def _make_audio(path, duration_sec):
@@ -558,6 +558,109 @@ class WhisperPrimaryRegressionTest(VoiceoverUploadBase):
             self.assertLessEqual(entry["end_sec"], total + 1e-6)
         self.assertAlmostEqual(timestamps[-1]["end_sec"], total, places=2)
         self.assertLessEqual(result["target_total_sec"], total + 1e-6)
+
+
+class WhisperLanguageHintTest(VoiceoverUploadBase):
+    """F12f/Part D: the Whisper alignment language follows the job's
+    ``target_lang``, not a hardcoded ``"hi"``.
+
+    ``target_lang`` codes (hi/bn/en) already match Whisper's ISO-639-1
+    language codes, so the hint passes through directly; a ``hi`` job must
+    get exactly the pre-F12f ``language="hi"`` call (byte-identical).
+    """
+
+    WORDS = [
+        {"word": "এক", "start": 0.1, "end": 1.2},
+        {"word": "দুই", "start": 1.5, "end": 4.9},
+    ]
+
+    def _make_subtitles_lang(self, lang, entries):
+        (self.job_dir / lang_files.subtitles_json(lang)).write_text(
+            json.dumps(entries, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def _write_target_lang_job(self, lang, entries):
+        job_config.write_config(
+            self.job_id, engine="whisper_primary", target_lang=lang,
+            voice_source="user_upload", upload_root=self.upload_root,
+        )
+        self._make_subtitles_lang(lang, entries)
+        _make_audio(self.job_dir / lang_files.voiceover_audio(lang), 6.0)
+
+    def _align_captured_language(self, words=None):
+        captured = {}
+
+        def fake_transcribe(audio_path, language=None, model=None, logger_=None):
+            captured["language"] = language
+            return words if words is not None else self.WORDS
+
+        with mock.patch.object(
+            voiceover_upload, "_transcribe_words", side_effect=fake_transcribe
+        ):
+            result = self._align()
+        return captured.get("language"), result
+
+    def test_hi_target_lang_uses_hi_language_hint(self):
+        # Regression: a hi job must call Whisper with language="hi" — the
+        # same hint as before F12f Part D.
+        self._write_target_lang_job(
+            "hi", [{"serial": 1, "text_hi": "এক"}, {"serial": 2, "text_hi": "দুই"}]
+        )
+        language, result = self._align_captured_language()
+        self.assertEqual(language, "hi")
+        self.assertEqual(result["alignment_source"], "whisper")
+        self.assertEqual(result["status"], "ok")
+
+    def test_bn_target_lang_uses_bn_language_hint(self):
+        self._write_target_lang_job(
+            "bn",
+            [
+                {"serial": 1, "text_zh": "A", "text_translated": "এক"},
+                {"serial": 2, "text_zh": "B", "text_translated": "দুই"},
+            ],
+        )
+        language, result = self._align_captured_language()
+        self.assertEqual(language, "bn")
+        self.assertNotEqual(language, "hi")
+        self.assertEqual(result["alignment_source"], "whisper")
+
+    def test_en_target_lang_uses_en_language_hint(self):
+        self._write_target_lang_job(
+            "en",
+            [
+                {"serial": 1, "text_zh": "A", "text_translated": "one"},
+                {"serial": 2, "text_zh": "B", "text_translated": "two"},
+            ],
+        )
+        en_words = [
+            {"word": "one", "start": 0.1, "end": 1.2},
+            {"word": "two", "start": 1.5, "end": 4.9},
+        ]
+        language, result = self._align_captured_language(words=en_words)
+        self.assertEqual(language, "en")
+        self.assertNotEqual(language, "hi")
+        self.assertEqual(result["alignment_source"], "whisper")
+
+    def test_missing_target_lang_uses_hi_without_crashing(self):
+        # Defensive: no job_config at all -> target_lang defaults to "hi" and
+        # Whisper still receives a valid "hi" hint (never None/empty).
+        _make_subtitles(
+            self.job_dir, [{"serial": 1, "text_hi": "এক"}],
+        )
+        _make_audio(self.job_dir / "voiceover_hi.wav", 6.0)
+        language, result = self._align_captured_language()
+        self.assertEqual(language, "hi")
+        self.assertEqual(result["alignment_source"], "whisper")
+
+    def test_invalid_target_lang_resolver_falls_back_to_hi_and_logs(self):
+        # Defensive: an unsupported code reaching the resolver must fall back
+        # to "hi" (never None/empty) and log the fallback.
+        with self.assertLogs("pipeline.voiceover_upload", level="WARNING") as logs:
+            resolved = voiceover_upload._resolve_whisper_language("xx")
+        self.assertEqual(resolved, "hi")
+        self.assertTrue(
+            any("unsupported target_lang" in m for m in logs.output)
+        )
 
 
 class SaveUploadTest(VoiceoverUploadBase):
