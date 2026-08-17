@@ -692,7 +692,19 @@ def home() -> HTMLResponse:
     <label for="file">Video (mp4/mkv/mov/avi/webm/flv/wmv/m4v)</label>
     <input type="file" id="file" name="file"
            accept=".mp4,.mkv,.mov,.avi,.webm,.flv,.wmv,.m4v" required>
-    <label for="transcript">ট্রান্সক্রিপ্ট/সাবটাইটেল (ঐচ্ছিক) — .srt, .vtt বা প্লেইন টেক্সট</label>
+    <fieldset>
+      <legend>সাবটাইটেল উৎস</legend>
+      <label for="subtitle-source">অরিজিনাল সাবটাইটেল কোথা থেকে আসবে?</label>
+      <select id="subtitle-source" name="subtitle_source">
+        <option value="gemini_extract" selected>
+          Gemini ভিডিও থেকে নিজে বের করো (default)
+        </option>
+        <option value="user_transcript">
+          আমি নিজের ট্রান্সক্রিপ্ট/সাবটাইটেল ফাইল দেব
+        </option>
+      </select>
+    </fieldset>
+    <label for="transcript">ট্রান্সক্রিপ্ট/সাবটাইটেল ফাইল (শুধু "আমি নিজের ট্রান্সক্রিপ্ট ফাইল দেব" বাছাই করলে প্রযোজ্য) — .srt, .vtt বা প্লেইন টেক্সট</label>
     <input type="file" id="transcript" name="transcript"
            accept=".srt,.vtt,.txt,text/plain">
     <fieldset>
@@ -995,6 +1007,7 @@ async def upload_video(
     voice_source: str = Form("auto_tts"),
     engine: str | None = Form(None),
     target_lang: str | None = Form(None),
+    subtitle_source: str | None = Form(None),
 ) -> dict:
     try:
         video_ingest.ensure_active_key(key_store.get_active_keys())
@@ -1023,13 +1036,37 @@ async def upload_video(
     except video_ingest.UnsupportedFileError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    # F12a: an optional original-language transcript skips F1 (Gemini
-    # extraction). It is parsed and validated HERE, before anything is
-    # persisted — a malformed/unparseable transcript rejects the whole upload
-    # with no job dir, no video file and no partial state saved anywhere.
-    subtitle_source = job_config.DEFAULT_SUBTITLE_SOURCE
+    # F12b (Part A): the subtitle source is an explicit user choice on the
+    # upload form, no longer an implicit side-effect of whether a transcript
+    # file happened to be attached. Default ``gemini_extract``.
+    if subtitle_source is None:
+        subtitle_source = job_config.DEFAULT_SUBTITLE_SOURCE
+    if subtitle_source not in job_config.ALLOWED_SUBTITLE_SOURCES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"invalid subtitle source: {subtitle_source!r} "
+                f"(allowed: {', '.join(job_config.ALLOWED_SUBTITLE_SOURCES)})"
+            ),
+        )
+
+    # F12a/F12b: when the user picked their own transcript, it is parsed and
+    # validated HERE, before anything is persisted — a malformed/unparseable
+    # transcript rejects the whole upload with no job dir, no video file and
+    # no partial state saved anywhere. Picking "user_transcript" without
+    # attaching a file is a hard rejection. Picking "gemini_extract" ignores
+    # any attached transcript file and proceeds with normal Gemini extraction.
     transcript_bytes = None
-    if transcript is not None and transcript.filename:
+    if subtitle_source == "user_transcript":
+        if transcript is None or not transcript.filename:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "আপনি “আমি নিজের ট্রান্সক্রিপ্ট ফাইল দেব” বেছে নিয়েছেন, "
+                    "কিন্তু কোনো ফাইল আপলোড করা হয়নি — .srt, .vtt বা প্লেইন "
+                    "টেক্সট ফাইল যুক্ত করুন।"
+                ),
+            )
         try:
             transcript_bytes = await transcript.read()
         except OSError as exc:
@@ -1055,7 +1092,8 @@ async def upload_video(
                 status_code=400,
                 detail="ট্রান্সক্রিপ্ট ফাইলটি খালি — কোনো সাবটাইটেল পাওয়া যায়নি।",
             )
-        subtitle_source = "user_transcript"
+    else:
+        transcript = None
 
     job_id = video_ingest.new_job_id()
     job_dir = video_ingest.UPLOAD_ROOT / job_id

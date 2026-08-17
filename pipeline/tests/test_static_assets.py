@@ -29,6 +29,14 @@ class StaticAssetsTest(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertIn(LINK, res.text)
 
+    def test_home_page_has_subtitle_source_dropdown(self):
+        res = TestClient(app).get("/")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn('name="subtitle_source"', res.text)
+        self.assertIn('<select', res.text)
+        self.assertIn('value="gemini_extract"', res.text)
+        self.assertIn('value="user_transcript"', res.text)
+
     def test_settings_page_links_stylesheet(self):
         res = TestClient(app).get("/settings")
         self.assertEqual(res.status_code, 200)

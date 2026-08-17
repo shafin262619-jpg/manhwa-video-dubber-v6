@@ -103,13 +103,15 @@ class TranscriptUploadHttpTest(unittest.TestCase):
         res = self.client.post("/settings/keys", data={"key": "test-gemini-key"})
         self.assertEqual(res.status_code, 200, res.text)
 
-    def _upload(self, transcript=None, voice_source="user_upload"):
+    def _upload(self, transcript=None, voice_source="user_upload",
+                subtitle_source=None):
         files = {"file": ("sample.mp4", self.video_bytes, "video/mp4")}
         if transcript is not None:
             files["transcript"] = transcript
-        return self.client.post(
-            "/upload", data={"voice_source": voice_source}, files=files
-        )
+        data = {"voice_source": voice_source}
+        if subtitle_source is not None:
+            data["subtitle_source"] = subtitle_source
+        return self.client.post("/upload", data=data, files=files)
 
     def _wait_upload_done(self, job_id, timeout=20.0):
         deadline = time.time() + timeout
@@ -132,7 +134,8 @@ class TranscriptUploadHttpTest(unittest.TestCase):
         self._patch(translator, "_call_gemini_text", return_value="नमस्ते")
 
         res = self._upload(
-            transcript=("subs.srt", SRT_SAMPLE.encode("utf-8"), "application/x-subrip")
+            transcript=("subs.srt", SRT_SAMPLE.encode("utf-8"), "application/x-subrip"),
+            subtitle_source="user_transcript",
         )
         self.assertEqual(res.status_code, 200, res.text)
         job_id = res.json()["job_id"]
@@ -201,7 +204,8 @@ class TranscriptUploadHttpTest(unittest.TestCase):
     def test_malformed_transcript_rejected_with_nothing_saved(self):
         self._add_key()
         res = self._upload(
-            transcript=("broken.srt", b"not a subtitle file", "application/x-subrip")
+            transcript=("broken.srt", b"not a subtitle file", "application/x-subrip"),
+            subtitle_source="user_transcript",
         )
         self.assertEqual(res.status_code, 400, res.text)
         detail = res.json()["detail"]
@@ -212,7 +216,8 @@ class TranscriptUploadHttpTest(unittest.TestCase):
     def test_empty_transcript_rejected_with_nothing_saved(self):
         self._add_key()
         res = self._upload(
-            transcript=("empty.txt", b"   \n  \n", "text/plain")
+            transcript=("empty.txt", b"   \n  \n", "text/plain"),
+            subtitle_source="user_transcript",
         )
         self.assertEqual(res.status_code, 400, res.text)
         self.assertIn("ট্রান্সক্রিপ্ট", res.json()["detail"])
@@ -233,7 +238,8 @@ class TranscriptUploadHttpTest(unittest.TestCase):
             "আমি এখানে থাকি\n"
         )
         res = self._upload(
-            transcript=("subs.vtt", vtt.encode("utf-8"), "text/vtt")
+            transcript=("subs.vtt", vtt.encode("utf-8"), "text/vtt"),
+            subtitle_source="user_transcript",
         )
         self.assertEqual(res.status_code, 200, res.text)
         job_id = res.json()["job_id"]
@@ -245,6 +251,57 @@ class TranscriptUploadHttpTest(unittest.TestCase):
             )
         )
         self.assertEqual([s["text"] for s in raw["subtitles"]], ["আমার নাম জন", "আমি এখানে থাকি"])
+
+    def test_gemini_extract_ignores_uploaded_transcript_file(self):
+        self._add_key()
+        extract = self._patch(
+            subtitle_extract,
+            "_call_gemini",
+            return_value=[
+                {"text": "你好", "start_sec": 0.0, "end_sec": 1.5},
+            ],
+        )
+        self._patch(translator, "_call_gemini_text", return_value="नमस्ते")
+
+        res = self._upload(
+            transcript=("subs.srt", SRT_SAMPLE.encode("utf-8"), "application/x-subrip"),
+            subtitle_source="gemini_extract",
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        job_id = res.json()["job_id"]
+        self._wait_upload_done(job_id)
+        job_dir = self.upload_root / job_id
+
+        # F1 must still have run — the attached file is ignored entirely.
+        extract.assert_called()
+        raw = json.loads(
+            (job_dir / "subtitles_zh_raw.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual([s["text"] for s in raw["subtitles"]], ["你好"])
+        # No transcript file was persisted for the chain to import.
+        self.assertFalse(list(job_dir.glob("transcript_upload.*")))
+        cfg = job_config.read_config(job_id)
+        self.assertEqual(cfg["subtitle_source"], "gemini_extract")
+
+    def test_user_transcript_without_file_rejected_nothing_saved(self):
+        self._add_key()
+        res = self._upload(subtitle_source="user_transcript")
+        self.assertEqual(res.status_code, 400, res.text)
+        self.assertIn("ফাইল আপলোড করা হয়নি", res.json()["detail"])
+        self.assertEqual(
+            list(self.upload_root.iterdir()) if self.upload_root.exists() else [],
+            [],
+        )
+
+    def test_invalid_subtitle_source_rejected_nothing_saved(self):
+        self._add_key()
+        res = self._upload(subtitle_source="bogus_source")
+        self.assertEqual(res.status_code, 400, res.text)
+        self.assertIn("invalid subtitle source", res.json()["detail"])
+        self.assertEqual(
+            list(self.upload_root.iterdir()) if self.upload_root.exists() else [],
+            [],
+        )
 
 
 if __name__ == "__main__":
