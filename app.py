@@ -215,7 +215,91 @@ def _resume_pipeline_extra(job_id):
             extra["serials"] = len(hi)
     except (OSError, ValueError):
         pass
+    gap_stats = _load_gap_stats(job_dir)
+    if gap_stats.get("detected"):
+        extra["gap_fill_stats"] = gap_stats
+        if gap_stats.get("failed"):
+            extra["gap_fill_warning_bn"] = TRANSCRIPT_GAP_FILL_WARNING_BN
     return extra
+
+
+def _default_gap_stats():
+    """A zeroed gap-fill stats dict (F12b) — shared default for fresh runs."""
+    return {
+        "detected": 0,
+        "attempted": 0,
+        "filled": 0,
+        "failed": 0,
+        "added_entries": 0,
+        "windows": [],
+    }
+
+
+def _load_gap_stats(job_dir):
+    """Read the persisted gap-fill stats sidecar; zeroed default when missing.
+
+    ``_run_upload_pipeline`` writes ``gap_fill_stats.json`` right after gap-fill
+    runs so a resumed job can restore the F12b Part C warning even though the
+    gap-fill sub-stage itself is never re-run. Never raises.
+    """
+    try:
+        data = json.loads(
+            (job_dir / "gap_fill_stats.json").read_text(encoding="utf-8")
+        )
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return _default_gap_stats()
+
+
+def _save_gap_stats(job_dir, gap_stats):
+    """Best-effort persist of the gap-fill stats sidecar. Never raises."""
+    try:
+        (job_dir / "gap_fill_stats.json").write_text(
+            json.dumps(gap_stats, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _raw_summary(job_dir):
+    """Best-effort F1 result summary from an existing ``subtitles_zh_raw.json``.
+
+    Used on the resume path where F1 already finished (its artifact exists) so
+    the completed extraction is never re-run; missing/malformed files keep the
+    ``"ok"``/``{}`` defaults (a malformed raw is surfaced downstream instead).
+    """
+    summary = {"status": "ok", "errors": {}}
+    try:
+        data = json.loads(
+            (job_dir / "subtitles_zh_raw.json").read_text(encoding="utf-8")
+        )
+        if isinstance(data, dict):
+            summary["status"] = data.get("status", "ok")
+            errors = data.get("errors")
+            if isinstance(errors, dict):
+                summary["errors"] = errors
+    except (OSError, ValueError):
+        pass
+    return summary
+
+
+def _load_whisper_check(job_dir):
+    """Read an existing whisper cross-check result; ``skipped`` default.
+
+    The whisper sub-stage always writes ``subtitle_qa_whisper.json`` when it
+    runs, so its presence is the proof the stage finished. Never raises.
+    """
+    try:
+        data = json.loads(
+            (job_dir / "subtitle_qa_whisper.json").read_text(encoding="utf-8")
+        )
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"status": "skipped"}
 
 
 def _stage_progress(job_id, stage):
@@ -246,6 +330,14 @@ def _run_upload_pipeline(job_id):
     Idempotent resume: if ``subtitles_hi.json`` already exists the chain is
     not re-run; ``done`` is recorded from the existing files instead. This is
     the basis for the future Retry button (U1c).
+
+    F12c (Part A): resume works at sub-stage granularity too. Each sub-stage
+    is skipped when its own artifact already exists (``subtitles_zh_raw.json``
+    for F1, ``subtitles_zh.json`` for B2, ``subtitle_qa_whisper.json`` for the
+    whisper cross-check, ``subtitles_hi.json`` for C1), so an interrupted
+    upload pipeline resumes from its first missing sub-stage without re-running
+    the completed ones. Gap-fill stats are persisted to a sidecar right after
+    gap-fill so the F12b Part C warning survives a resume.
     """
     try:
         job_dir = video_ingest.UPLOAD_ROOT / job_id
@@ -260,15 +352,14 @@ def _run_upload_pipeline(job_id):
             # config.MAX_API_CALLS_PER_JOB calls for a single job run.
             budget = gemini_rotation.CallBudget(config.MAX_API_CALLS_PER_JOB)
             cfg = job_config.read_config(job_id) or {}
-            gap_stats = {
-                "detected": 0,
-                "attempted": 0,
-                "filled": 0,
-                "failed": 0,
-                "added_entries": 0,
-                "windows": [],
-            }
-            if cfg.get("subtitle_source") == "user_transcript":
+            # F12c: on a resume the F1 artifact already exists (the extraction/
+            # import ran before the interruption), so F1 and gap-fill are never
+            # re-run — the summary is derived from disk and the persisted
+            # gap-fill stats instead.
+            gap_stats = _load_gap_stats(job_dir)
+            if (job_dir / "subtitles_zh_raw.json").exists():
+                extraction = _raw_summary(job_dir)
+            elif cfg.get("subtitle_source") == "user_transcript":
                 # F12a: the user uploaded their own transcript, so F1 (Gemini
                 # extraction) is skipped entirely — the uploaded content is
                 # imported into subtitles_zh_raw.json instead. Everything
@@ -294,6 +385,7 @@ def _run_upload_pipeline(job_id):
                     logger.warning(
                         "gap-fill raised for job %s (non-fatal): %s", job_id, exc
                     )
+                _save_gap_stats(job_dir, gap_stats)
             else:
                 extraction = job_status_store.run_stage(
                     job_id,
@@ -303,18 +395,25 @@ def _run_upload_pipeline(job_id):
                     call_budget=budget,
                     progress_cb=_stage_progress(job_id, "F1_extract"),
                 )
-            subtitle_builder.build_subtitle_list(job_id, call_budget=budget)
-            try:
-                whisper_check = subtitle_verify.whisper_cross_check(
-                    job_id,
-                    logger_=job_logging.get_job_logger(job_id),
-                )
-            except Exception as exc:  # noqa: BLE001 - best-effort, never break upload_pipeline
-                logger.warning(
-                    "whisper cross-check failed for job %s (non-fatal): %s",
-                    job_id, exc,
-                )
-                whisper_check = {"status": "skipped"}
+            if not (job_dir / "subtitles_zh.json").exists():
+                subtitle_builder.build_subtitle_list(job_id, call_budget=budget)
+            if (job_dir / "subtitle_qa_whisper.json").exists():
+                whisper_check = _load_whisper_check(job_dir)
+            else:
+                try:
+                    whisper_check = subtitle_verify.whisper_cross_check(
+                        job_id,
+                        logger_=job_logging.get_job_logger(job_id),
+                    )
+                except Exception as exc:  # noqa: BLE001 - best-effort, never break upload_pipeline
+                    logger.warning(
+                        "whisper cross-check failed for job %s (non-fatal): %s",
+                        job_id, exc,
+                    )
+                    whisper_check = {"status": "skipped"}
+            # C1 is always reached with subtitles_hi.json missing (the top-level
+            # branch above already handled the fully-complete case), so the
+            # translation stage always runs here.
             translation = job_status_store.run_stage(
                 job_id,
                 "C1_translate",
@@ -1384,10 +1483,18 @@ def resume_polling_page(job_id: str) -> HTMLResponse:
     """Polling page shown after clicking "রিজিউম করুন" on the history page.
 
     Redirects to the final-video page once the resume chain completes.
+    F12c (Part A): a job whose upload pipeline is mid-flight polls the upload
+    pipeline instead and lands on the ``/upload`` result page.
     """
     status = job_status_store.read_status(job_id)
     if status.get("stage") == "unknown":
         raise HTTPException(status_code=404, detail=f"unknown job {job_id}")
+    upload_point = resume.find_upload_resume_point(job_id)
+    if upload_point not in (None, "upload_pipeline"):
+        return _polling_page(
+            job_id, "Resuming upload pipeline", f"/upload/{job_id}",
+            "upload_pipeline",
+        )
     return _polling_page(
         job_id, "Resuming job", f"/final/{job_id}", "resume"
     )
@@ -1401,6 +1508,12 @@ def resume_job_endpoint(job_id: str) -> dict:
     ``resume.find_resume_point``); the chain is re-run from that point on a
     background thread, with completed stages skipped (never re-run). Returns a
     409 when there is nothing to resume yet.
+
+    F12c (Part A): a job interrupted inside the upload pipeline (before
+    ``subtitles_hi.json``) is resumable too — ``find_upload_resume_point``
+    picks the first missing upload sub-stage and the existing upload thread
+    continues from there (skipping completed sub-stages). Only a job with no
+    upload work done at all keeps returning 409.
     """
     try:
         point = resume.find_resume_point(job_id)
@@ -1412,13 +1525,24 @@ def resume_job_endpoint(job_id: str) -> dict:
             detail=f"job {job_id} is already complete — nothing to resume",
         )
     if point == "upload_pipeline":
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"job {job_id} has not finished subtitle extraction/translation "
-                "yet — resume is available once the dubbing chain has started"
-            ),
-        )
+        upload_point = resume.find_upload_resume_point(job_id)
+        if upload_point is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"job {job_id} is already complete — nothing to resume",
+            )
+        if upload_point == "upload_pipeline":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"job {job_id} has not finished subtitle extraction yet — "
+                    "nothing to resume"
+                ),
+            )
+        _start_stage(job_id, "upload_pipeline", _run_upload_pipeline)
+        return {
+            "job_id": job_id, "resume_point": upload_point, "status": "processing",
+        }
     _start_stage(job_id, "resume", _run_resume)
     return {"job_id": job_id, "resume_point": point, "status": "processing"}
 

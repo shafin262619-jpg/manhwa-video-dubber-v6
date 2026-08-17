@@ -25,11 +25,32 @@ finished the upload pipeline (no ``subtitles_hi.json``) reports the sentinel
 translation exist. ``resume_job`` then re-runs the right chain (auto-TTS vs
 user-upload, from the voice-source choice) with ``start_from=<resume point>``
 so the completed stages are skipped, never re-run.
+
+F12c (Part A): the upload pipeline is itself resumable at sub-stage
+granularity. ``find_upload_resume_point`` derives which upload sub-stage
+(F1 extraction / import+gap-fill, B2 build/repair, whisper cross-check, C1
+translate) is first missing from its artifact, using the same presence-proof
+pattern as the D2+ chain. The app wires that point back into
+``_run_upload_pipeline`` so an interrupted upload resumes without re-running
+completed sub-stages.
 """
 
 from pathlib import Path
 
 from pipeline import full_auto_chain, lang_files, render_final, video_ingest, voiceover_unify
+
+# Upload-pipeline sub-stages and the artifact that proves each one finished.
+# Order matters: ``find_upload_resume_point`` returns the first missing one.
+# - F1        ``subtitles_zh_raw.json``   (Gemini extraction or transcript import + gap-fill)
+# - B2        ``subtitles_zh.json``       (build/repair + subtitle_qa.json)
+# - whisper   ``subtitle_qa_whisper.json``(local Whisper cross-check; always written, best-effort)
+# - C1        ``subtitles_hi.json``       (translation)
+UPLOAD_PIPELINE_STAGES = (
+    ("upload_F1", "subtitles_zh_raw.json"),
+    ("upload_B2", "subtitles_zh.json"),
+    ("upload_whisper", "subtitle_qa_whisper.json"),
+    ("upload_C1", "subtitles_hi.json"),
+)
 
 
 def _stage_artifacts(job_id, upload_root, mode):
@@ -66,6 +87,38 @@ def find_resume_point(job_id, upload_root=None):
     for stage, artifact in _stage_artifacts(job_id, upload_root, mode):
         present = artifact() if callable(artifact) else artifact.exists()
         if not present:
+            return stage
+    return None
+
+
+def find_upload_resume_point(job_id, upload_root=None):
+    """Return the first incomplete upload-pipeline sub-stage, or None.
+
+    Uses the same artifact-presence proof as :func:`find_resume_point` but at
+    sub-stage granularity within the upload pipeline:
+
+    - ``None`` — the upload pipeline is fully done (``subtitles_hi.json``
+      exists); the D2+ chain resume (``find_resume_point``) governs from here.
+    - ``"upload_pipeline"`` — nothing of the upload pipeline has started yet
+      (no ``subtitles_zh_raw.json``); there is nothing to resume, the job
+      needs a fresh start.
+    - ``"upload_F1"`` / ``"upload_B2"`` / ``"upload_whisper"`` /
+      ``"upload_C1"`` — the first sub-stage whose artifact is missing; resume
+      ``_run_upload_pipeline`` from here, skipping earlier completed stages.
+
+    Never raises for a missing/malformed job dir — missing files simply report
+    the next stage to run.
+    """
+    root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
+    job_dir = root / job_id
+    if (job_dir / lang_files.subtitles_json(
+        lang_files.target_lang(job_id, upload_root)
+    )).exists():
+        return None
+    if not (job_dir / "subtitles_zh_raw.json").exists():
+        return "upload_pipeline"
+    for stage, name in UPLOAD_PIPELINE_STAGES:
+        if not (job_dir / name).exists():
             return stage
     return None
 
