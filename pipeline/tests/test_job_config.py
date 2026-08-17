@@ -88,6 +88,23 @@ class WriteConfigTest(JobConfigBase):
                 self.job_id, subtitle_source="bogus_source", upload_root=self.upload_root
             )
 
+    def test_write_config_persists_bn_target_lang(self):
+        data = job_config.write_config(
+            self.job_id,
+            voice_source="auto_tts",
+            target_lang="bn",
+            upload_root=self.upload_root,
+        )
+        self.assertEqual(data["target_lang"], "bn")
+        persisted = self._read_file()
+        self.assertEqual(persisted["target_lang"], "bn")
+
+    def test_write_config_rejects_invalid_target_lang(self):
+        with self.assertRaises(ValueError):
+            job_config.write_config(
+                self.job_id, target_lang="fr", upload_root=self.upload_root
+            )
+
 
 class ReadConfigTest(JobConfigBase):
     def test_read_config_round_trip(self):
@@ -152,6 +169,20 @@ class ReadConfigTest(JobConfigBase):
         path.write_text(json.dumps(data), encoding="utf-8")
         cfg = job_config.read_config(self.job_id, self.upload_root)
         self.assertEqual(cfg["subtitle_source"], "gemini_extract")
+
+    def test_read_config_sanitizes_invalid_target_lang(self):
+        job_config.write_config(
+            self.job_id,
+            voice_source="auto_tts",
+            target_lang="bn",
+            upload_root=self.upload_root,
+        )
+        path = self.job_dir / "job_config.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["target_lang"] = "fr"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        cfg = job_config.read_config(self.job_id, self.upload_root)
+        self.assertEqual(cfg["target_lang"], job_config.DEFAULT_TARGET_LANG)
 
 
 class DefaultEngineTest(JobConfigBase):

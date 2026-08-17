@@ -104,13 +104,15 @@ class TranscriptUploadHttpTest(unittest.TestCase):
         self.assertEqual(res.status_code, 200, res.text)
 
     def _upload(self, transcript=None, voice_source="user_upload",
-                subtitle_source=None):
+                subtitle_source=None, target_lang=None):
         files = {"file": ("sample.mp4", self.video_bytes, "video/mp4")}
         if transcript is not None:
             files["transcript"] = transcript
         data = {"voice_source": voice_source}
         if subtitle_source is not None:
             data["subtitle_source"] = subtitle_source
+        if target_lang is not None:
+            data["target_lang"] = target_lang
         return self.client.post("/upload", data=data, files=files)
 
     def _wait_upload_done(self, job_id, timeout=20.0):
@@ -298,6 +300,42 @@ class TranscriptUploadHttpTest(unittest.TestCase):
         res = self._upload(subtitle_source="bogus_source")
         self.assertEqual(res.status_code, 400, res.text)
         self.assertIn("invalid subtitle source", res.json()["detail"])
+        self.assertEqual(
+            list(self.upload_root.iterdir()) if self.upload_root.exists() else [],
+            [],
+        )
+
+    def test_target_lang_plumbed_to_config_and_filenames(self):
+        self._add_key()
+        self._patch(
+            subtitle_extract,
+            "_call_gemini",
+            return_value=[
+                {"text": "你好", "start_sec": 0.0, "end_sec": 1.5},
+            ],
+        )
+        self._patch(translator, "_call_gemini_text", return_value="নমস্কার")
+
+        res = self._upload(target_lang="bn")
+        self.assertEqual(res.status_code, 200, res.text)
+        job_id = res.json()["job_id"]
+        self._wait_upload_done(job_id)
+        job_dir = self.upload_root / job_id
+
+        cfg = job_config.read_config(job_id)
+        self.assertEqual(cfg["target_lang"], "bn")
+
+        # F12b filename wiring already drives the translated artifacts off the
+        # config, so a bn job produces the bn-named files (and no hi ones).
+        self.assertTrue((job_dir / "subtitles_bn.json").exists())
+        self.assertTrue((job_dir / "subtitles_bn.srt").exists())
+        self.assertFalse((job_dir / "subtitles_hi.json").exists())
+
+    def test_invalid_target_lang_rejected_nothing_saved(self):
+        self._add_key()
+        res = self._upload(target_lang="fr")
+        self.assertEqual(res.status_code, 400, res.text)
+        self.assertIn("invalid target lang", res.json()["detail"])
         self.assertEqual(
             list(self.upload_root.iterdir()) if self.upload_root.exists() else [],
             [],

@@ -37,6 +37,15 @@ class StaticAssetsTest(unittest.TestCase):
         self.assertIn('value="gemini_extract"', res.text)
         self.assertIn('value="user_transcript"', res.text)
 
+    def test_home_page_has_target_lang_dropdown(self):
+        res = TestClient(app).get("/")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn('name="target_lang"', res.text)
+        for lang in ("hi", "bn", "en"):
+            self.assertIn(f'value="{lang}"', res.text)
+        # hi is the default -> its option is pre-selected.
+        self.assertIn('value="hi" selected', res.text)
+
     def test_settings_page_links_stylesheet(self):
         res = TestClient(app).get("/settings")
         self.assertEqual(res.status_code, 200)

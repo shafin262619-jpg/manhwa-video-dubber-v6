@@ -42,6 +42,28 @@ ALLOWED_VOICE_SOURCES = ("auto_tts", "user_upload", "transcript_upload")
 # the user uploaded their own transcript file and F1 was skipped.
 ALLOWED_SUBTITLE_SOURCES = ("gemini_extract", "user_transcript")
 
+# F12f: the target language the voiceover is produced in. ``"hi"`` is the
+# long-standing default; ``bn`` / ``en`` are the additional supported dubbing
+# targets. Every downstream consumer (translation prompt, TTS voice, Whisper
+# alignment language, on-disk filenames via ``lang_files``) keys off this one
+# catalog, so adding a 4th language is a single new entry here plus a voice in
+# ``config.TTS_VOICES``.
+ALLOWED_TARGET_LANGS = ("hi", "bn", "en")
+
+# English name used in translation/alignment prompts and logs.
+TARGET_LANG_NAMES = {
+    "hi": "Hindi",
+    "bn": "Bangla",
+    "en": "English",
+}
+
+# Bangla UI labels for the upload-form dropdown (the UI language is Bangla).
+TARGET_LANG_UI_LABELS = {
+    "hi": "হিন্দি",
+    "bn": "বাংলা",
+    "en": "ইংরেজি",
+}
+
 DEFAULT_TARGET_LANG = "hi"
 DEFAULT_SUBTITLE_SOURCE = "gemini_extract"
 
@@ -84,8 +106,8 @@ def write_config(job_id, engine=None, target_lang=None, source_lang=None,
 
     ``engine`` / ``target_lang`` / ``voice_source`` / ``subtitle_source`` may
     be ``None`` to keep the defaults. Raises ValueError on an invalid
-    ``engine``, ``voice_source`` or ``subtitle_source``. Written atomically
-    (temp file + ``os.replace``).
+    ``engine``, ``target_lang``, ``voice_source`` or ``subtitle_source``.
+    Written atomically (temp file + ``os.replace``).
     """
     if engine is None:
         engine = default_engine()
@@ -105,12 +127,19 @@ def write_config(job_id, engine=None, target_lang=None, source_lang=None,
             f"invalid subtitle source: {subtitle_source!r} "
             f"(allowed: {', '.join(ALLOWED_SUBTITLE_SOURCES)})"
         )
+    if target_lang is None:
+        target_lang = DEFAULT_TARGET_LANG
+    if target_lang not in ALLOWED_TARGET_LANGS:
+        raise ValueError(
+            f"invalid target lang: {target_lang!r} "
+            f"(allowed: {', '.join(ALLOWED_TARGET_LANGS)})"
+        )
     data = {
         "job_id": job_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "engine": engine,
         "source_lang": source_lang,
-        "target_lang": target_lang or DEFAULT_TARGET_LANG,
+        "target_lang": target_lang,
         "voice_source": voice_source,
         "subtitle_source": subtitle_source,
     }
@@ -153,5 +182,10 @@ def read_config(job_id, upload_root=None):
         defaults["subtitle_source"]
         if defaults["subtitle_source"] in ALLOWED_SUBTITLE_SOURCES
         else DEFAULT_SUBTITLE_SOURCE
+    )
+    defaults["target_lang"] = (
+        defaults["target_lang"]
+        if defaults["target_lang"] in ALLOWED_TARGET_LANGS
+        else DEFAULT_TARGET_LANG
     )
     return defaults

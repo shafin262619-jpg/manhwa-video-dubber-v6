@@ -880,6 +880,12 @@ def home() -> HTMLResponse:
     engine_checked_gemini = (
         'checked' if default_engine == "gemini_only" else ''
     )
+    target_lang_options = "".join(
+        f'<option value="{lang}"'
+        f'{" selected" if lang == job_config.DEFAULT_TARGET_LANG else ""}>'
+        f'{job_config.TARGET_LANG_UI_LABELS[lang]}</option>'
+        for lang in job_config.ALLOWED_TARGET_LANGS
+    )
     body = f"""<section class="hero-panel">
     <h1>Manhwa Video Dubber</h1>
     <p>Upload a Chinese-subtitled manhwa explain video to start auto-dubbing.</p>
@@ -898,6 +904,13 @@ def home() -> HTMLResponse:
         <option value="user_transcript">
           আমি নিজের ট্রান্সক্রিপ্ট/সাবটাইটেল ফাইল দেব
         </option>
+      </select>
+    </fieldset>
+    <fieldset>
+      <legend>ডাবিং ভাষা</legend>
+      <label for="target-lang">ভয়েসওভার কোন ভাষায় হবে?</label>
+      <select id="target-lang" name="target_lang">
+        {target_lang_options}
       </select>
     </fieldset>
     <label for="transcript">ট্রান্সক্রিপ্ট/সাবটাইটেল ফাইল (শুধু "আমি নিজের ট্রান্সক্রিপ্ট ফাইল দেব" বাছাই করলে প্রযোজ্য) — .srt, .vtt বা প্লেইন টেক্সট</label>
@@ -1226,6 +1239,14 @@ async def upload_video(
             detail=(
                 f"invalid engine: {engine!r} "
                 f"(allowed: {', '.join(job_config.ALLOWED_ENGINES)})"
+            ),
+        )
+    if target_lang is not None and target_lang not in job_config.ALLOWED_TARGET_LANGS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"invalid target lang: {target_lang!r} "
+                f"(allowed: {', '.join(job_config.ALLOWED_TARGET_LANGS)})"
             ),
         )
 
