@@ -670,8 +670,10 @@ def home() -> HTMLResponse:
     engine_checked_gemini = (
         'checked' if default_engine == "gemini_only" else ''
     )
-    body = f"""<h1>Manhwa Video Dubber</h1>
-  <p>Upload a Chinese-subtitled manhwa explain video to start auto-dubbing.</p>
+    body = f"""<section class="hero-panel">
+    <h1>Manhwa Video Dubber</h1>
+    <p>Upload a Chinese-subtitled manhwa explain video to start auto-dubbing.</p>
+  </section>
   <form id="upload-form" enctype="multipart/form-data">
     <label for="file">Video (mp4/mkv/mov/avi/webm/flv/wmv/m4v)</label>
     <input type="file" id="file" name="file"
@@ -693,8 +695,6 @@ def home() -> HTMLResponse:
     <button type="submit" id="upload-submit">System Start</button>
   </form>
   <div id="upload-error" class="error-banner" hidden></div>
-  <p><a href="/settings">Gemini API key settings</a></p>
-  <p><a href="/history">ইতিহাস (last {history_store.HISTORY_LIMIT} jobs)</a></p>
   <script>
     var form = document.getElementById('upload-form');
     var submitBtn = document.getElementById('upload-submit');
@@ -764,7 +764,7 @@ def home() -> HTMLResponse:
         }});
     }});
   </script>"""
-    return HTMLResponse(ui.page("Manhwa Video Dubber", body))
+    return HTMLResponse(ui.page("Manhwa Video Dubber", body, active="home"))
 
 
 def _render_chain_final_result(job_id: str, stage: str) -> HTMLResponse:
@@ -904,24 +904,7 @@ def settings_page() -> HTMLResponse:
         """
         for k in keys
     )
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Manhwa Video Dubber — Settings</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="{ui.FONTS_HREF}" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css">
-</head>
-<body>
-<div class="grain"></div>
-  <header class="site-header">
-    <a class="brand" href="/">Manhwa Video Dubber</a>
-    <span class="page-title">Settings</span>
-  </header>
-  <main class="site-content">
-  <h1>Manhwa Video Dubber — Settings</h1>
+    body = f"""<h1>Manhwa Video Dubber — Settings</h1>
   <h2>Add Gemini API key</h2>
   <form method="post" action="/settings/keys">
     <label for="key">Key</label>
@@ -955,16 +938,10 @@ def settings_page() -> HTMLResponse:
         alert('Error: ' + (data.detail || res.status));
       }}
     }}
-  </script>
-  <nav class="page-nav">
-    <a href="javascript:history.back()">আগের পাতায় যান</a>
-    <span class="page-nav-sep" aria-hidden="true">·</span>
-    <a href="/">হোমে যান</a>
-  </nav>
-  </main>
-</body>
-</html>"""
-    return HTMLResponse(html)
+  </script>"""
+    return HTMLResponse(
+        ui.page("Manhwa Video Dubber — Settings", body, active="settings")
+    )
 
 
 @app.post("/settings/keys")
@@ -1183,7 +1160,7 @@ def history_page() -> HTMLResponse:
       }});
     }});
   </script>"""
-    return HTMLResponse(ui.page("Job history — Manhwa Video Dubber", body))
+    return HTMLResponse(ui.page("Job history — Manhwa Video Dubber", body, active="history"))
 
 
 def _job_is_stale_running(job_id, status):

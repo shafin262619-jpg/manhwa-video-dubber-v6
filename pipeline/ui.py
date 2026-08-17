@@ -1,7 +1,8 @@
-"""Shared HTML chrome for the web UI (UI1 visual polish).
+"""Shared HTML chrome for the web UI (F13 "control deck" redesign).
 
 Small helpers so every page renders with the same stylesheet link and a
-consistent header/nav. Pure presentation only - no behavior, no logic.
+consistent left-rail nav + header. Pure presentation only - no behavior,
+no logic.
 """
 
 STYLESHEET_HREF = "/static/style.css"
@@ -12,14 +13,72 @@ FONTS_HREF = (
     "family=IBM+Plex+Mono:wght@400;500&display=swap"
 )
 
+# (route, label, small inline icon) - kept as plain geometric SVGs so the
+# nav never depends on an icon-font CDN.
+_NAV_ITEMS = [
+    (
+        "home",
+        "/",
+        "Home",
+        '<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">'
+        '<path d="M3 9.5L10 4l7 5.5" stroke="currentColor" stroke-width="1.6" '
+        'stroke-linecap="round" stroke-linejoin="round"/>'
+        '<path d="M5 8.5V16a1 1 0 0 0 1 1h3v-4.5h2V17h3a1 1 0 0 0 1-1V8.5" '
+        'stroke="currentColor" stroke-width="1.6" stroke-linecap="round" '
+        'stroke-linejoin="round"/></svg>',
+    ),
+    (
+        "history",
+        "/history",
+        "History",
+        '<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">'
+        '<circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.6"/>'
+        '<path d="M10 6v4l3 2" stroke="currentColor" stroke-width="1.6" '
+        'stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    ),
+    (
+        "settings",
+        "/settings",
+        "Settings",
+        '<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">'
+        '<path d="M3 6h8M14 6h3M3 14h3M9 14h8" stroke="currentColor" '
+        'stroke-width="1.6" stroke-linecap="round"/>'
+        '<circle cx="11" cy="6" r="2" stroke="currentColor" stroke-width="1.6"/>'
+        '<circle cx="6" cy="14" r="2" stroke="currentColor" stroke-width="1.6"/>'
+        "</svg>",
+    ),
+]
 
-def page_head(title):
-    """Open the HTML document with the shared fonts + stylesheet linked.
 
-    Same font stack and design tokens as BlueprintTube (UI2): Baloo Da 2 /
-    Hind Siliguri / IBM Plex Mono via Google Fonts, so the two sibling
-    pipelines share one visual identity.
+def _sidebar(active=None):
+    """Left rail: brand + tally dot, then Home / History / Settings.
+
+    Collapses to a horizontal top bar on narrow screens (pure CSS, no JS).
     """
+    links = []
+    for key, href, label, icon in _NAV_ITEMS:
+        active_class = " is-active" if key == active else ""
+        links.append(
+            f'<a class="side-link{active_class}" href="{href}">'
+            f'<span class="side-icon">{icon}</span>'
+            f'<span class="side-label">{label}</span></a>'
+        )
+    nav = "\n    ".join(links)
+    return f"""<aside class="app-sidebar">
+  <a class="side-brand" href="/">
+    <span class="side-brand-dot" aria-hidden="true"></span>
+    <span>Manhwa Video Dubber</span>
+  </a>
+  <nav class="side-nav">
+    {nav}
+  </nav>
+</aside>
+"""
+
+
+def page_head(title, active=None):
+    """Open the HTML document, link shared fonts + stylesheet, and open
+    the app shell (sidebar + main column)."""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -32,31 +91,31 @@ def page_head(title):
 </head>
 <body>
 <div class="grain"></div>
+<div class="app-shell">
+{_sidebar(active)}<div class="app-main">
 """
 
 
 def site_header(page_title):
-    """Shared header: home link + page title + history nav, then content."""
+    """Slim in-column top bar (page title only - nav lives in the sidebar
+    now), then open the content well."""
     return f"""<header class="site-header">
-  <a class="brand" href="/">Manhwa Video Dubber</a>
   <span class="page-title">{page_title}</span>
-  <nav class="site-nav">
-    <a class="nav-link" href="/history">ইতিহাস</a>
-  </nav>
 </header>
 <main class="site-content">
 """
 
 
-def page(title, body):
-    """Full HTML document: shared head + header + body in a main wrapper.
+def page(title, body, active=None):
+    """Full HTML document: shared head + sidebar + header + body in a main
+    wrapper.
 
-    F10.5: every page ends with a consistent back/home nav so users never get
-    stranded — "আগের পাতায় যান" (``history.back()``) first, then "হোমে যান".
-    Route-level "Back to home" links were removed in favor of this one place.
+    F10.5: every page ends with a consistent back/home nav so users never
+    get stranded - "আগের পাতায় যান" (``history.back()``) first, then
+    "হোমে যান".
     """
     return (
-        page_head(title)
+        page_head(title, active)
         + site_header(title)
         + body
         + '\n<nav class="page-nav">\n'
@@ -64,5 +123,8 @@ def page(title, body):
         '  <span class="page-nav-sep" aria-hidden="true">·</span>\n'
         '  <a href="/">হোমে যান</a>\n'
         "</nav>\n"
-        + "\n</main>\n</body>\n</html>\n"
+        + "\n</main>\n"
+        + "</div><!-- /app-main -->\n"
+        + "</div><!-- /app-shell -->\n"
+        + "</body>\n</html>\n"
     )
