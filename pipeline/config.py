@@ -206,3 +206,14 @@ SUBTITLE_MAX_REPAIR_ATTEMPTS = 3
 # duration is below this fraction of Whisper's independently-measured
 # spoken-audio duration (QA verification, D1).
 SUBTITLE_COVERAGE_MISMATCH_RATIO = 0.75
+
+# F12b: a consecutive pair of uploaded-transcript entries (SRT/VTT) whose gap
+# (start of the next minus end of the previous) exceeds this many seconds is
+# treated as missing content and re-extracted from the video with Gemini.
+# Mirrors the QA flag threshold SUBTITLE_GAP_FLAG_THRESHOLD_SEC above.
+TRANSCRIPT_GAP_FILL_THRESHOLD_SEC = 6.0
+
+# Cap on the number of gap windows re-extracted per upload job (largest gaps
+# first). None = unlimited (default). Guards the shared per-job Gemini
+# CallBudget from a transcript with many tiny holes.
+TRANSCRIPT_GAP_FILL_MAX_WINDOWS = None

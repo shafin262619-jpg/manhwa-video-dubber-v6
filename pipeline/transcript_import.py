@@ -19,7 +19,7 @@ import logging
 import re
 from pathlib import Path
 
-from pipeline import video_ingest
+from pipeline import config, subtitle_extract, video_ingest
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +220,146 @@ def _distribute_freeform(texts, duration_sec):
         end = round((index + 1) * step, 3)
         entries.append({"text": text, "start_sec": start, "end_sec": end})
     return entries
+
+
+def detect_gaps(entries, threshold_sec=config.TRANSCRIPT_GAP_FILL_THRESHOLD_SEC):
+    """Find video-time windows missing content between consecutive entries.
+
+    ``entries`` are subtitle dicts with ``start_sec`` / ``end_sec``; they are
+    sorted on a copy (the caller's list is never mutated). A gap
+    ``[previous_end, start)`` is reported only when
+    ``start - previous_end > threshold_sec``, where ``previous_end`` tracks the
+    running latest end so overlapping entries never create spurious gaps.
+    Untimed or malformed entries are skipped (free-form lines before timing is
+    distributed).
+
+    Returns a chronological list of ``{"start_sec", "end_sec"}`` windows.
+    """
+    timed = []
+    for entry in entries:
+        try:
+            start = float(entry["start_sec"])
+            end = float(entry["end_sec"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start < 0 or end < start:
+            continue
+        timed.append((start, end))
+    timed.sort(key=lambda pair: pair[0])
+    gaps = []
+    previous_end = None
+    for start, end in timed:
+        if previous_end is not None and start - previous_end > threshold_sec:
+            gaps.append({"start_sec": previous_end, "end_sec": start})
+        if previous_end is None or end > previous_end:
+            previous_end = end
+    return gaps
+
+
+def fill_gaps(job_id, result, upload_root=None, call_budget=None, logger_=None,
+              threshold_sec=None, max_windows=None):
+    """Best-effort re-extraction of missing windows in an uploaded transcript.
+
+    ``result`` is the :func:`import_transcript` result dict (the
+    ``subtitles_zh_raw.json`` schema). Missing windows between consecutive
+    timestamped entries are re-extracted from the source video with
+    :func:`subtitle_extract.extract_window` (largest first, capped at
+    ``max_windows``); the found entries are merged chronologically back into
+    ``result["subtitles"]`` in the exact same schema and
+    ``subtitles_zh_raw.json`` is re-saved when anything was added.
+
+    F12b: never blocks the pipeline and never retries. A window whose
+    re-extraction fails (missing source video / no keys / Gemini error) is
+    logged, counted in ``stats["failed"]`` and skipped; the transcript is used
+    as-is for everything downstream.
+
+    Returns ``(result, stats)`` where ``stats`` holds ``detected`` (gaps
+    found), ``attempted`` (windows actually re-extracted), ``filled``,
+    ``failed``, ``added_entries`` and a per-window ``windows`` list of
+    ``{"start_sec", "end_sec", "outcome", "entries"}``.
+    """
+    log = logger_ or logger
+    if threshold_sec is None:
+        threshold_sec = config.TRANSCRIPT_GAP_FILL_THRESHOLD_SEC
+    if max_windows is None:
+        max_windows = config.TRANSCRIPT_GAP_FILL_MAX_WINDOWS
+
+    stats = {
+        "detected": 0,
+        "attempted": 0,
+        "filled": 0,
+        "failed": 0,
+        "added_entries": 0,
+        "windows": [],
+    }
+    gaps = detect_gaps(result.get("subtitles") or [], threshold_sec)
+    stats["detected"] = len(gaps)
+    if not gaps:
+        return result, stats
+
+    ordered = sorted(
+        gaps,
+        key=lambda gap: gap["end_sec"] - gap["start_sec"],
+        reverse=True,
+    )
+    if max_windows is not None:
+        ordered = ordered[:max_windows]
+
+    added = []
+    for gap in ordered:
+        stats["attempted"] += 1
+        window = {
+            "start_sec": gap["start_sec"],
+            "end_sec": gap["end_sec"],
+            "outcome": "failed",
+            "entries": 0,
+        }
+        try:
+            found = subtitle_extract.extract_window(
+                job_id,
+                gap["start_sec"],
+                gap["end_sec"],
+                upload_root=upload_root,
+                call_budget=call_budget,
+                logger_=log,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort, never raise
+            log.warning(
+                "gap-fill job %s window [%.3f, %.3f) raised: %s",
+                job_id, gap["start_sec"], gap["end_sec"], exc,
+            )
+            found = None
+        if found is None:
+            stats["failed"] += 1
+            log.warning(
+                "gap-fill job %s window [%.3f, %.3f): re-extraction failed, "
+                "gap left unfilled",
+                job_id, gap["start_sec"], gap["end_sec"],
+            )
+        else:
+            window["outcome"] = "filled"
+            window["entries"] = len(found)
+            stats["filled"] += 1
+            stats["added_entries"] += len(found)
+            added.extend(found)
+            log.info(
+                "gap-fill job %s window [%.3f, %.3f): found %d entries",
+                job_id, gap["start_sec"], gap["end_sec"], len(found),
+            )
+        stats["windows"].append(window)
+
+    if added:
+        result = dict(result)
+        current = result.get("subtitles") or []
+        result["subtitles"] = sorted(
+            current + added,
+            key=lambda entry: float(entry.get("start_sec", 0.0)),
+        )
+        upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
+        (upload_root / job_id / "subtitles_zh_raw.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    return result, stats
 
 
 def import_transcript(job_id, upload_root=None):

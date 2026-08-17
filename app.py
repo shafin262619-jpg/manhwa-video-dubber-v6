@@ -62,6 +62,14 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# F12b: shown in the job status when the user-transcript gap-fill could not
+# re-extract every missing window from the video. Non-blocking — the rest of
+# the pipeline still runs with the transcript as-is.
+TRANSCRIPT_GAP_FILL_WARNING_BN = (
+    "আপনার আপলোড করা ট্রান্সক্রিপ্টে কিছু সময়ের ব্যবধান ভিডিও থেকে "
+    "পুনরায় নিষ্কাশন করা যায়নি; পাইপলাইনের বাকি অংশ স্বাভাবিকভাবে চলছে।"
+)
+
 
 def _friendly_error(exc: Exception) -> str:
     """Short, human-readable summary of a pipeline-stage failure.
@@ -252,6 +260,14 @@ def _run_upload_pipeline(job_id):
             # config.MAX_API_CALLS_PER_JOB calls for a single job run.
             budget = gemini_rotation.CallBudget(config.MAX_API_CALLS_PER_JOB)
             cfg = job_config.read_config(job_id) or {}
+            gap_stats = {
+                "detected": 0,
+                "attempted": 0,
+                "filled": 0,
+                "failed": 0,
+                "added_entries": 0,
+                "windows": [],
+            }
             if cfg.get("subtitle_source") == "user_transcript":
                 # F12a: the user uploaded their own transcript, so F1 (Gemini
                 # extraction) is skipped entirely — the uploaded content is
@@ -263,6 +279,21 @@ def _run_upload_pipeline(job_id):
                     transcript_import.import_transcript,
                     job_id,
                 )
+                # F12b: best-effort gap-fill for uploaded transcripts. Missing
+                # windows between consecutive timed entries are re-extracted
+                # from the video with Gemini; failures are non-blocking and
+                # only surface a Bengali warning in the job status below.
+                try:
+                    extraction, gap_stats = transcript_import.fill_gaps(
+                        job_id,
+                        extraction,
+                        call_budget=budget,
+                        logger_=job_logging.get_job_logger(job_id),
+                    )
+                except Exception as exc:  # noqa: BLE001 - gap-fill never breaks the chain
+                    logger.warning(
+                        "gap-fill raised for job %s (non-fatal): %s", job_id, exc
+                    )
             else:
                 extraction = job_status_store.run_stage(
                     job_id,
@@ -298,6 +329,10 @@ def _run_upload_pipeline(job_id):
             }
             if extraction["status"] != "ok":
                 extra["errors"] = _extraction_error_summary(extraction)
+            if gap_stats.get("detected"):
+                extra["gap_fill_stats"] = gap_stats
+                if gap_stats.get("failed"):
+                    extra["gap_fill_warning_bn"] = TRANSCRIPT_GAP_FILL_WARNING_BN
         job_status_store.write_status(
             job_id, "upload_pipeline", "done", extra=extra
         )
