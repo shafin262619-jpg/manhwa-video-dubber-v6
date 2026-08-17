@@ -34,7 +34,7 @@ from pathlib import Path
 from google import genai
 from google.genai import types as genai_types
 
-from pipeline import config, job_logging, key_store, subtitle_extract, video_ingest
+from pipeline import config, job_logging, key_store, lang_files, subtitle_extract, video_ingest
 
 logger = logging.getLogger(__name__)
 
@@ -134,17 +134,19 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None):
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = upload_root / job_id
-    in_path = job_dir / "subtitles_hi.json"
+    lang = lang_files.target_lang(job_id, upload_root)
+    sub_name = lang_files.subtitles_json(lang)
+    in_path = job_dir / sub_name
     if not in_path.exists():
-        raise FileNotFoundError(f"no subtitles_hi.json for job {job_id}")
+        raise FileNotFoundError(f"no {sub_name} for job {job_id}")
 
     job_logger = job_logging.get_job_logger(job_id, upload_root)
     entries = json.loads(in_path.read_text(encoding="utf-8"))
     if not isinstance(entries, list):
-        raise ValueError(f"malformed subtitles_hi.json for job {job_id}")
+        raise ValueError(f"malformed {sub_name} for job {job_id}")
 
     if not entries:
-        timestamps_path = job_dir / "timestamps_hi_auto.json"
+        timestamps_path = job_dir / lang_files.timestamps_auto(lang)
         timestamps_path.write_text("[]", encoding="utf-8")
         return {
             "job_id": job_id,
@@ -288,11 +290,11 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None):
         )
         running_end += duration_sec
 
-    voiceover_path = job_dir / "voiceover_hi.wav"
+    voiceover_path = job_dir / lang_files.voiceover_audio(lang)
     _normalize_and_concat(clip_paths, voiceover_path)
     total_sec = _probe_audio_duration(voiceover_path)
 
-    timestamps_path = job_dir / "timestamps_hi_auto.json"
+    timestamps_path = job_dir / lang_files.timestamps_auto(lang)
     timestamps_path.write_text(
         json.dumps(timestamps, ensure_ascii=False, indent=2), encoding="utf-8"
     )

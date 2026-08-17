@@ -29,18 +29,19 @@ so the completed stages are skipped, never re-run.
 
 from pathlib import Path
 
-from pipeline import full_auto_chain, render_final, video_ingest, voiceover_unify
+from pipeline import full_auto_chain, lang_files, render_final, video_ingest, voiceover_unify
 
 
 def _stage_artifacts(job_id, upload_root, mode):
     """Ordered (stage_name, artifact_path_or_callable) checks for a mode."""
     root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = root / job_id
+    lang = lang_files.target_lang(job_id, upload_root)
     artifacts = [
-        ("D2_voiceover", job_dir / "timestamps_hi_auto.json")
+        ("D2_voiceover", job_dir / lang_files.timestamps_auto(lang))
         if mode == "auto_tts"
-        else ("D3_align", job_dir / "timestamps_hi_upload.json"),
-        ("D4_unify", job_dir / "timestamps_hi_final.json"),
+        else ("D3_align", job_dir / lang_files.timestamps_upload(lang)),
+        ("D4_unify", job_dir / lang_files.timestamps_final(lang)),
         ("E1_guideline", job_dir / "edit_guideline.json"),
         ("E2_draft", job_dir / "draft_final_video.mp4"),
         ("F3_final", lambda: render_final.final_video_path(job_id).exists()),
@@ -51,14 +52,14 @@ def _stage_artifacts(job_id, upload_root, mode):
 def find_resume_point(job_id, upload_root=None):
     """Return the first stage whose artifact is missing, or None when complete.
 
-    ``"upload_pipeline"`` is returned when the job has no ``subtitles_hi.json``
-    yet (extraction/translation unfinished) — the D2+ chains have nothing to
-    resume until that exists. Never raises for a missing job dir: a job with no
-    ``subtitles_hi.json`` reports ``"upload_pipeline"``.
+    ``"upload_pipeline"`` is returned when the job has no translated-subtitle
+    file yet (extraction/translation unfinished) — the D2+ chains have nothing
+    to resume until that exists. Never raises for a missing job dir: a job with
+    no translated-subtitle file reports ``"upload_pipeline"``.
     """
     root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = root / job_id
-    if not (job_dir / "subtitles_hi.json").exists():
+    if not (job_dir / lang_files.subtitles_json(lang_files.target_lang(job_id, upload_root))).exists():
         return "upload_pipeline"
 
     mode = voiceover_unify.get_voice_source(job_id, upload_root) or "auto_tts"

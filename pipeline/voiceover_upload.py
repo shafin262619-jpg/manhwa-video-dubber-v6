@@ -46,7 +46,7 @@ from pathlib import Path
 from google import genai
 from google.genai import types as genai_types
 
-from pipeline import config, job_logging, key_store, video_ingest
+from pipeline import config, job_logging, key_store, lang_files, video_ingest
 from pipeline.subtitle_extract import _extract_json, call_with_rotation
 from pipeline.voiceover_auto import _probe_audio_duration, _run
 from pipeline.voiceover_unify import VoiceoverAlignmentError, _clamp_timestamps_to_audio
@@ -106,7 +106,8 @@ def save_uploaded_voiceover(job_id, audio_bytes, filename, upload_root=None):
         )
 
     job_logger = job_logging.get_job_logger(job_id, upload_root)
-    out_path = job_dir / "voiceover_hi.wav"
+    lang = lang_files.target_lang(job_id, upload_root)
+    out_path = job_dir / lang_files.voiceover_audio(lang)
     with tempfile.TemporaryDirectory(dir=str(job_dir)) as tmpdir:
         tmp_path = Path(tmpdir) / f"upload{ext}"
         tmp_path.write_bytes(audio_bytes)
@@ -325,20 +326,23 @@ def align_uploaded_voiceover(job_id, upload_root=None):
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = upload_root / job_id
-    audio_path = job_dir / "voiceover_hi.wav"
+    lang = lang_files.target_lang(job_id, upload_root)
+    audio_name = lang_files.voiceover_audio(lang)
+    audio_path = job_dir / audio_name
     if not audio_path.exists():
-        raise FileNotFoundError(f"no voiceover_hi.wav for job {job_id}")
+        raise FileNotFoundError(f"no {audio_name} for job {job_id}")
 
-    in_path = job_dir / "subtitles_hi.json"
+    sub_name = lang_files.subtitles_json(lang)
+    in_path = job_dir / sub_name
     if not in_path.exists():
-        raise FileNotFoundError(f"no subtitles_hi.json for job {job_id}")
+        raise FileNotFoundError(f"no {sub_name} for job {job_id}")
 
     job_logger = job_logging.get_job_logger(job_id, upload_root)
     entries = json.loads(in_path.read_text(encoding="utf-8"))
     if not isinstance(entries, list):
-        raise ValueError(f"malformed subtitles_hi.json for job {job_id}")
+        raise ValueError(f"malformed {sub_name} for job {job_id}")
 
-    timestamps_path = job_dir / "timestamps_hi_upload.json"
+    timestamps_path = job_dir / lang_files.timestamps_upload(lang)
     if not entries:
         timestamps_path.write_text("[]", encoding="utf-8")
         return {

@@ -39,7 +39,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from pipeline import video_ingest
+from pipeline import lang_files, video_ingest
 
 BLOCKING_FIELDS_ZH = ("serial", "text_zh", "start_sec", "end_sec")
 
@@ -263,9 +263,12 @@ def run_checks(job_id, upload_root=None):
         report.blocking_errors.append(f"job directory not found: {job_dir}")
         return report
 
+    lang = lang_files.target_lang(job_id, upload_root)
+    sub_name = lang_files.subtitles_json(lang)
+    ts_name = lang_files.timestamps_final(lang)
     zh_path = job_dir / "subtitles_zh.json"
-    hi_path = job_dir / "subtitles_hi.json"
-    ts_path = job_dir / "timestamps_hi_final.json"
+    hi_path = job_dir / sub_name
+    ts_path = job_dir / ts_name
     eg_path = job_dir / "edit_guideline.json"
 
     zh = None
@@ -283,21 +286,21 @@ def run_checks(job_id, upload_root=None):
         hi = _load_json_list(hi_path, report)
         if hi is not None:
             _check_subtitles_hi(zh, hi, report)
-        report.notes.append("C1 (subtitles_hi.json): present — checked")
+        report.notes.append(f"C1 ({sub_name}): present — checked")
     else:
         hi = None
         report.notes.append(
-            "C1 (subtitles_hi.json): not found — stage not done yet, skipped"
+            f"C1 ({sub_name}): not found — stage not done yet, skipped"
         )
 
     if ts_path.exists():
         ts = _load_json_list(ts_path, report)
         if ts is not None:
             _check_timestamps_final(hi, ts, report)
-        report.notes.append("D4 (timestamps_hi_final.json): present — checked")
+        report.notes.append(f"D4 ({ts_name}): present — checked")
     else:
         report.notes.append(
-            "D4 (timestamps_hi_final.json): not found — stage not done yet, skipped"
+            f"D4 ({ts_name}): not found — stage not done yet, skipped"
         )
 
     if eg_path.exists():

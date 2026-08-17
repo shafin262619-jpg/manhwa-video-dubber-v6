@@ -27,7 +27,7 @@ import logging
 import subprocess
 from pathlib import Path
 
-from pipeline import config, video_ingest, voiceover_unify
+from pipeline import config, lang_files, video_ingest, voiceover_unify
 
 logger = logging.getLogger(__name__)
 
@@ -313,11 +313,14 @@ def build_draft_video(job_id, upload_root=None, progress_cb=None):
 
     guideline_path = job_dir / "edit_guideline.json"
     source = job_dir / "source.mp4"
-    voiceover = job_dir / "voiceover_hi.wav"
+    voiceover_name = lang_files.voiceover_audio(
+        lang_files.target_lang(job_id, upload_root)
+    )
+    voiceover = job_dir / voiceover_name
     for path, name in (
         (guideline_path, "edit_guideline.json"),
         (source, "source.mp4"),
-        (voiceover, "voiceover_hi.wav"),
+        (voiceover, voiceover_name),
     ):
         if not path.exists():
             raise FileNotFoundError(f"no {name} for job {job_id}")

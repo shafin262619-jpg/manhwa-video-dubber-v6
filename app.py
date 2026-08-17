@@ -28,6 +28,7 @@ from pipeline import (
     job_logging,
     job_status as job_status_store,
     key_store,
+    lang_files,
     render_final,
     resume,
     review,
@@ -168,7 +169,10 @@ def _process_auto_tts(job_id):
     errors so the caller can surface them.
     """
     job_dir = video_ingest.UPLOAD_ROOT / job_id
-    if not (job_dir / "subtitles_hi.json").exists():
+    if not (
+        job_dir
+        / lang_files.subtitles_json(lang_files.target_lang(job_id))
+    ).exists():
         return "pending"
     voiceover_auto.generate_auto_voiceover(job_id)
     _continue_from_voiceover(job_id)
@@ -194,7 +198,10 @@ def _resume_pipeline_extra(job_id):
         pass
     try:
         hi = json.loads(
-            (job_dir / "subtitles_hi.json").read_text(encoding="utf-8")
+            (
+                job_dir
+                / lang_files.subtitles_json(lang_files.target_lang(job_id))
+            ).read_text(encoding="utf-8")
         )
         if isinstance(hi, list):
             extra["serials"] = len(hi)
@@ -234,7 +241,10 @@ def _run_upload_pipeline(job_id):
     """
     try:
         job_dir = video_ingest.UPLOAD_ROOT / job_id
-        if (job_dir / "subtitles_hi.json").exists():
+        if (
+            job_dir
+            / lang_files.subtitles_json(lang_files.target_lang(job_id))
+        ).exists():
             extra = _resume_pipeline_extra(job_id)
         else:
             # U2b: the whole upload chain (B1 + C1) shares one per-job
@@ -1409,10 +1419,11 @@ def job_status(job_id: str) -> dict:
 @app.get("/download/{job_id}/subtitles")
 def download_subtitles(job_id: str, format: str = Query("srt")) -> FileResponse:
     fmt = format.lower()
+    lang = lang_files.target_lang(job_id)
     files = {
-        "srt": ("subtitles_hi.srt", "text/plain"),
-        "txt": ("subtitles_hi_plain.txt", "text/plain"),
-        "json": ("subtitles_hi.json", "application/json"),
+        "srt": (lang_files.subtitles_srt(lang), "text/plain"),
+        "txt": (lang_files.subtitles_plain(lang), "text/plain"),
+        "json": (lang_files.subtitles_json(lang), "application/json"),
     }
     if fmt not in files:
         raise HTTPException(status_code=400, detail=f"unsupported format: {format}")
@@ -1429,9 +1440,10 @@ def download_subtitles(job_id: str, format: str = Query("srt")) -> FileResponse:
 @app.get("/download/{job_id}/voiceover")
 def download_voiceover(job_id: str, format: str = Query("wav")) -> FileResponse:
     fmt = format.lower()
+    lang = lang_files.target_lang(job_id)
     files = {
-        "wav": ("voiceover_hi.wav", "audio/wav"),
-        "timestamps": ("timestamps_hi_auto.json", "application/json"),
+        "wav": (lang_files.voiceover_audio(lang), "audio/wav"),
+        "timestamps": (lang_files.timestamps_auto(lang), "application/json"),
     }
     if fmt not in files:
         raise HTTPException(status_code=400, detail=f"unsupported format: {format}")
@@ -1448,9 +1460,10 @@ def download_voiceover(job_id: str, format: str = Query("wav")) -> FileResponse:
 @app.get("/download/{job_id}/voiceover_upload")
 def download_voiceover_upload(job_id: str, format: str = Query("timestamps")) -> FileResponse:
     fmt = format.lower()
+    lang = lang_files.target_lang(job_id)
     files = {
-        "timestamps": ("timestamps_hi_upload.json", "application/json"),
-        "wav": ("voiceover_hi.wav", "audio/wav"),
+        "timestamps": (lang_files.timestamps_upload(lang), "application/json"),
+        "wav": (lang_files.voiceover_audio(lang), "audio/wav"),
     }
     if fmt not in files:
         raise HTTPException(status_code=400, detail=f"unsupported format: {format}")
@@ -1508,6 +1521,9 @@ def align_uploaded_page(job_id: str) -> HTMLResponse:
 
     status = result["status"]
     fallback_serials = result["fallback_serials"] or []
+    lang = lang_files.target_lang(job_id)
+    ts_name = lang_files.timestamps_upload(lang)
+    wav_name = lang_files.voiceover_audio(lang)
     warning = ""
     if status != "ok":
         warning = (
@@ -1522,9 +1538,9 @@ def align_uploaded_page(job_id: str) -> HTMLResponse:
   <p>Audio duration: {result.get("total_sec")} sec.</p>
   {warning}
   <p>Timestamps:
-    <a href="/download/{job_id}/voiceover_upload?format=timestamps">timestamps_hi_upload.json</a></p>
+    <a href="/download/{job_id}/voiceover_upload?format=timestamps">{ts_name}</a></p>
   <p>Audio:
-    <a href="/download/{job_id}/voiceover_upload?format=wav">voiceover_hi.wav</a></p>
+    <a href="/download/{job_id}/voiceover_upload?format=wav">{wav_name}</a></p>
   <p><a href="/voiceover/{job_id}/choose">Change voice source</a></p>
 """
     return HTMLResponse(ui.page(f"Alignment — Manhwa Video Dubber", body))
@@ -1625,10 +1641,11 @@ def voiceover_auto_page(job_id: str) -> HTMLResponse:
         status.get("stage") == "voiceover_auto" and status.get("state") == "done"
     ):
         job_dir = video_ingest.UPLOAD_ROOT / job_id
-        if not (job_dir / "subtitles_hi.json").exists():
+        sub_name = lang_files.subtitles_json(lang_files.target_lang(job_id))
+        if not (job_dir / sub_name).exists():
             raise HTTPException(
                 status_code=404,
-                detail=f"no subtitles_hi.json for job {job_id}",
+                detail=f"no {sub_name} for job {job_id}",
             )
         _start_stage(
             job_id, "voiceover_auto", _run_voiceover_auto
@@ -1661,15 +1678,18 @@ def _render_auto_tts_result(job_id: str) -> HTMLResponse:
             "<p>No active Gemini key — add one in Settings first.</p>"
         )
     else:
+        lang = lang_files.target_lang(job_id)
         links = []
         if result.get("voiceover_path"):
             links.append(
-                f'<p>Audio: <a href="/download/{job_id}/voiceover?format=wav">voiceover_hi.wav</a> '
+                f'<p>Audio: <a href="/download/{job_id}/voiceover?format=wav">'
+                f'{lang_files.voiceover_audio(lang)}</a> '
                 f'({result.get("total_sec")} sec)</p>'
             )
         links.append(
             f'<p>Timestamps: '
-            f'<a href="/download/{job_id}/voiceover?format=timestamps">timestamps_hi_auto.json</a></p>'
+            f'<a href="/download/{job_id}/voiceover?format=timestamps">'
+            f'{lang_files.timestamps_auto(lang)}</a></p>'
         )
         warning = (
             f"<p>TTS failed for {len(failed)} line(s): {failed}. "

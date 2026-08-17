@@ -31,7 +31,7 @@ import json
 import logging
 from pathlib import Path
 
-from pipeline import config, video_ingest
+from pipeline import config, lang_files, video_ingest
 
 logger = logging.getLogger(__name__)
 
@@ -136,11 +136,12 @@ def build_edit_guideline(job_id, upload_root=None):
         raise FileNotFoundError(f"job not found: {job_id}")
 
     zh_path = job_dir / "subtitles_zh.json"
-    hi_path = job_dir / "timestamps_hi_final.json"
+    ts_name = lang_files.timestamps_final(lang_files.target_lang(job_id, upload_root))
+    hi_path = job_dir / ts_name
     if not zh_path.exists():
         raise FileNotFoundError(f"no subtitles_zh.json for job {job_id}")
     if not hi_path.exists():
-        raise FileNotFoundError(f"no timestamps_hi_final.json for job {job_id}")
+        raise FileNotFoundError(f"no {ts_name} for job {job_id}")
 
     zh_by_serial = _index_by_serial(_load_json_list(zh_path))
     hi_by_serial = _index_by_serial(_load_json_list(hi_path))

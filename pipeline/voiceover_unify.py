@@ -15,7 +15,7 @@ import json
 import logging
 from pathlib import Path
 
-from pipeline import video_ingest
+from pipeline import lang_files, video_ingest
 from pipeline.voiceover_auto import _probe_audio_duration
 
 logger = logging.getLogger(__name__)
@@ -73,12 +73,15 @@ def get_voice_source(job_id, upload_root=None):
         return None
 
 
-# D2/D3 timestamp files, keyed by the voice source mode. Both carry the same
-# shape (serial, start_sec, end_sec) with different per-path flag names.
-SOURCE_TIMESTAMPS_FILES = {
-    "auto_tts": "timestamps_hi_auto.json",
-    "user_upload": "timestamps_hi_upload.json",
-}
+# D2/D3 timestamp file NAME templates, keyed by the voice source mode. Both
+# carry the same shape (serial, start_sec, end_sec) with different per-path
+# flag names. The language fragment is applied via lang_files so a non-Hindi
+# target_lang produces correctly-named files (F12b Part B).
+def source_timestamps_name(mode, lang):
+    """``timestamps_<lang>_auto.json`` (D2) or ``_upload.json`` (D3)."""
+    if mode == "auto_tts":
+        return lang_files.timestamps_auto(lang)
+    return lang_files.timestamps_upload(lang)
 
 
 def _load_timestamps_list(path):
@@ -195,16 +198,16 @@ def _clamp_consecutive_overlaps(entries):
     return out, clamped_serials
 
 
-def _missing_serials(job_dir, final_entries):
+def _missing_serials(job_dir, final_entries, lang):
     """Subtitle serials with no matching voiceover timestamp, if known.
 
-    Reads ``subtitles_hi.json`` when present (both D2 and D3 align to its
+    Reads ``subtitles_<lang>.json`` when present (both D2 and D3 align to its
     serials) and returns the sorted list of serials that exist there but have
     no entry in the unified timestamps. When the subtitle file is missing or
     unreadable, returns ``[]`` so this check never breaks a caller that only
     works with timestamps (e.g. the direct D4 unit fixtures).
     """
-    subs_path = job_dir / "subtitles_hi.json"
+    subs_path = job_dir / lang_files.subtitles_json(lang)
     if not subs_path.exists():
         return []
     try:
@@ -264,15 +267,17 @@ def unify_voiceover_timestamps(job_id, upload_root=None):
             f"(choose one via /voiceover/{job_id}/choose first)"
         )
 
-    source_name = SOURCE_TIMESTAMPS_FILES[mode]
+    lang = lang_files.target_lang(job_id, upload_root)
+    source_name = source_timestamps_name(mode, lang)
     source_path = job_dir / source_name
     if not source_path.exists():
         phase = "auto TTS (D2)" if mode == "auto_tts" else "uploaded voiceover alignment (D3)"
         raise FileNotFoundError(f"no {source_name} for job {job_id} ({phase} not done yet?)")
 
-    audio_path = job_dir / "voiceover_hi.wav"
+    audio_name = lang_files.voiceover_audio(lang)
+    audio_path = job_dir / audio_name
     if not audio_path.exists():
-        raise FileNotFoundError(f"no voiceover_hi.wav for job {job_id}")
+        raise FileNotFoundError(f"no {audio_name} for job {job_id}")
 
     entries = _load_timestamps_list(source_path)
     entries.sort(key=lambda entry: int(entry.get("serial", 0)))
@@ -306,7 +311,7 @@ def unify_voiceover_timestamps(job_id, upload_root=None):
                     job_id, len(audio_clamped), audio_total_sec, audio_clamped,
                 )
 
-    missing = _missing_serials(job_dir, final)
+    missing = _missing_serials(job_dir, final, lang)
     if missing:
         logger.error(
             "job %s: %d subtitle segment(s) have no aligned voiceover timestamp: %s",
@@ -318,7 +323,7 @@ def unify_voiceover_timestamps(job_id, upload_root=None):
             "or re-run the alignment before continuing."
         )
 
-    out_path = job_dir / "timestamps_hi_final.json"
+    out_path = job_dir / lang_files.timestamps_final(lang)
     out_path.write_text(
         json.dumps(final, ensure_ascii=False, indent=2), encoding="utf-8"
     )

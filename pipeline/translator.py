@@ -30,7 +30,7 @@ from pathlib import Path
 from google import genai
 from google.genai import types as genai_types
 
-from pipeline import config, job_logging, key_store, subtitle_extract, video_ingest
+from pipeline import config, job_logging, key_store, lang_files, subtitle_extract, video_ingest
 
 logger = logging.getLogger(__name__)
 
@@ -286,13 +286,14 @@ def translate_subtitles(
 
     output = _build_output(entries, translations, fallback)
 
-    (job_dir / "subtitles_hi.json").write_text(
+    lang = lang_files.target_lang(job_id, upload_root)
+    (job_dir / lang_files.subtitles_json(lang)).write_text(
         json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    (job_dir / "subtitles_hi.srt").write_text(
+    (job_dir / lang_files.subtitles_srt(lang)).write_text(
         build_srt(output), encoding="utf-8"
     )
-    (job_dir / "subtitles_hi_plain.txt").write_text(
+    (job_dir / lang_files.subtitles_plain(lang)).write_text(
         build_plain(output), encoding="utf-8"
     )
     return output
