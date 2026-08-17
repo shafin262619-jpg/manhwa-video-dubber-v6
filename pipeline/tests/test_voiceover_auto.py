@@ -35,7 +35,7 @@ def _map_tts(mapping):
     Values may be bytes (returned as audio) or callables (invoked; the result
     is returned, so a raising callable simulates a TTS failure).
     """
-    def fake_tts(key, text):
+    def fake_tts(key, text, voice_name):
         value = mapping[text]
         if callable(value):
             return value()
@@ -319,6 +319,66 @@ class VoiceoverAutoModuleTest(VoiceoverAutoBase):
         self.assertFalse(timestamps[1]["tts_failed"])
 
 
+class VoiceSelectionTest(VoiceoverAutoBase):
+    """F12f: the TTS voice name follows the job's target_lang."""
+
+    def _run_recording(self, voices):
+        with mock.patch.object(
+            voiceover_auto,
+            "_call_tts",
+            side_effect=lambda key, text, voice_name: (
+                voices.append(voice_name), self.clip_short
+            )[1],
+        ):
+            return voiceover_auto.generate_auto_voiceover(
+                self.job_id, upload_root=self.upload_root
+            )
+
+    def test_hi_default_job_uses_hindi_voice(self):
+        # No job_config.json -> default target_lang hi -> pre-F12f voice.
+        _make_subtitles(
+            self.job_dir,
+            [{"serial": 1, "text_zh": "A", "text_translated": "पहला"}],
+        )
+        voices = []
+        self._run_recording(voices)
+        self.assertEqual(voices, [config.TTS_VOICE_HINDI])
+
+    def test_bn_job_uses_bn_voice(self):
+        (self.job_dir / "job_config.json").write_text(
+            json.dumps({"job_id": self.job_id, "target_lang": "bn"}),
+            encoding="utf-8",
+        )
+        (self.job_dir / "subtitles_bn.json").write_text(
+            json.dumps(
+                [{"serial": 1, "text_zh": "A", "text_translated": "নমস্কার"}],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        voices = []
+        result = self._run_recording(voices)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(voices, [config.TTS_VOICE_BN])
+        self.assertTrue((self.job_dir / "voiceover_bn.wav").exists())
+
+    def test_en_job_uses_en_voice(self):
+        (self.job_dir / "job_config.json").write_text(
+            json.dumps({"job_id": self.job_id, "target_lang": "en"}),
+            encoding="utf-8",
+        )
+        (self.job_dir / "subtitles_en.json").write_text(
+            json.dumps(
+                [{"serial": 1, "text_zh": "A", "text_translated": "Hello"}],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        voices = []
+        self._run_recording(voices)
+        self.assertEqual(voices, [config.TTS_VOICE_EN])
+
+
 class VoiceoverAutoEndpointTest(VoiceoverAutoBase):
     def setUp(self):
         super().setUp()
@@ -402,7 +462,7 @@ class VoiceoverAutoEndpointTest(VoiceoverAutoBase):
 
         calls = []
 
-        def recording_tts(key, text):
+        def recording_tts(key, text, voice_name):
             calls.append(text)
             return self.clip_long
 

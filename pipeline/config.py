@@ -9,7 +9,24 @@ SPEED_RATIO_MIN = 0.5
 SPEED_RATIO_MAX = 2.0
 
 # Placeholder voice for Hindi TTS. Tune later.
+#
+# Gemini TTS voices are stylistic descriptors, NOT language-specific: the
+# language of the speech comes from the input text, and the docs' supported
+# languages table includes Bangla (bn), Hindi (hi) and English (en) with the
+# same 30 voice_name options. ``TTS_VOICES`` maps each supported target_lang
+# to a voice; hi keeps the long-standing placeholder so its output is
+# byte-identical to pre-F12f, bn/en get distinct placeholders (tune later).
 TTS_VOICE_HINDI = "Aoede"
+TTS_VOICE_BN = "Zephyr"
+TTS_VOICE_EN = "Puck"
+
+# Single source of truth for the TTS voice per target_lang (F12f).
+# Unknown/newer language codes fall back to the Hindi voice.
+TTS_VOICES = {
+    "hi": TTS_VOICE_HINDI,
+    "bn": TTS_VOICE_BN,
+    "en": TTS_VOICE_EN,
+}
 
 # Model used for audio-generating TTS (Gemini TTS path).
 #

@@ -42,8 +42,12 @@ logger = logging.getLogger(__name__)
 CLIP_DIR_NAME = "auto_tts_clips"
 
 
-def _call_tts(key, text):
-    """Send one line to Gemini TTS and return the raw audio bytes."""
+def _call_tts(key, text, voice_name):
+    """Send one line to Gemini TTS and return the raw audio bytes.
+
+    ``voice_name`` is the ``config.TTS_VOICES[target_lang]`` style voice
+    resolved by the caller; the spoken language itself comes from ``text``.
+    """
     client = genai.Client(api_key=key)
     response = client.models.generate_content(
         model=config.TTS_MODEL,
@@ -53,7 +57,7 @@ def _call_tts(key, text):
             speech_config=genai_types.SpeechConfig(
                 voice_config=genai_types.VoiceConfig(
                     prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
-                        voice_name=config.TTS_VOICE_HINDI
+                        voice_name=voice_name
                     )
                 )
             ),
@@ -128,14 +132,17 @@ def _normalize_and_concat(clip_paths, out_path):
 
 
 def generate_auto_voiceover(job_id, upload_root=None, call_budget=None):
-    """Generate the full Hindi voiceover for a job. Returns a result dict.
+    """Generate the full voiceover for a job. Returns a result dict.
 
-    Raises FileNotFoundError when the job has no ``subtitles_hi.json``.
-    Never raises on per-line TTS failures (silence placeholders are used).
+    The voice is picked per ``target_lang`` from ``config.TTS_VOICES`` (hi
+    keeps the pre-F12f placeholder voice). Raises FileNotFoundError when the
+    job has no ``subtitles_<target_lang>.json``. Never raises on per-line TTS
+    failures (silence placeholders are used).
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = upload_root / job_id
     lang = lang_files.target_lang(job_id, upload_root)
+    voice = config.TTS_VOICES.get(lang, config.TTS_VOICE_HINDI)
     sub_name = lang_files.subtitles_json(lang)
     in_path = job_dir / sub_name
     if not in_path.exists():
@@ -206,7 +213,7 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None):
             tts_failed = False
         elif text:
             audio, rotation, _ = subtitle_extract.call_with_rotation(
-                keys, rotation, _call_tts, text,
+                keys, rotation, _call_tts, text, voice,
                 call_budget=call_budget, logger_=job_logger,
             )
             if audio is not None:
@@ -254,7 +261,7 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None):
                 continue
             clip_path = clips_dir / f"serial_{serial}.wav"
             audio, rotation, _ = subtitle_extract.call_with_rotation(
-                keys, rotation, _call_tts, text,
+                keys, rotation, _call_tts, text, voice,
                 call_budget=call_budget, logger_=job_logger,
             )
             if audio is None:
