@@ -7,8 +7,8 @@ the E1 ``edit_guideline.json``:
   (extracted on-the-fly with ffmpeg from ``[target_start_sec,
   target_end_sec]`` — the browser never downloads the whole draft),
 - a trim timeline (source start/end controls) used by F2,
-- the Hindi subtitle text (``text_hi`` from ``subtitles_hi.json``) and the
-  line's target duration.
+- the translated subtitle text (``text_translated`` from the target-language
+  ``subtitles_<target_lang>.json``) and the line's target duration.
 
 Serials flagged ``extreme_speed_ratio`` / ``invalid_duration`` are pulled out
 into a highlighted section (banner on top + a highlighted box).
@@ -93,13 +93,14 @@ def _find_guideline_entry(guideline, serial):
 def get_review_items(job_id, upload_root=None):
     """Build the list of per-serial review items for a job.
 
-    Each item joins the E1 guideline timing with the B2 Hindi subtitle text:
-    ``{"serial", "text_hi", "source_start_sec", "source_end_sec",
+    Each item joins the E1 guideline timing with the B2 translated subtitle
+    text: ``{"serial", "text_translated", "source_start_sec", "source_end_sec",
     "target_start_sec", "target_end_sec", "source_duration_sec",
     "target_duration_sec", "pts_multiplier", "flagged", "flag_reason"}``.
 
     Raises FileNotFoundError when the job or ``edit_guideline.json`` is
-    missing. ``subtitles_hi.json`` is optional (missing text -> empty string).
+    missing. The target-language ``subtitles_<lang>.json`` is optional
+    (missing text -> empty string).
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = upload_root / job_id
@@ -119,13 +120,13 @@ def get_review_items(job_id, upload_root=None):
     if subtitles_path.exists():
         try:
             text_by_serial = {
-                serial: entry.get("text_hi", "")
+                serial: lang_files.entry_text(entry) or ""
                 for serial, entry in _index_by_serial(
                     _load_json_list(subtitles_path)
                 ).items()
             }
         except ValueError:
-            logger.warning("job %s: malformed subtitles_hi.json; ignoring", job_id)
+            logger.warning("job %s: malformed subtitles json; ignoring", job_id)
 
     items = []
     for entry in guideline:
@@ -142,7 +143,7 @@ def get_review_items(job_id, upload_root=None):
         items.append(
             {
                 "serial": serial,
-                "text_hi": text_by_serial.get(serial, ""),
+                "text_translated": text_by_serial.get(serial, ""),
                 "source_start_sec": round(source_start, 3),
                 "source_end_sec": round(source_end, 3),
                 "target_start_sec": round(target_start, 3),
@@ -171,7 +172,7 @@ def _render_item_block(job_id, item):
     <section class="{flagged_class.strip()}" id="serial-{serial}">
       <h2>Serial {serial}</h2>
       <video controls preload="metadata" src="/review/{job_id}/clip/{serial}"></video>
-      <p class="subtitle"><strong>text_hi:</strong> {html.escape(item["text_hi"])}</p>
+      <p class="subtitle"><strong>text_translated:</strong> {html.escape(item["text_translated"])}</p>
       <p class="duration">Target duration: {item["target_duration_sec"]}s
         (source {item["source_duration_sec"]}s, pts x{item["pts_multiplier"]})</p>
       {flag_html}

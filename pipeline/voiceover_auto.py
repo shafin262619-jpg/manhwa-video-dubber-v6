@@ -1,10 +1,11 @@
-"""Automatic Hindi voiceover generation via Gemini TTS.
+"""Automatic voiceover generation via Gemini TTS (target-language text).
 
-For every serial in ``subtitles_hi.json`` the Hindi text is sent to Gemini TTS
-in its own request (key rotation reused from
+For every serial in ``subtitles_<target_lang>.json`` the translated text is
+sent to Gemini TTS in its own request (key rotation reused from
 ``subtitle_extract.call_with_rotation``). Each resulting clip's real duration
 is measured with ffprobe, clips are concatenated in serial order, and
-per-line cumulative timestamps are written to ``timestamps_hi_auto.json``.
+per-line cumulative timestamps are written to
+``timestamps_<target_lang>_auto.json``.
 
 Resilience rules:
 
@@ -164,7 +165,9 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None):
         return {
             "job_id": job_id,
             "status": "tts_unavailable",
-            "failed_serials": [e.get("serial") for e in entries if e.get("text_hi")],
+            "failed_serials": [
+                e.get("serial") for e in entries if lang_files.entry_text(e)
+            ],
             "entries_count": len(entries),
             "total_sec": None,
             "voiceover_path": None,
@@ -181,7 +184,7 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None):
 
     for entry in entries:
         serial = entry.get("serial")
-        text_hi = (entry.get("text_hi") or "").strip()
+        text = (lang_files.entry_text(entry) or "").strip()
         clip_path = clips_dir / f"serial_{serial}.wav"
         tts_failed = True
 
@@ -201,9 +204,9 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None):
 
         if reuse_existing:
             tts_failed = False
-        elif text_hi:
+        elif text:
             audio, rotation, _ = subtitle_extract.call_with_rotation(
-                keys, rotation, _call_tts, text_hi,
+                keys, rotation, _call_tts, text,
                 call_budget=call_budget, logger_=job_logger,
             )
             if audio is not None:
@@ -245,13 +248,13 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None):
             serial = entry.get("serial")
             if serial not in failed_set:
                 continue
-            text_hi = (entry.get("text_hi") or "").strip()
-            if not text_hi:
+            text = (lang_files.entry_text(entry) or "").strip()
+            if not text:
                 still_failed.append(serial)
                 continue
             clip_path = clips_dir / f"serial_{serial}.wav"
             audio, rotation, _ = subtitle_extract.call_with_rotation(
-                keys, rotation, _call_tts, text_hi,
+                keys, rotation, _call_tts, text,
                 call_budget=call_budget, logger_=job_logger,
             )
             if audio is None:

@@ -121,7 +121,10 @@ def _call_gemini_align(key, audio_path, entries):
     client = genai.Client(api_key=key)
     uploaded = client.files.upload(file=str(audio_path))
     lines = json.dumps(
-        [{"serial": e.get("serial"), "text_hi": e.get("text_hi")} for e in entries],
+        [
+            {"serial": e.get("serial"), "text": lang_files.entry_text(e)}
+            for e in entries
+        ],
         ensure_ascii=False,
     )
     prompt = ALIGNMENT_PROMPT + "\n\nSUBTITLES:\n" + lines

@@ -120,11 +120,28 @@ class TranslatorFilenameIntegrationTest(unittest.TestCase):
     def test_hi_output_content_is_unchanged(self):
         out = self._translate("hi")
         self.assertEqual(len(out), 2)
-        self.assertEqual(out[0]["text_hi"], "नमस्ते")
+        self.assertEqual(out[0]["text_translated"], "नमस्ते")
         persisted = json.loads(
             (self.job_dir / "subtitles_hi.json").read_text(encoding="utf-8")
         )
         self.assertEqual(persisted[0]["serial"], 1)
+
+
+class EntryTextFieldTest(unittest.TestCase):
+    def test_prefers_translated_field(self):
+        entry = {"serial": 1, "text_translated": "নমস্কার", "text_hi": "नमस्ते"}
+        self.assertEqual(lang_files.entry_text(entry), "নমস্কার")
+
+    def test_falls_back_to_legacy_hi_field(self):
+        entry = {"serial": 1, "text_hi": "नमस्ते"}
+        self.assertEqual(lang_files.entry_text(entry), "नमस्ते")
+
+    def test_empty_translated_field_falls_back(self):
+        entry = {"serial": 1, "text_translated": "", "text_hi": "नमस्ते"}
+        self.assertEqual(lang_files.entry_text(entry), "नमस्ते")
+
+    def test_returns_none_when_absent(self):
+        self.assertIsNone(lang_files.entry_text({"serial": 1}))
 
 
 if __name__ == "__main__":

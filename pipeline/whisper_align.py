@@ -23,7 +23,7 @@ import re
 import unicodedata
 from difflib import SequenceMatcher
 
-from pipeline import config
+from pipeline import config, lang_files
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +194,7 @@ def match_words_to_entries(words, entries, min_ratio=None):
     cursor = 0
     matches = {}
     for entry in entries:
-        target = _norm_text(entry.get("text_hi"))
+        target = _norm_text(lang_files.entry_text(entry))
         if not target:
             continue
         best = None

@@ -61,8 +61,8 @@ class TranslateSuccessTest(TranslatorBase):
 
         self.assertEqual(len(output), 2)
         self.assertEqual([e["serial"] for e in output], [1, 2])
-        self.assertEqual(output[0]["text_hi"], "Namaste")
-        self.assertEqual(output[1]["text_hi"], "Duniya")
+        self.assertEqual(output[0]["text_translated"], "Namaste")
+        self.assertEqual(output[1]["text_translated"], "Duniya")
         self.assertFalse(output[0]["translation_fallback"])
         self.assertFalse(output[1]["translation_fallback"])
         self.assertEqual(output[0]["start_sec"], 0.0)
@@ -105,7 +105,7 @@ class CountMismatchTest(TranslatorBase):
         self.assertEqual(len(output), 2)
         for entry in output:
             self.assertTrue(entry["translation_fallback"])
-            self.assertEqual(entry["text_hi"], entry["text_zh"])
+            self.assertEqual(entry["text_translated"], entry["text_zh"])
 
     def test_retry_fixes_count(self):
         self._set_keys(["key-one"])
@@ -118,8 +118,8 @@ class CountMismatchTest(TranslatorBase):
         self.assertEqual(fake.call_count, 2)
         self.assertFalse(output[0]["translation_fallback"])
         self.assertFalse(output[1]["translation_fallback"])
-        self.assertEqual(output[0]["text_hi"], "Namaste")
-        self.assertEqual(output[1]["text_hi"], "Duniya")
+        self.assertEqual(output[0]["text_translated"], "Namaste")
+        self.assertEqual(output[1]["text_translated"], "Duniya")
 
     def test_no_active_keys_falls_back(self):
         with mock.patch.object(translator, "_call_gemini_text") as fake:
@@ -127,7 +127,7 @@ class CountMismatchTest(TranslatorBase):
         fake.assert_not_called()
         for entry in output:
             self.assertTrue(entry["translation_fallback"])
-            self.assertEqual(entry["text_hi"], entry["text_zh"])
+            self.assertEqual(entry["text_translated"], entry["text_zh"])
 
     def test_call_budget_cap_falls_back_without_raising(self):
         # U2b: an exhausted per-job CallBudget must degrade to the original
@@ -141,7 +141,7 @@ class CountMismatchTest(TranslatorBase):
         fake.assert_not_called()
         for entry in output:
             self.assertTrue(entry["translation_fallback"])
-            self.assertEqual(entry["text_hi"], entry["text_zh"])
+            self.assertEqual(entry["text_translated"], entry["text_zh"])
 
     def test_empty_lines_are_kept_not_translated(self):
         entries = [
@@ -156,9 +156,9 @@ class CountMismatchTest(TranslatorBase):
             output = self._translate()
 
         self.assertEqual(len(output), 2)
-        self.assertEqual(output[0]["text_hi"], "")
+        self.assertEqual(output[0]["text_translated"], "")
         self.assertFalse(output[0]["translation_fallback"])
-        self.assertEqual(output[1]["text_hi"], "Namaste")
+        self.assertEqual(output[1]["text_translated"], "Namaste")
         self.assertFalse(output[1]["translation_fallback"])
 
 
@@ -177,8 +177,8 @@ class BatchSplitRepairTest(TranslatorBase):
 
         self.assertEqual(fake.call_count, 4)
         self.assertEqual(len(output), 2)
-        self.assertEqual(output[0]["text_hi"], "Namaste")
-        self.assertEqual(output[1]["text_hi"], "Duniya")
+        self.assertEqual(output[0]["text_translated"], "Namaste")
+        self.assertEqual(output[1]["text_translated"], "Duniya")
         self.assertFalse(output[0]["translation_fallback"])
         self.assertFalse(output[1]["translation_fallback"])
 
@@ -194,9 +194,9 @@ class BatchSplitRepairTest(TranslatorBase):
 
         self.assertEqual(fake.call_count, 4)
         self.assertTrue(output[0]["translation_fallback"])
-        self.assertEqual(output[0]["text_hi"], "你好")
+        self.assertEqual(output[0]["text_translated"], "你好")
         self.assertFalse(output[1]["translation_fallback"])
-        self.assertEqual(output[1]["text_hi"], "Duniya")
+        self.assertEqual(output[1]["text_translated"], "Duniya")
 
     def test_max_split_rounds_falls_back_gracefully(self):
         # max_split_rounds=1: the first split reaches the limit, the leftover
@@ -221,7 +221,57 @@ class BatchSplitRepairTest(TranslatorBase):
         self.assertEqual(len(output), 4)
         for entry in output:
             self.assertTrue(entry["translation_fallback"])
-            self.assertEqual(entry["text_hi"], entry["text_zh"])
+            self.assertEqual(entry["text_translated"], entry["text_zh"])
+
+
+class LanguageAwareTest(TranslatorBase):
+    """F12f: the C1 prompt and output files follow the job's target_lang."""
+
+    def _write_config(self, lang):
+        (self.job_dir / "job_config.json").write_text(
+            json.dumps({"job_id": self.job_id, "target_lang": lang}),
+            encoding="utf-8",
+        )
+
+    def test_hi_default_prompt_keeps_natural_hindi(self):
+        # Regression: the pre-F12f prompt language for hi is unchanged.
+        self._set_keys(["key-one"])
+        with mock.patch.object(
+            translator, "_call_gemini_text", return_value="Namaste\nDuniya"
+        ) as fake:
+            self._translate()
+        self.assertIn("natural Hindi", fake.call_args.args[1])
+
+    def test_bn_job_prompts_bangla_and_writes_bn_files(self):
+        self._write_config("bn")
+        self._set_keys(["key-one"])
+        with mock.patch.object(
+            translator, "_call_gemini_text", return_value="নমস্কার\nদুনিয়া"
+        ) as fake:
+            output = self._translate()
+
+        prompt = fake.call_args.args[1]
+        self.assertIn("natural Bangla", prompt)
+        self.assertIn("Chinese lines:", prompt)
+        self.assertEqual(output[0]["text_translated"], "নমস্কার")
+        self.assertEqual(output[1]["text_translated"], "দুনিয়া")
+
+        on_disk = json.loads(self._read("subtitles_bn.json"))
+        self.assertEqual(on_disk[0]["text_translated"], "নমস্কার")
+        self.assertNotIn("text_hi", on_disk[0])
+        self.assertTrue((self.job_dir / "subtitles_bn.srt").exists())
+        self.assertFalse((self.job_dir / "subtitles_hi.json").exists())
+
+    def test_en_job_prompts_english_and_writes_en_files(self):
+        self._write_config("en")
+        self._set_keys(["key-one"])
+        with mock.patch.object(
+            translator, "_call_gemini_text", return_value="Hello\nWorld"
+        ) as fake:
+            output = self._translate()
+        self.assertIn("natural English", fake.call_args.args[1])
+        self.assertEqual(output[0]["text_translated"], "Hello")
+        self.assertTrue((self.job_dir / "subtitles_en.json").exists())
 
 
 class SrtTimestampTest(unittest.TestCase):

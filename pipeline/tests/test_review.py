@@ -70,17 +70,17 @@ class ReviewItemsTest(ReviewBase):
         items = review.get_review_items(self.job_id, upload_root=self.upload_root)
         self.assertEqual(len(items), 2)
         self.assertEqual(items[0]["serial"], 1)
-        self.assertEqual(items[0]["text_hi"], "पहली पंक्ति")
+        self.assertEqual(items[0]["text_translated"], "पहली पंक्ति")
         self.assertAlmostEqual(items[0]["target_duration_sec"], 8.0, places=3)
         self.assertAlmostEqual(items[0]["source_duration_sec"], 6.0, places=3)
         self.assertAlmostEqual(items[0]["pts_multiplier"], round(8.0 / 6.0, 4), places=4)
-        self.assertEqual(items[1]["text_hi"], "दूसरी पंक्ति")
+        self.assertEqual(items[1]["text_translated"], "दूसरी पंक्ति")
 
     def test_missing_subtitles_gives_empty_text(self):
         self._write_guideline([self._entry(1, 0.0, 6.0, 0.0, 8.0, 1.0)])
         items = review.get_review_items(self.job_id, upload_root=self.upload_root)
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["text_hi"], "")
+        self.assertEqual(items[0]["text_translated"], "")
 
     def test_missing_job_raises(self):
         with self.assertRaises(FileNotFoundError):
@@ -89,6 +89,24 @@ class ReviewItemsTest(ReviewBase):
     def test_missing_guideline_raises(self):
         with self.assertRaises(FileNotFoundError):
             review.get_review_items(self.job_id, upload_root=self.upload_root)
+
+    def test_reads_translated_field_from_target_lang_file(self):
+        # F12f: for a bn job the translated text is read from
+        # subtitles_bn.json using the new text_translated field.
+        self._write_guideline([self._entry(1, 0.0, 6.0, 0.0, 8.0, 1.0)])
+        (self.job_dir / "job_config.json").write_text(
+            json.dumps({"job_id": self.job_id, "target_lang": "bn"}),
+            encoding="utf-8",
+        )
+        (self.job_dir / "subtitles_bn.json").write_text(
+            json.dumps(
+                [{"serial": 1, "text_zh": "A", "text_translated": "নমস্কার"}],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        items = review.get_review_items(self.job_id, upload_root=self.upload_root)
+        self.assertEqual(items[0]["text_translated"], "নমস্কার")
 
 
 class BuildReviewPageTest(ReviewBase):
