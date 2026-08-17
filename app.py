@@ -40,6 +40,7 @@ from pipeline import (
     transcript_import,
     translator,
     ui,
+    unresolved,
     video_ingest,
     voiceover_auto,
     voiceover_unify,
@@ -220,7 +221,49 @@ def _resume_pipeline_extra(job_id):
         extra["gap_fill_stats"] = gap_stats
         if gap_stats.get("failed"):
             extra["gap_fill_warning_bn"] = TRANSCRIPT_GAP_FILL_WARNING_BN
+    extra.update(_unresolved_extra(job_id))
     return extra
+
+
+def _unresolved_extra(job_id):
+    """The upload-pipeline extra fields for unresolved segments (F12c Part B).
+
+    Reads the persisted registry: active items carry a Bengali warning
+    (``unresolved_warning_bn``) plus the structured ``unresolved_segments``
+    list; fully-accepted jobs drop the warning and record ``unresolved_accepted``
+    instead. Empty dict when there is nothing to report.
+    """
+    items = unresolved.load_unresolved(job_id)
+    if not items:
+        return {}
+    active = [i for i in items if i.get("state") != "accepted"]
+    if active:
+        return {
+            "unresolved_warning_bn": unresolved.build_warning_bn(active),
+            "unresolved_segments": active,
+        }
+    return {"unresolved_segments": items, "unresolved_accepted": True}
+
+
+def _refresh_upload_extra(job_id):
+    """Rewrite the ``upload_pipeline`` done entry with fresh unresolved extras.
+
+    Used after the F12c Part B retry/accept endpoints so the status/warning
+    channel mirrors the updated registry. Best-effort: a missing/malformed
+    stage entry is left untouched.
+    """
+    status = job_status_store.read_status(job_id)
+    entry = (status.get("stages") or {}).get("upload_pipeline") or {}
+    if not entry:
+        return
+    extra = {
+        k: v for k, v in entry.items() if k not in ("stage", "state", "progress")
+    }
+    extra.pop("unresolved_warning_bn", None)
+    extra.pop("unresolved_segments", None)
+    extra.pop("unresolved_accepted", None)
+    extra.update(_unresolved_extra(job_id))
+    job_status_store.write_status(job_id, "upload_pipeline", "done", extra=extra)
 
 
 def _default_gap_stats():
@@ -432,6 +475,15 @@ def _run_upload_pipeline(job_id):
                 extra["gap_fill_stats"] = gap_stats
                 if gap_stats.get("failed"):
                     extra["gap_fill_warning_bn"] = TRANSCRIPT_GAP_FILL_WARNING_BN
+            # F12c Part B: after the automatic repair/translation retries are
+            # exhausted, any segments still flagged (repair gaps/clusters or
+            # translation fallbacks) are surfaced — non-blocking — via the same
+            # warning channel as gap-fill, and the user can ask for one more
+            # retry or mark them acceptable.
+            unresolved_items, _warning = unresolved.collect_unresolved(job_id)
+            if unresolved_items:
+                unresolved.persist_unresolved(job_id, unresolved_items)
+                extra.update(_unresolved_extra(job_id))
         job_status_store.write_status(
             job_id, "upload_pipeline", "done", extra=extra
         )
@@ -1043,12 +1095,14 @@ def upload_status_page(job_id: str) -> HTMLResponse:
         if extraction_status != "ok"
         else ""
     )
+    unresolved_card = _unresolved_card_html(job_id)
     # FA-D1: voice_source is already known (FA-A1), so the user_upload path
     # drops straight into the audio-upload form — no extra "choose" click.
     body = f"""
   <h1>Upload complete — job {job_id}</h1>
   <p>{serials if serials is not None else "?"} subtitle line(s) extracted and translated.</p>
   {warning}
+  {unresolved_card}
   <h2>Upload your voiceover audio</h2>
   <p>Voice source set to <strong>user_upload</strong> for this job.</p>
   <p>Use these as reference while making your audio:
@@ -1424,6 +1478,45 @@ def _job_is_stale_running(job_id, status):
     return age > STALE_RUNNING_SECONDS
 
 
+def _unresolved_card_html(job_id):
+    """F12c Part B: non-blocking "ask the user" card for unresolved segments.
+
+    Rendered on the upload result page (and the review page) whenever the
+    automatic repair/translation retries were exhausted and flagged segments
+    are still unresolved. Shows the Bengali warning with the exact regions
+    plus two actions — "একবার আবার চেষ্টা করুন" (one more retry) and
+    "মেনে নিন / বাদ দিন" (accept/skip). The card does NOT gate the rest of
+    the job: it stays fully usable even if the user ignores it entirely.
+    """
+    status = job_status_store.read_status(job_id)
+    extra = (status.get("stages") or {}).get("upload_pipeline") or {}
+    items = extra.get("unresolved_segments") or []
+    if not items:
+        return ""
+    active = [i for i in items if i.get("state") != "accepted"]
+    if not active:
+        return (
+            '<div class="ok-banner">উল্লেখিত সেগমেন্টগুলো মেনে নেওয়া হয়েছে।</div>'
+        )
+    warning_bn = extra.get("unresolved_warning_bn") or (
+        unresolved.build_warning_bn(active)
+    )
+    safe_warning = html.escape(warning_bn)
+    retry_url = f"/jobs/{job_id}/unresolved/retry"
+    accept_url = f"/jobs/{job_id}/unresolved/accept"
+    return f"""
+  <div class="unresolved-card" id="unresolved-card">
+    <h3>সমস্যাযুক্ত সেগমেন্ট</h3>
+    <pre>{safe_warning}</pre>
+    <form method="post" action="{retry_url}">
+      <button type="submit">একবার আবার চেষ্টা করুন</button>
+    </form>
+    <form method="post" action="{accept_url}">
+      <button type="submit">মেনে নিন / বাদ দিন</button>
+    </form>
+  </div>"""
+
+
 def _history_card(entry):
     """Render one history card (F10.3): meta + badge + দেখুন / রিজিউম করুন."""
     job_id = entry.get("job_id", "")
@@ -1568,6 +1661,46 @@ def _run_resume(job_id):
     except Exception as exc:  # noqa: BLE001 — daemon thread must never die
         logger.exception("unexpected resume failure for job %s", job_id)
         _write_error_status(job_id, "resume", exc)
+
+
+@app.post("/jobs/{job_id}/unresolved/retry")
+def unresolved_retry(job_id: str) -> dict:
+    """F12c Part B: one more *user-initiated* retry for unresolved segments.
+
+    Explicitly requested by the user (never automatic) — each unresolved repair
+    region/line gets a fresh attempt on top of the exhausted automatic retries
+    (``config.SUBTITLE_MAX_REPAIR_ATTEMPTS`` stays unchanged). Runs synchronously
+    like the review edit endpoints; ``translate_subtitles`` is re-run so
+    ``subtitles_hi.json`` stays in sync. The status/warning channel
+    (``upload_pipeline`` extra) is refreshed from the updated registry.
+    """
+    try:
+        items, _warning = unresolved.apply_retry(job_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    _refresh_upload_extra(job_id)
+    return {
+        "job_id": job_id,
+        "unresolved": items,
+        "warning_bn": unresolved.build_warning_bn(items),
+    }
+
+
+@app.post("/jobs/{job_id}/unresolved/accept")
+def unresolved_accept(job_id: str) -> dict:
+    """F12c Part B: mark the unresolved segments as acceptable/skip.
+
+    The flagged segments keep their last imperfect on-disk state but are no
+    longer reported as actionable; the ``upload_pipeline`` warning is cleared.
+    """
+    try:
+        items, _warning = unresolved.apply_accept(job_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    _refresh_upload_extra(job_id)
+    return {"job_id": job_id, "unresolved": items, "accepted": True}
 
 
 @app.get("/api/jobs/{job_id}/status")
@@ -1896,6 +2029,11 @@ def review_page(job_id: str) -> HTMLResponse:
             ui.page("রিভিউ পাওয়া যায়নি — Manhwa Video Dubber", body),
             status_code=404,
         )
+    unresolved_card = _unresolved_card_html(job_id)
+    if unresolved_card:
+        page = page.replace(
+            "</h1>", "</h1>" + unresolved_card, 1
+        ) if "</h1>" in page else page
     return HTMLResponse(page)
 
 

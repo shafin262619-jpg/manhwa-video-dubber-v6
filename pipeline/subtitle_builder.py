@@ -577,16 +577,56 @@ def build_subtitle_list(job_id, upload_root=None, call_budget=None, auto_repair=
     }
     if repair_summary is not None:
         diagnostics["repair"] = repair_summary
-    qa_path = job_dir / "subtitle_qa.json"
-    qa_path.write_text(
-        json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-    out_path = job_dir / "subtitles_zh.json"
-    out_path.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+    refresh_qa(
+        job_id, result, upload_root=upload_root,
+        repair_summary=repair_summary, collision_clusters=collision_clusters,
     )
     return result
+
+
+def refresh_qa(job_id, serialized_entries, upload_root=None, repair_summary=None,
+               collision_clusters=None):
+    """Rewrite ``subtitle_qa.json`` + ``subtitles_zh.json`` from entries.
+
+    Recomputes the QA diagnostics (gaps, duplicate clusters, collision
+    clusters, coverage) for an already-built/repaired entry list *without*
+    re-running the automatic repair — the F12c Part B user-initiated retry uses
+    this so a targeted re-extraction updates QA without triggering another
+    auto-repair round. ``serialized_entries`` must be in the
+    ``subtitles_zh.json`` schema. ``collision_clusters`` defaults to clusters
+    computed over the serialized entries when not provided. Returns the
+    diagnostics dict.
+    """
+    upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
+    job_dir = upload_root / job_id
+    meta = _load_json_optional(job_dir / "job_meta.json")
+    duration = _duration_of(meta, serialized_entries)
+    if collision_clusters is None:
+        collision_clusters = detect_collision_clusters(serialized_entries)
+    gaps = detect_gaps(serialized_entries)
+    duplicate_clusters = detect_duplicate_clusters(serialized_entries)
+    covered_sec = duration - sum(g["gap_sec"] for g in gaps)
+    if covered_sec < 0.0:
+        covered_sec = 0.0
+    diagnostics = {
+        "job_id": job_id,
+        "total_duration_sec": round(duration, 3),
+        "covered_duration_sec": round(covered_sec, 3),
+        "entries_count": len(serialized_entries),
+        "gaps": gaps,
+        "duplicate_clusters": duplicate_clusters,
+        "collision_clusters": collision_clusters,
+    }
+    if repair_summary is not None:
+        diagnostics["repair"] = repair_summary
+    (job_dir / "subtitle_qa.json").write_text(
+        json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (job_dir / "subtitles_zh.json").write_text(
+        json.dumps(serialized_entries, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return diagnostics
 
 
 def _entries_from_serialized(serialized):
