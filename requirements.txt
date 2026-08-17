@@ -3,3 +3,5 @@ uvicorn
 python-multipart
 google-genai
 python-dotenv
+openai-whisper
+numpy
