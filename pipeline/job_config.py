@@ -4,8 +4,9 @@ Every job gets a ``uploads/<job_id>/job_config.json`` written once, at job
 creation, BEFORE any Gemini/Whisper stage runs. It records the processing
 engine (``whisper_primary`` vs ``gemini_only``), the target language the
 voiceover is produced in (``target_lang``, ``"hi"`` today), the auto-detected
-source language (``source_lang``, optional — schema only until F12) and the
-voice source (``auto_tts`` / ``user_upload`` / ``transcript_upload``).
+source language (``source_lang``, optional — schema only until F12), the
+voice source (``auto_tts`` / ``user_upload`` / ``transcript_upload``) and the
+subtitle source (``gemini_extract`` / ``user_transcript``, F12a).
 
 Engine semantics:
 
@@ -36,7 +37,13 @@ ALLOWED_ENGINES = ("whisper_primary", "gemini_only")
 # but nothing downstream consumes it yet.
 ALLOWED_VOICE_SOURCES = ("auto_tts", "user_upload", "transcript_upload")
 
+# F12a: where the original-language subtitles came from. ``gemini_extract`` is
+# the normal F1 (Gemini video-understanding) path; ``user_transcript`` means
+# the user uploaded their own transcript file and F1 was skipped.
+ALLOWED_SUBTITLE_SOURCES = ("gemini_extract", "user_transcript")
+
 DEFAULT_TARGET_LANG = "hi"
+DEFAULT_SUBTITLE_SOURCE = "gemini_extract"
 
 
 def config_path(job_id, upload_root=None):
@@ -67,16 +74,18 @@ def _defaults():
         "source_lang": None,
         "target_lang": DEFAULT_TARGET_LANG,
         "voice_source": "auto_tts",
+        "subtitle_source": DEFAULT_SUBTITLE_SOURCE,
     }
 
 
 def write_config(job_id, engine=None, target_lang=None, source_lang=None,
-                 voice_source="auto_tts", upload_root=None):
+                 voice_source="auto_tts", subtitle_source=None, upload_root=None):
     """Write the per-job config. Returns the saved dict.
 
-    ``engine`` / ``target_lang`` / ``voice_source`` may be ``None`` to keep
-    the defaults. Raises ValueError on an invalid ``engine`` or
-    ``voice_source``. Written atomically (temp file + ``os.replace``).
+    ``engine`` / ``target_lang`` / ``voice_source`` / ``subtitle_source`` may
+    be ``None`` to keep the defaults. Raises ValueError on an invalid
+    ``engine``, ``voice_source`` or ``subtitle_source``. Written atomically
+    (temp file + ``os.replace``).
     """
     if engine is None:
         engine = default_engine()
@@ -89,6 +98,13 @@ def write_config(job_id, engine=None, target_lang=None, source_lang=None,
             f"invalid voice source: {voice_source!r} "
             f"(allowed: {', '.join(ALLOWED_VOICE_SOURCES)})"
         )
+    if subtitle_source is None:
+        subtitle_source = DEFAULT_SUBTITLE_SOURCE
+    if subtitle_source not in ALLOWED_SUBTITLE_SOURCES:
+        raise ValueError(
+            f"invalid subtitle source: {subtitle_source!r} "
+            f"(allowed: {', '.join(ALLOWED_SUBTITLE_SOURCES)})"
+        )
     data = {
         "job_id": job_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -96,6 +112,7 @@ def write_config(job_id, engine=None, target_lang=None, source_lang=None,
         "source_lang": source_lang,
         "target_lang": target_lang or DEFAULT_TARGET_LANG,
         "voice_source": voice_source,
+        "subtitle_source": subtitle_source,
     }
     path = config_path(job_id, upload_root)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -131,5 +148,10 @@ def read_config(job_id, upload_root=None):
         defaults["voice_source"]
         if defaults["voice_source"] in ALLOWED_VOICE_SOURCES
         else "auto_tts"
+    )
+    defaults["subtitle_source"] = (
+        defaults["subtitle_source"]
+        if defaults["subtitle_source"] in ALLOWED_SUBTITLE_SOURCES
+        else DEFAULT_SUBTITLE_SOURCE
     )
     return defaults

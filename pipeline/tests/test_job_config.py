@@ -65,6 +65,29 @@ class WriteConfigTest(JobConfigBase):
                 self.job_id, voice_source="bogus_mode", upload_root=self.upload_root
             )
 
+    def test_write_config_persists_subtitle_source(self):
+        data = job_config.write_config(
+            self.job_id,
+            voice_source="auto_tts",
+            subtitle_source="user_transcript",
+            upload_root=self.upload_root,
+        )
+        self.assertEqual(data["subtitle_source"], "user_transcript")
+        persisted = self._read_file()
+        self.assertEqual(persisted["subtitle_source"], "user_transcript")
+
+    def test_write_config_default_subtitle_source(self):
+        data = job_config.write_config(
+            self.job_id, voice_source="auto_tts", upload_root=self.upload_root
+        )
+        self.assertEqual(data["subtitle_source"], "gemini_extract")
+
+    def test_write_config_rejects_invalid_subtitle_source(self):
+        with self.assertRaises(ValueError):
+            job_config.write_config(
+                self.job_id, subtitle_source="bogus_source", upload_root=self.upload_root
+            )
+
 
 class ReadConfigTest(JobConfigBase):
     def test_read_config_round_trip(self):
@@ -99,6 +122,36 @@ class ReadConfigTest(JobConfigBase):
         )
         cfg = job_config.read_config(self.job_id, self.upload_root)
         self.assertIn(cfg["engine"], job_config.ALLOWED_ENGINES)
+
+    def test_read_config_subtitle_source_round_trip(self):
+        job_config.write_config(
+            self.job_id,
+            voice_source="auto_tts",
+            subtitle_source="user_transcript",
+            upload_root=self.upload_root,
+        )
+        cfg = job_config.read_config(self.job_id, self.upload_root)
+        self.assertEqual(cfg["subtitle_source"], "user_transcript")
+
+    def test_read_config_pre_f9_defaults_to_gemini_extract(self):
+        # A job dir that exists but has no config file (pre-F9) defaults to
+        # the F1 extraction path, never the transcript path.
+        cfg = job_config.read_config(self.job_id, self.upload_root)
+        self.assertEqual(cfg["subtitle_source"], "gemini_extract")
+
+    def test_read_config_sanitizes_invalid_subtitle_source(self):
+        job_config.write_config(
+            self.job_id,
+            voice_source="auto_tts",
+            subtitle_source="user_transcript",
+            upload_root=self.upload_root,
+        )
+        path = self.job_dir / "job_config.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["subtitle_source"] = "bogus_source"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        cfg = job_config.read_config(self.job_id, self.upload_root)
+        self.assertEqual(cfg["subtitle_source"], "gemini_extract")
 
 
 class DefaultEngineTest(JobConfigBase):

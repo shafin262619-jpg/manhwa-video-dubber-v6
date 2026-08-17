@@ -36,6 +36,7 @@ from pipeline import (
     subtitle_extract,
     subtitle_qa,
     subtitle_verify,
+    transcript_import,
     translator,
     ui,
     video_ingest,
@@ -240,14 +241,27 @@ def _run_upload_pipeline(job_id):
             # CallBudget so a runaway Gemini rotation can never burn more than
             # config.MAX_API_CALLS_PER_JOB calls for a single job run.
             budget = gemini_rotation.CallBudget(config.MAX_API_CALLS_PER_JOB)
-            extraction = job_status_store.run_stage(
-                job_id,
-                "F1_extract",
-                subtitle_extract.extract_subtitles,
-                job_id,
-                call_budget=budget,
-                progress_cb=_stage_progress(job_id, "F1_extract"),
-            )
+            cfg = job_config.read_config(job_id) or {}
+            if cfg.get("subtitle_source") == "user_transcript":
+                # F12a: the user uploaded their own transcript, so F1 (Gemini
+                # extraction) is skipped entirely — the uploaded content is
+                # imported into subtitles_zh_raw.json instead. Everything
+                # downstream (B2, whisper cross-check, C1, D2-F3) is unchanged.
+                extraction = job_status_store.run_stage(
+                    job_id,
+                    "F1_extract",
+                    transcript_import.import_transcript,
+                    job_id,
+                )
+            else:
+                extraction = job_status_store.run_stage(
+                    job_id,
+                    "F1_extract",
+                    subtitle_extract.extract_subtitles,
+                    job_id,
+                    call_budget=budget,
+                    progress_cb=_stage_progress(job_id, "F1_extract"),
+                )
             subtitle_builder.build_subtitle_list(job_id, call_budget=budget)
             try:
                 whisper_check = subtitle_verify.whisper_cross_check(
@@ -678,6 +692,9 @@ def home() -> HTMLResponse:
     <label for="file">Video (mp4/mkv/mov/avi/webm/flv/wmv/m4v)</label>
     <input type="file" id="file" name="file"
            accept=".mp4,.mkv,.mov,.avi,.webm,.flv,.wmv,.m4v" required>
+    <label for="transcript">ট্রান্সক্রিপ্ট/সাবটাইটেল (ঐচ্ছিক) — .srt, .vtt বা প্লেইন টেক্সট</label>
+    <input type="file" id="transcript" name="transcript"
+           accept=".srt,.vtt,.txt,text/plain">
     <fieldset>
       <legend>Voiceover source</legend>
       <label><input type="radio" name="voice_source" value="auto_tts" checked>
@@ -974,6 +991,7 @@ def delete_key(key_id: str) -> dict:
 @app.post("/upload")
 async def upload_video(
     file: UploadFile = File(...),
+    transcript: UploadFile | None = File(None),
     voice_source: str = Form("auto_tts"),
     engine: str | None = Form(None),
     target_lang: str | None = Form(None),
@@ -1005,6 +1023,40 @@ async def upload_video(
     except video_ingest.UnsupportedFileError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    # F12a: an optional original-language transcript skips F1 (Gemini
+    # extraction). It is parsed and validated HERE, before anything is
+    # persisted — a malformed/unparseable transcript rejects the whole upload
+    # with no job dir, no video file and no partial state saved anywhere.
+    subtitle_source = job_config.DEFAULT_SUBTITLE_SOURCE
+    transcript_bytes = None
+    if transcript is not None and transcript.filename:
+        try:
+            transcript_bytes = await transcript.read()
+        except OSError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"ট্রান্সক্রিপ্ট ফাইলটি পড়া যায়নি: {exc}",
+            )
+        content = transcript_bytes.decode("utf-8-sig", errors="replace")
+        try:
+            parsed, _kind = transcript_import.parse_transcript(
+                content, transcript.filename
+            )
+        except transcript_import.TranscriptParseError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "ট্রান্সক্রিপ্ট ফাইলটি সঠিক ফরম্যাটে নেই "
+                    f"({exc}). .srt, .vtt বা প্লেইন টেক্সট ফাইল আপলোড করুন।"
+                ),
+            )
+        if not parsed:
+            raise HTTPException(
+                status_code=400,
+                detail="ট্রান্সক্রিপ্ট ফাইলটি খালি — কোনো সাবটাইটেল পাওয়া যায়নি।",
+            )
+        subtitle_source = "user_transcript"
+
     job_id = video_ingest.new_job_id()
     job_dir = video_ingest.UPLOAD_ROOT / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -1031,14 +1083,23 @@ async def upload_video(
     # Gemini/Whisper call runs (the pipeline runs on a background thread
     # below). Engine ("whisper_primary" | "gemini_only") and target_lang
     # (schema-only until F12) are recorded here; source_lang stays None until
-    # auto-detection lands (F12).
+    # auto-detection lands (F12). F12a records subtitle_source
+    # ("gemini_extract" | "user_transcript").
     job_config.write_config(
         job_id,
         engine=engine,
         target_lang=target_lang,
         source_lang=None,
         voice_source=voice_source,
+        subtitle_source=subtitle_source,
     )
+
+    # F12a: the validated transcript is persisted for the background chain to
+    # import (the pipeline thread only knows the job_id).
+    if transcript_bytes is not None:
+        suffix = Path(transcript.filename).suffix.lower()
+        name = "transcript_upload" + (suffix if suffix in (".srt", ".vtt") else ".txt")
+        (job_dir / name).write_bytes(transcript_bytes)
 
     # F9: history is capped at HISTORY_LIMIT (3) jobs and never evicts
     # silently. When the index is full the new job is NOT started; the client
