@@ -211,6 +211,137 @@ class SubtitleExtractChunkTest(SubtitleExtractBase):
         self.assertEqual(result["failed_segments"], [])
 
 
+class LongVideoAccuracyTest(SubtitleExtractBase):
+    """F13a evidence: chunked extraction of >5min videos is accurate.
+
+    The root cause of post-5-minute degradation was a single Gemini call on
+    the whole video (old 600s threshold) dropping dialogue blocks. With the
+    90s-window chunking these tests prove the full timeline is covered
+    chronologically with no dropped or duplicated lines, and that
+    sub-threshold (<5min) videos keep the single-call behavior unchanged.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # gemini_only keeps the proof focused on the chunking/merge path
+        # regardless of whether local Whisper is installed in this env.
+        job_config.write_config(
+            self.job_id, engine="gemini_only", upload_root=self.upload_root
+        )
+
+    @staticmethod
+    def _ground_truth():
+        # One line every 3s from 1.5s to 319.5s -> 107 lines over 320s.
+        return {t: f"line_{int(t):03d}" for t in (x + 1.5 for x in range(0, 319, 3))}
+
+    def test_320s_video_accurate_full_coverage(self):
+        # A 5.3-minute video (over the old 600s whole-video failure regime) is
+        # split into 5 overlapping 90s windows. An accurate per-window model
+        # must yield a complete, chronological transcript over the whole
+        # timeline: no dropped lines, no duplicates, no large gaps.
+        ground = self._ground_truth()
+        expected_starts = [0.0, 60.0, 120.0, 180.0, 240.0]
+        segments = [
+            {"index": i, "start": s, "end": min(s + 90.0, 320.0),
+             "path": self.job_dir / f"s{i}.mp4"}
+            for i, s in enumerate(expected_starts)
+        ]
+        calls = []
+
+        def fake_call(key, prompt, video_path, offset_sec):
+            calls.append(offset_sec)
+            win_end = offset_sec + 90.0
+            return [
+                {"text": text, "start_sec": t, "end_sec": t + 1.5}
+                for t, text in ground.items()
+                if offset_sec - 1e-6 <= t < win_end
+            ]
+
+        self._write_meta(320.0)
+        self._set_keys(["key-one"])
+        with (
+            mock.patch.object(subtitle_extract, "_call_gemini", side_effect=fake_call),
+            mock.patch("pipeline.subtitle_extract._segment_video", return_value=segments),
+        ):
+            result = subtitle_extract.extract_subtitles(
+                self.job_id, upload_root=self.upload_root
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["chunked"])
+        self.assertEqual(result["segments_count"], 5)
+        self.assertEqual(result["failed_segments"], [])
+        self.assertEqual(calls, expected_starts)
+        subs = result["subtitles"]
+        starts = [s["start_sec"] for s in subs]
+        self.assertEqual(len(subs), len(ground))
+        # Full timeline coverage: the final line (319.5s) survives.
+        self.assertAlmostEqual(max(starts), max(ground), places=6)
+        self.assertTrue(any(s >= 300.0 for s in starts))
+        # Chronological order, distinct timestamps, no large gaps.
+        self.assertTrue(all(a <= b for a, b in zip(starts, starts[1:])))
+        self.assertEqual(len({round(s, 3) for s in starts}), len(subs))
+        gaps = [b["start_sec"] - a["end_sec"] for a, b in zip(subs, subs[1:])]
+        self.assertTrue(all(g <= 3.5 for g in gaps))
+
+    def test_window_boundary_no_drop_no_dup(self):
+        # Two overlapping windows share the 30s boundary region; the overlap
+        # line is returned by BOTH windows. Dedup must keep exactly one copy
+        # and must not drop the unique lines from either window.
+        ground = {1.5: "a", 75.0: "boundary", 100.0: "b"}
+        segments = [
+            {"index": 0, "start": 0.0, "end": 90.0, "path": self.job_dir / "s0.mp4"},
+            {"index": 1, "start": 60.0, "end": 150.0, "path": self.job_dir / "s1.mp4"},
+        ]
+
+        def fake_call(key, prompt, video_path, offset_sec):
+            win_end = offset_sec + 90.0
+            return [
+                {"text": text, "start_sec": t, "end_sec": t + 1.5}
+                for t, text in ground.items()
+                if offset_sec - 1e-6 <= t < win_end
+            ]
+
+        self._write_meta(150.0)
+        self._set_keys(["key-one"])
+        with (
+            mock.patch.object(subtitle_extract, "_call_gemini", side_effect=fake_call),
+            mock.patch("pipeline.subtitle_extract._segment_video", return_value=segments),
+        ):
+            result = subtitle_extract.extract_subtitles(
+                self.job_id, upload_root=self.upload_root
+            )
+
+        self.assertEqual(result["status"], "ok")
+        subs = result["subtitles"]
+        self.assertEqual(len(subs), 3)  # no dropped, no duplicated lines
+        self.assertEqual([s["text"] for s in subs], ["a", "boundary", "b"])
+        # The deduped boundary line keeps its original timing.
+        self.assertAlmostEqual(subs[1]["start_sec"], 75.0, places=6)
+
+    def test_under_5min_single_window_unchanged(self):
+        # A sub-threshold video (30s) is still one unchunked Gemini call with
+        # offset 0.0 — identical to the pre-chunking behavior.
+        self._write_meta(30.0)
+        self._set_keys(["key-one"])
+        with mock.patch.object(
+            subtitle_extract, "_call_gemini", return_value=[
+                {"text": "你好", "start_sec": 0.2, "end_sec": 2.1},
+            ]
+        ) as fake:
+            result = subtitle_extract.extract_subtitles(
+                self.job_id, upload_root=self.upload_root
+            )
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["chunked"])
+        self.assertEqual(result["segments_count"], 1)
+        fake.assert_called_once()
+        self.assertEqual(fake.call_args.args[3], 0.0)
+        self.assertEqual(len(result["subtitles"]), 1)
+        self.assertEqual(result["subtitles"][0]["text"], "你好")
+        self.assertAlmostEqual(result["subtitles"][0]["start_sec"], 0.2, places=6)
+
+
 class WhisperPrimaryMergeTest(SubtitleExtractBase):
     """F1-F3: Whisper is the timing authority; Gemini text merges onto its
     segments. Whisper itself is faked via ``sys.modules`` and the source video
