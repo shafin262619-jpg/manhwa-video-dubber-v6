@@ -978,6 +978,51 @@ code {
   font-size: 0.9rem;
 }
 
+.seg-review-qa-note {
+  border: 1px solid rgba(222, 165, 60, .5);
+  background: rgba(222, 165, 60, .12);
+  color: #f2c879;
+  border-radius: var(--radius);
+  padding: 0.7rem 0.95rem;
+  margin: 0 0 0.8rem;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.seg-review-prev {
+  border-left: 3px solid var(--hairline);
+  padding: 0.4rem 0.9rem;
+  margin: 0 0 0.8rem;
+}
+
+.seg-review-prev ul {
+  margin: 0.3rem 0 0;
+  padding-left: 1.2rem;
+  color: var(--text-muted);
+}
+
+.seg-review-fixing {
+  border: 1px dashed rgba(63, 167, 150, .5);
+  background: rgba(63, 167, 150, .06);
+}
+
+.seg-review-done {
+  border: 1px solid rgba(63, 167, 150, .4);
+  background: rgba(63, 167, 150, .07);
+}
+
+.seg-review-done-badge {
+  display: inline-block;
+  margin-top: 0.7rem;
+  padding: 0.35rem 0.95rem;
+  border-radius: 999px;
+  background: rgba(63, 167, 150, .25);
+  border: 1px solid rgba(63, 167, 150, .6);
+  color: #9fe8d4;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
 /* Sidebar collapses to a horizontal top bar below ~860px */
 @media (max-width: 860px) {
   .app-shell {

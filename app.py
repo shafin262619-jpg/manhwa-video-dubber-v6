@@ -2215,12 +2215,24 @@ def final_page(job_id: str) -> HTMLResponse:
 
 
 def _segment_review_block(job_id, entry):
-    """Per-segment review card (F14a Part 2) for one done segment.
+    """Per-segment review card (F14a Part 2 + F14b Part 3) for one done segment.
 
-    Shows the recorded round-1 review state once submitted; otherwise the
-    issue-tag checkboxes + free text + explicit "no issues" submit buttons,
-    all wired to :func:`job_status_store.record_segment_review` via
-    ``POST /segment-review/{job_id}/{index}``.
+    Decides which of the four states the segment is in from its recorded
+    review rounds (latest round wins):
+
+    - no reviews yet                  -> issue-tag form (initial round 1)
+    - latest round is a human review
+      with issues, no rerun round yet -> "ঠিক করা হচ্ছে" (fix in progress)
+    - latest round is a successful
+      rerun                            -> issue-tag form for the new output,
+      with the previous round's reported issues as brief context
+    - latest round is a failed rerun   -> Bengali error + retry form
+    - latest round is a clean human
+      review                           -> done-reviewing summary
+
+    All wired to :func:`job_status_store.record_segment_review` via
+    ``POST /segment-review/{job_id}/{index}``; an issue submission additionally
+    starts the targeted correction (F14b Part 1) on a background thread.
 
     F14b Part 2: a round-1 entry that is only an automated-QA rerun
     (``rerun: True``) is not a human review, so the form is still shown, and a
@@ -2228,7 +2240,7 @@ def _segment_review_block(job_id, entry):
     ``qa.note_bn`` banner above the card content.
     """
     index = entry.get("index")
-    existing = job_status_store.get_segment_reviews(job_id, index, round_no=1)
+    reviews = job_status_store.get_segment_reviews(job_id, index)
     labels = job_status_store.SEGMENT_REVIEW_ISSUE_CATEGORIES
     qa_note = (entry.get("qa") or {}).get("note_bn")
     banner = ""
@@ -2236,37 +2248,79 @@ def _segment_review_block(job_id, entry):
         banner = (
             f'<p class="seg-review-qa-note">{html.escape(str(qa_note))}</p>'
         )
-    if existing is not None and not existing.get("rerun"):
-        summary = (
-            f'<p class="seg-review-meta">রিভিউ রেকর্ড হয়েছে (রাউন্ড '
-            f'{existing.get("round", 1)}):</p>'
+    rounds = sorted(int(k) for k in reviews if str(k).isdigit())
+    latest_round = rounds[-1] if rounds else None
+    latest = reviews.get(str(latest_round)) if latest_round is not None else None
+    if latest is None:
+        return _review_form_block(job_id, index, banner)
+    if latest.get("rerun"):
+        if latest.get("rerun_status") == "failed":
+            return _rerun_failed_block(job_id, index, latest, banner)
+        return _review_form_block(
+            job_id, index, banner,
+            context=_previous_round_context(reviews, latest),
         )
-        if existing.get("issues"):
-            names = "".join(
-                f"<li>{html.escape(labels[t])}</li>"
-                for t in existing["issues"]
-                if t in labels
-            )
-            summary += f"<ul>{names}</ul>"
-        else:
-            summary += (
-                '<p class="seg-review-meta">কোনো সমস্যা নেই — '
-                "এই সেগমেন্ট ঠিক আছে।</p>"
-            )
-        if existing.get("notes"):
-            summary += (
-                f'<p class="seg-review-notes">{html.escape(str(existing["notes"]))}</p>'
-            )
-        return f'<div class="review-box seg-review">{banner}{summary}</div>'
+    if latest.get("issues"):
+        return _being_fixed_block(job_id, index, latest, banner)
+    return _done_reviewing_block(job_id, index, latest, banner)
+
+
+def _segment_being_fixed(job_id, entry):
+    """True while a human-reported correction is running/awaiting for a segment."""
+    index = entry.get("index")
+    reviews = job_status_store.get_segment_reviews(job_id, index)
+    rounds = sorted(int(k) for k in reviews if str(k).isdigit())
+    if not rounds:
+        return False
+    latest = reviews.get(str(rounds[-1]))
+    return bool(latest) and not latest.get("rerun") and bool(latest.get("issues"))
+
+
+def _previous_round_context(reviews, latest):
+    """Brief context: the issues+notes a successful rerun corrected.
+
+    Only rendered when the round the rerun corrected was a human review (a QA
+    rerun points at itself, so no context — the QA note banner covers that).
+    """
+    prev_round = latest.get("rerun_of_round")
+    if prev_round is None:
+        return ""
+    prev = reviews.get(str(int(prev_round)))
+    if not isinstance(prev, dict) or prev.get("rerun"):
+        return ""
+    labels = job_status_store.SEGMENT_REVIEW_ISSUE_CATEGORIES
+    issues = [t for t in (prev.get("issues") or []) if t in labels]
+    if not issues:
+        return ""
+    names = "".join(f"<li>{html.escape(labels[t])}</li>" for t in issues)
+    context = (
+        '<div class="seg-review-prev">'
+        '<p class="seg-review-meta">পূর্ববর্তী রাউন্ডে রিপোর্ট করা সমস্যা:</p>'
+        f"<ul>{names}</ul>"
+    )
+    if prev.get("notes"):
+        context += (
+            f'<p class="seg-review-notes">{html.escape(str(prev["notes"]))}</p>'
+        )
+    return context + "</div>"
+
+
+def _review_form_block(job_id, index, banner="", context="", pre_checked=None):
+    """The issue-tag checkboxes + free text + explicit "no issues" form."""
+    labels = job_status_store.SEGMENT_REVIEW_ISSUE_CATEGORIES
+    pre_checked = set(pre_checked or [])
+    seg_key = segmentation.segment_key(int(index)) if index is not None else "?"
     options = "".join(
         f'<label class="issue-tag"><input type="checkbox" name="issues" '
-        f'value="{tag}"><span>{html.escape(bn)}</span></label>'
+        f'value="{tag}"'
+        f'{" checked" if tag in pre_checked else ""}><span>{html.escape(bn)}</span></label>'
         for tag, bn in labels.items()
     )
     return f"""
   <div class="review-box seg-review">
     {banner}
-    <h2>সেগমেন্ট {_seg_key(entry)} — রিভিউ</h2>
+    {context}
+    <h2>সেগমেন্ট {seg_key} — রিভিউ</h2>
     <form method="post" action="/segment-review/{job_id}/{index}" class="trim-form">
       <fieldset>
         <legend>কোন সমস্যা আছে? (যা প্রযোজ্য সব বেছে নিন)</legend>
@@ -2285,10 +2339,60 @@ def _segment_review_block(job_id, entry):
   </div>"""
 
 
-def _seg_key(entry):
-    """``seg_000`` display key for a segment entry."""
-    index = entry.get("index")
-    return segmentation.segment_key(int(index)) if index is not None else "?"
+def _being_fixed_block(job_id, index, latest, banner):
+    """Distinct "ঠিক করা হচ্ছে" card shown while a correction is running."""
+    round_no = latest.get("round", 1)
+    seg_key = segmentation.segment_key(int(index)) if index is not None else "?"
+    return f"""
+  <div class="review-box seg-review seg-review-fixing">
+    {banner}
+    <h2>সেগমেন্ট {seg_key} — ঠিক করা হচ্ছে</h2>
+    <p class="seg-review-meta">রাউন্ড {round_no}-এ রিপোর্ট করা সমস্যাগুলো ঠিক করা
+    হচ্ছে — পেজটি স্বয়ংক্রিয়ভাবে রিফ্রেশ হবে।</p>
+  </div>"""
+
+
+def _done_reviewing_block(job_id, index, latest, banner):
+    """Done-reviewing summary: the latest round was reviewed with no issues."""
+    labels = job_status_store.SEGMENT_REVIEW_ISSUE_CATEGORIES
+    summary = (
+        f'<p class="seg-review-meta">রিভিউ রেকর্ড হয়েছে (রাউন্ড '
+        f'{latest.get("round", 1)}):</p>'
+    )
+    if latest.get("issues"):
+        names = "".join(
+            f"<li>{html.escape(labels[t])}</li>"
+            for t in latest["issues"]
+            if t in labels
+        )
+        summary += f"<ul>{names}</ul>"
+    else:
+        summary += (
+            '<p class="seg-review-meta">কোনো সমস্যা নেই — '
+            "এই সেগমেন্ট ঠিক আছে।</p>"
+        )
+    if latest.get("notes"):
+        summary += (
+            f'<p class="seg-review-notes">{html.escape(str(latest["notes"]))}</p>'
+        )
+    return (
+        f'<div class="review-box seg-review seg-review-done">{banner}'
+        f"{summary}"
+        '<p class="seg-review-done-badge">রিভিউ সম্পন্ন</p></div>'
+    )
+
+
+def _rerun_failed_block(job_id, index, latest, banner):
+    """Failed correction: Bengali error + the issue form as the retry path."""
+    error_bn = html.escape(str(latest.get("rerun_error_bn") or "অজানা ত্রুটি"))
+    error_block = (
+        f'<div class="error-banner"><p class="error-banner-title">'
+        f"ঠিক করা ব্যর্থ হয়েছে</p><p>{error_bn}</p></div>"
+    )
+    return _review_form_block(
+        job_id, index, banner, context=error_block,
+        pre_checked=latest.get("issues"),
+    )
 
 
 def _render_segmented_result(job_id: str, reviewed=None, verdict=None) -> HTMLResponse:
@@ -2336,16 +2440,23 @@ def _render_segmented_result(job_id: str, reviewed=None, verdict=None) -> HTMLRe
             f"<td>{entry.get('start_sec')} → {entry.get('end_sec')}s</td>"
             f"<td>{link}</td></tr>"
         )
-        if state == "done":
+        being_fixed = _segment_being_fixed(job_id, entry)
+        if state == "done" or being_fixed:
             player = ""
-            if has_final:
-                player = (
-                    f'<video controls preload="metadata" '
-                    f'src="/download/{job_id}/segment/{index}"></video>'
+            if state == "done":
+                if has_final:
+                    player = (
+                        f'<video controls preload="metadata" '
+                        f'src="/download/{job_id}/segment/{index}"></video>'
+                    )
+                heading = (
+                    f"<h2>{html.escape(str(key))} — সমাপ্ত</h2>"
                 )
+            else:
+                heading = f"<h2>{html.escape(str(key))}</h2>"
             cards.append(
                 f'<div class="review-box seg-playback">'
-                f"<h2>{html.escape(str(key))} — সমাপ্ত</h2>{player}"
+                f"{heading}{player}"
                 f"{_segment_review_block(job_id, entry)}</div>"
             )
     segmented = data.get("segmented") or {}
@@ -2409,6 +2520,30 @@ def _render_segmented_result(job_id: str, reviewed=None, verdict=None) -> HTMLRe
     )
 
 
+def _run_segment_rerun(job_id, seg_index, round_no):
+    """Background targeted correction for one review round (F14b Part 3).
+
+    Started after an issue report is recorded; a single call corrects that
+    round's owning stage (and the downstream cascade) and records the next
+    review round. Failures are persisted by the rerun code as a failed rerun
+    round so the card can offer a retry — only unexpected exceptions reach
+    here, where they are logged and swallowed so the worker thread never dies.
+    """
+    try:
+        segmented_pipeline.rerun_segment_stage(
+            job_id, seg_index, round_no=round_no
+        )
+    except Exception:  # noqa: BLE001 - never crash the background worker
+        try:
+            log = job_logging.get_job_logger(job_id)
+            log.exception(
+                "job %s seg %d: background correction for round %d failed",
+                job_id, seg_index, round_no,
+            )
+        except Exception:  # noqa: BLE001 - logging is best-effort
+            pass
+
+
 @app.post("/segment-review/{job_id}/{seg_index}")
 def segment_review_submit(
     job_id: str,
@@ -2417,14 +2552,18 @@ def segment_review_submit(
     issues: list[str] | None = Form(None),
     notes: str | None = Form(None),
 ) -> RedirectResponse:
-    """Record a per-segment review (F14a Part 2) for one review round.
+    """Record a per-segment review (F14a Part 2) and start the fix (F14b Part 3).
 
-    Wired to :func:`job_status_store.record_segment_review` — no review
-    logic lives here. ``verdict=clean`` records the explicit "no issues"
-    state; otherwise the checked issue tags + free text are recorded. A
-    review for one segment never touches any other segment's state. On
-    success the browser redirects back to the segmented result page with a
-    Bengali confirmation banner.
+    Wired to :func:`job_status_store.record_segment_review` — no review logic
+    lives here. ``verdict=clean`` records the explicit "no issues" state;
+    otherwise the checked issue tags + free text are recorded. The review is
+    written to the segment's next free round (so it never overwrites an
+    automated-QA rerun round, F14b Part 2). An issue report additionally kicks
+    off the targeted correction for THAT round on a background thread (F14b
+    Part 1); the card transitions to "ঠিক করা হচ্ছে" and the page polls for
+    the new round. A review for one segment never touches any other segment's
+    state. On success the browser redirects back to the segmented result page
+    with a Bengali confirmation banner.
     """
     data = job_status_store.read_status(job_id)
     seg_map = data.get("segments") or {}
@@ -2440,15 +2579,23 @@ def segment_review_submit(
         issue_list = []
     else:
         issue_list = [tag for tag in (issues or []) if isinstance(tag, str)]
+    round_no = job_status_store.next_review_round(job_id, seg_index)
     try:
         job_status_store.record_segment_review(
             job_id,
             seg_index,
+            round_no=round_no,
             issues=issue_list,
             notes=(notes or None),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    if issue_list:
+        threading.Thread(
+            target=_run_segment_rerun,
+            args=(job_id, seg_index, round_no),
+            daemon=True,
+        ).start()
     return RedirectResponse(
         url=f"/upload/{job_id}?reviewed={seg_index}&verdict={verdict}",
         status_code=303,
