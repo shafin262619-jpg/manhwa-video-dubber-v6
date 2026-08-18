@@ -32,16 +32,22 @@ import logging
 import subprocess
 from pathlib import Path
 
+from google import genai
+from google.genai import types as genai_types
+
 from pipeline import (
     auto_cut,
+    config,
     edit_guideline,
     error_bn,
     job_logging,
     job_status as job_status_store,
+    key_store,
     lang_files,
     render_final,
     segmentation,
     subtitle_builder,
+    subtitle_extract,
     subtitle_verify,
     translator,
     video_ingest,
@@ -253,6 +259,15 @@ def run_segmented_pipeline(job_id, upload_root=None, call_budget=None,
             except Exception:  # noqa: BLE001 - status is advisory
                 pass
             raise
+        if final_path is not None:
+            try:
+                run_auto_qa_gate(
+                    job_id, segment, seg_dir, final_path,
+                    upload_root=root, call_budget=call_budget, logger_=log,
+                )
+            except Exception as exc:  # noqa: BLE001 - never block the segment
+                log.error("job %s seg %d: auto QA gate raised: %s",
+                          job_id, index, exc)
         try:
             job_status_store.mark_segment_done(
                 job_id, index, final_path=final_path,
@@ -421,6 +436,14 @@ def run_segmented_user_audio_pipeline(job_id, upload_root=None):
             render_final.finalize_video, job_id,
             upload_root=upload_root, job_dir=seg_dir, output_path=final_path,
         )
+        try:
+            run_auto_qa_gate(
+                job_id, segment, seg_dir, final_path,
+                upload_root=root, call_budget=None, logger_=log,
+            )
+        except Exception as exc:  # noqa: BLE001 - never block the segment
+            log.error("job %s seg %d: auto QA gate raised: %s",
+                      job_id, index, exc)
         try:
             job_status_store.mark_segment_done(
                 job_id, index, final_path=final_path,
@@ -809,3 +832,320 @@ def rerun_segment_stage(job_id, seg_index, round_no=None, review=None,
         "stages_rerun": order,
         "correction": correction,
     }
+
+
+# ---------------------------------------------------------------------------
+# Automated pre-review QA gate (F14b Part 2)
+#
+# Before a finished segment is released to human review, Gemini watches the
+# segment's final video once and checks, per dialogue line, that the audio
+# being spoken matches what is shown on screen at that timestamp. On a
+# mismatch the finding is shaped exactly like a human ``timing_mismatch``
+# review payload and fed through :func:`rerun_segment_stage` — the SAME
+# correction path, no separate one — then the updated video is re-checked, up
+# to ``config.MAX_AUTO_QA_FIX_ATTEMPTS`` corrective rounds. The whole loop is
+# invisible to the user; only the outcome (passed, or capped with a Bengali
+# note) is recorded in the segment's job-status ``qa`` block. A Gemini
+# API/parse failure counts as a failed attempt toward the cap and never
+# crashes the segment's pipeline run.
+# ---------------------------------------------------------------------------
+
+SEGMENT_QA_PROMPT = (
+    "You are an automated QA checker for a dubbed manhwa video segment. "
+    "Watch the attached video. For each dialogue line below, check whether "
+    "the VOICEOVER AUDIO being spoken at that line's time matches what is "
+    "SHOWN ON SCREEN at that moment (the scene/action and any on-screen "
+    "subtitle text). A line FAILS when the audio does not match the on-screen "
+    "scene/action at its timestamp (a voice/scene timing mismatch).\n\n"
+    "Dialogue lines (serial, [start_sec - end_sec], text):\n"
+    "{lines}\n\n"
+    "Respond with ONLY JSON, no commentary, in this exact structure: "
+    '{"lines": [{"serial": 1, "pass": true}, {"serial": 2, "pass": false, '
+    '"reason": "audio says X but the on-screen scene shows Y"}]}. '
+    "Report every line; a line with no issue must have \"pass\": true."
+)
+
+
+def _qa_check_video(key, prompt, video_path):
+    """Send one finished segment video to Gemini and parse the per-line QA.
+
+    Mirrors ``subtitle_extract._call_gemini`` exactly (client setup, upload
+    reuse, content-block detection); only the response parse differs. Returns
+    the raw ``lines`` list. Raises on Gemini/parse failure so the shared
+    rotation wrapper can classify and rotate keys.
+    """
+    client = genai.Client(api_key=key)
+    uploaded = subtitle_extract._get_or_upload(client, key, video_path)
+    response = client.models.generate_content(
+        model=config.GEMINI_MODEL,
+        contents=[
+            genai_types.Part.from_uri(
+                file_uri=uploaded.uri, mime_type=uploaded.mime_type
+            ),
+            prompt,
+        ],
+    )
+    blocked = subtitle_extract._is_content_blocked(None, response)
+    if blocked is not None:
+        raise subtitle_extract.ContentBlockedError(
+            blocked["reason"], blocked["message"]
+        )
+    data = subtitle_extract._extract_json(response.text)
+    raw = data.get("lines", []) if isinstance(data, dict) else []
+    if not isinstance(raw, list):
+        raise ValueError("malformed QA payload from Gemini")
+    return raw
+
+
+def _qa_dialogue_lines(job_id, seg_dir, upload_root):
+    """The segment's dialogue list for the QA check (serial, time, text).
+
+    Text comes from the translated subtitles (``lang_files.entry_text``);
+    playback times come from the D4 unified timestamps — what actually plays
+    in the final video — falling back to the subtitle timing when unification
+    has not run. Reloaded per check round so a D4 re-run's fresh timestamps
+    are picked up.
+    """
+    lang = lang_files.target_lang(job_id, upload_root)
+    sub_path = seg_dir / lang_files.subtitles_json(lang)
+    if not sub_path.exists():
+        return []
+    try:
+        entries = json.loads(sub_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(entries, list):
+        return []
+    aligned = {}
+    ts_path = seg_dir / lang_files.timestamps_final(lang)
+    if ts_path.exists():
+        try:
+            ts_list = json.loads(ts_path.read_text(encoding="utf-8"))
+            if isinstance(ts_list, list):
+                aligned = {
+                    int(e["serial"]): e
+                    for e in ts_list
+                    if isinstance(e, dict) and e.get("serial") is not None
+                }
+        except (OSError, ValueError, TypeError):
+            aligned = {}
+    lines = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("serial") is None:
+            continue
+        try:
+            serial = int(entry["serial"])
+        except (TypeError, ValueError):
+            continue
+        timed = aligned.get(serial) or entry
+        try:
+            start = float(timed.get("start_sec", 0.0))
+            end = float(timed.get("end_sec", 0.0))
+        except (TypeError, ValueError):
+            start, end = 0.0, 0.0
+        lines.append(
+            {
+                "serial": serial,
+                "text": lang_files.entry_text(entry) or "",
+                "start_sec": start,
+                "end_sec": end,
+            }
+        )
+    return lines
+
+
+def build_auto_qa_prompt(lines):
+    """Assemble the Gemini QA prompt for a segment's dialogue lines."""
+    rendered = "\n".join(
+        f'{ln["serial"]}. [{ln["start_sec"]:.3f} - {ln["end_sec"]:.3f}] '
+        f'{ln["text"]}'
+        for ln in lines
+    )
+    return SEGMENT_QA_PROMPT.replace("{lines}", rendered)
+
+
+def _qa_line_failed(line):
+    return isinstance(line, dict) and line.get("pass") is False
+
+
+def _qa_serial(line):
+    try:
+        return int(line.get("serial"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _qa_failure_bn(error):
+    """Bengali summary of a QA Gemini failure; never raises."""
+    if not isinstance(error, dict):
+        return "স্বয়ংক্রিয় QA চেক ব্যর্থ হয়েছে।"
+    etype = error.get("type")
+    if etype == "call_budget_exceeded":
+        return "স্বয়ংক্রিয় QA চেকের জন্য Gemini কল-বাজেট শেষ হয়ে গেছে।"
+    if etype == "content_blocked":
+        return "স্বয়ংক্রিয় QA চেকটি সামগ্রী নীতিতে আটকে গেছে।"
+    message = str(error.get("message") or "").strip()
+    if message:
+        return f"স্বয়ংক্রিয় QA চেক ব্যর্থ হয়েছে: {message}"
+    return "স্বয়ংক্রিয় QA চেক ব্যর্থ হয়েছে।"
+
+
+def _qa_mismatch_notes(failed):
+    """Concise description of the failing lines for the correction re-run."""
+    parts = []
+    for line in failed:
+        serial = _qa_serial(line)
+        reason = str(line.get("reason") or "voice/scene mismatch").strip()
+        prefix = f"serial {serial}" if serial is not None else "a line"
+        parts.append(f"{prefix}: {reason}")
+    return "Auto QA detected voice/scene timing mismatch: " + "; ".join(parts)
+
+
+def _finish_qa_capped(job_id, index, root, log):
+    """Record the capped outcome + Bengali note and return the result."""
+    job_status_store.record_segment_qa(
+        job_id, index, job_status_store.SEGMENT_QA_CAPPED,
+        note_bn=job_status_store.SEGMENT_QA_CAP_NOTE_BN, upload_root=root,
+    )
+    log.warning(
+        "job %s seg %d: auto QA reached the %d-attempt cap; releasing to "
+        "human review with a note",
+        job_id, index, config.MAX_AUTO_QA_FIX_ATTEMPTS,
+    )
+    return {
+        "qa_state": job_status_store.SEGMENT_QA_CAPPED,
+        "note_bn": job_status_store.SEGMENT_QA_CAP_NOTE_BN,
+    }
+
+
+def run_auto_qa_gate(job_id, segment, seg_dir, final_path, upload_root=None,
+                     call_budget=None, logger_=None):
+    """Automated Gemini voice/scene pre-review gate for one segment (F14b).
+
+    Called after a segment's final video is rendered but BEFORE it is marked
+    ready for human review. Runs up to ``config.MAX_AUTO_QA_FIX_ATTEMPTS``
+    corrective rounds:
+
+    - Gemini watches the final video against the segment's dialogue list.
+    - All lines match  -> ``qa_passed``; no user-visible change.
+    - A mismatch       -> the finding is shaped exactly like a human
+      ``timing_mismatch`` review and fed through ``rerun_segment_stage`` (the
+      same correction path); the updated video is then re-checked.
+    - A Gemini API/parse failure counts as a failed attempt toward the cap
+      (never crashes the pipeline run).
+    - Cap reached with a mismatch -> ``qa_capped`` + a Bengali note for F14a.
+
+    Only the given segment's state is touched; other segments are unaffected.
+    Returns ``{"qa_state": str|None, "note_bn": str|None}`` (``qa_state`` is
+    ``None`` when the gate is skipped, e.g. no final video / no dialogue lines
+    / no active Gemini keys).
+    """
+    root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
+    log = logger_ or logger
+    index = segment["index"]
+    final_path = Path(final_path)
+    max_attempts = config.MAX_AUTO_QA_FIX_ATTEMPTS
+
+    if not final_path.exists():
+        log.warning("job %s seg %d: no final video for QA; gate skipped",
+                    job_id, index)
+        return {"qa_state": None, "note_bn": None}
+    if not _qa_dialogue_lines(job_id, seg_dir, root):
+        log.info("job %s seg %d: no dialogue lines; QA gate skipped",
+                 job_id, index)
+        return {"qa_state": None, "note_bn": None}
+    keys = key_store.get_active_keys()
+    if not keys:
+        log.warning("job %s seg %d: no active Gemini keys; QA gate skipped",
+                    job_id, index)
+        return {"qa_state": None, "note_bn": None}
+
+    job_status_store.record_segment_qa(
+        job_id, index, job_status_store.SEGMENT_QA_CHECKING, upload_root=root
+    )
+    rotation = 0
+    attempt = 0
+    fix_attempts = 0
+    while True:
+        attempt += 1
+        lines = _qa_dialogue_lines(job_id, seg_dir, root)
+        if not lines:
+            job_status_store.record_segment_qa(
+                job_id, index, job_status_store.SEGMENT_QA_PASSED,
+                attempt=attempt, outcome="pass", fixed=False,
+                upload_root=root,
+            )
+            log.info("job %s seg %d: no dialogue lines to QA on attempt %d; "
+                     "releasing", job_id, index, attempt)
+            return {"qa_state": job_status_store.SEGMENT_QA_PASSED,
+                    "note_bn": None}
+        prompt = build_auto_qa_prompt(lines)
+        result, rotation, error = subtitle_extract.call_with_rotation(
+            keys, rotation, _qa_check_video, prompt, str(final_path),
+            call_budget=call_budget, logger_=log,
+        )
+        if result is None:
+            fix_attempts += 1
+            bn = _qa_failure_bn(error)
+            job_status_store.record_segment_qa(
+                job_id, index, f"qa_fixing_attempt_{attempt}",
+                attempt=attempt, outcome="failed", error_bn=bn,
+                upload_root=root,
+            )
+            log.warning(
+                "job %s seg %d: auto QA check attempt %d failed: %s",
+                job_id, index, attempt, error,
+            )
+            if fix_attempts >= max_attempts:
+                return _finish_qa_capped(job_id, index, root, log)
+            continue
+
+        failed = [line for line in result if _qa_line_failed(line)]
+        if not failed:
+            job_status_store.record_segment_qa(
+                job_id, index, job_status_store.SEGMENT_QA_PASSED,
+                attempt=attempt, outcome="pass", fixed=False,
+                upload_root=root,
+            )
+            log.info("job %s seg %d: auto QA passed on attempt %d",
+                     job_id, index, attempt)
+            return {"qa_state": job_status_store.SEGMENT_QA_PASSED,
+                    "note_bn": None}
+
+        serials = [s for s in (_qa_serial(line) for line in failed)
+                   if s is not None]
+        if fix_attempts >= max_attempts:
+            job_status_store.record_segment_qa(
+                job_id, index, f"qa_fixing_attempt_{attempt}",
+                attempt=attempt, outcome="mismatch", issues=serials,
+                fixed=False, upload_root=root,
+            )
+            return _finish_qa_capped(job_id, index, root, log)
+
+        notes = _qa_mismatch_notes(failed)
+        review = {
+            "round": 1,
+            "issues": ["timing_mismatch"],
+            "notes": notes,
+        }
+        log.warning(
+            "job %s seg %d: auto QA mismatch on attempt %d (lines %s); "
+            "running targeted re-run",
+            job_id, index, attempt, serials,
+        )
+        rerun = rerun_segment_stage(
+            job_id, index, round_no=None, review=review,
+            upload_root=root, call_budget=call_budget, logger_=log,
+        )
+        fixed = rerun.get("status") == "ok"
+        job_status_store.record_segment_qa(
+            job_id, index, f"qa_fixing_attempt_{attempt}",
+            attempt=attempt, outcome="mismatch", issues=serials, fixed=fixed,
+            upload_root=root,
+        )
+        fix_attempts += 1
+        if not fixed:
+            log.warning(
+                "job %s seg %d: auto QA fix attempt %d failed: %s",
+                job_id, index, attempt, rerun.get("error_bn"),
+            )

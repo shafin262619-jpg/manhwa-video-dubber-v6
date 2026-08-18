@@ -540,6 +540,104 @@ def restore_segment_state(job_id, seg_index, prior_entry, upload_root=None):
         _atomic_write(path, data)
 
 
+# ---------------------------------------------------------------------------
+# Per-segment automated pre-review QA gate (F14b Part 2)
+#
+# Before a segment is released to human review, an automated Gemini check
+# verifies voice/scene sync for every dialogue line and auto-fixes mismatches.
+# Its state lives on the segment entry as ``data["segments"]["seg_XXX"]["qa"]``
+# — an extension of the existing per-segment schema, not a parallel one:
+#
+#   "qa": {
+#     "state": "qa_checking" | "qa_fixing_attempt_N" | "qa_passed" | "qa_capped",
+#     "attempts": [
+#       {"attempt": 1, "outcome": "mismatch", "issues": [3, 7],
+#        "fixed": true, "at": "<iso>"},
+#       {"attempt": 2, "outcome": "pass", "fixed": false, "at": "<iso>"}
+#     ],
+#     "note_bn": "<Bengali note when capped>"
+#   }
+#
+# The attempts log mirrors F12b's per-window gap-fill log: every Gemini check
+# round is recorded with its outcome and whether a fix was applied, so the
+# gate's progress is inspectable rather than silent.
+# ---------------------------------------------------------------------------
+
+SEGMENT_QA_CHECKING = "qa_checking"
+SEGMENT_QA_PASSED = "qa_passed"
+SEGMENT_QA_CAPPED = "qa_capped"
+
+# Bengali note attached when the automated QA cap is reached (F14b Part 2);
+# surfaced in F14a's review UI so the user knows to look closely.
+SEGMENT_QA_CAP_NOTE_BN = (
+    "স্বয়ংক্রিয় প্রাক-রিভিউ চেক একটি সম্ভাব্য সমস্যা খুঁজে পেয়েছে "
+    "যা স্বয়ংক্রিয়ভাবে পুরোপুরি সমাধান করা যায়নি — এই সেগমেন্টটি "
+    "একটু মনোযোগ দিয়ে দেখে নিন।"
+)
+
+
+def record_segment_qa(job_id, seg_index, state, *, attempt=None, outcome=None,
+                      issues=None, fixed=None, error_bn=None, note_bn=None,
+                      upload_root=None):
+    """Record the automated pre-review QA gate state for one segment (F14b).
+
+    Writes ``data["segments"]["seg_XXX"]["qa"]["state"]``. When ``attempt`` is
+    given, an entry is appended to the ``qa.attempts`` log — one entry per
+    Gemini check round, recording its ``outcome`` (``pass`` / ``mismatch`` /
+    ``failed``), the failing serials and whether a targeted re-run fix was
+    applied. ``note_bn`` sets the Bengali note shown in F14a when the cap is
+    reached. Only the given segment's entry is modified; other segments are
+    untouched.
+    """
+    if attempt is not None and attempt < 1:
+        raise ValueError(f"invalid QA attempt {attempt!r}; attempts start at 1")
+    path = status_path(job_id, upload_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _lock_for(job_id):
+        data = read_status(job_id, upload_root)
+        seg_map = data.get("segments")
+        if not isinstance(seg_map, dict):
+            seg_map = {}
+            data["segments"] = seg_map
+        key = segmentation.segment_key(seg_index)
+        entry = seg_map.get(key)
+        if not isinstance(entry, dict):
+            entry = {"index": int(seg_index), "stages": {}}
+            seg_map[key] = entry
+        qa = entry.get("qa")
+        if not isinstance(qa, dict):
+            qa = {}
+            entry["qa"] = qa
+        qa["state"] = state
+        if note_bn:
+            qa["note_bn"] = str(note_bn)
+        if attempt is not None:
+            attempts = qa.get("attempts")
+            if not isinstance(attempts, list):
+                attempts = []
+                qa["attempts"] = attempts
+            attempt_entry = {
+                "attempt": int(attempt),
+                "outcome": outcome,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
+            if issues:
+                attempt_entry["issues"] = [int(i) for i in issues]
+            if fixed is not None:
+                attempt_entry["fixed"] = bool(fixed)
+            if error_bn:
+                attempt_entry["error_bn"] = str(error_bn)
+            attempts.append(attempt_entry)
+        _atomic_write(path, data)
+
+
+def get_segment_qa(job_id, seg_index, upload_root=None):
+    """The segment's ``qa`` block (or ``{}`` when never QA-checked)."""
+    entry = read_segment_status(job_id, seg_index, upload_root)
+    qa = entry.get("qa")
+    return qa if isinstance(qa, dict) else {}
+
+
 def _atomic_write(path, data):
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(

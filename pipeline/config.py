@@ -246,3 +246,9 @@ TRANSCRIPT_GAP_FILL_THRESHOLD_SEC = 6.0
 # first). None = unlimited (default). Guards the shared per-job Gemini
 # CallBudget from a transcript with many tiny holes.
 TRANSCRIPT_GAP_FILL_MAX_WINDOWS = None
+
+# F14b Part 2: max automated Gemini pre-review QA fix attempts per segment
+# before the segment is released to human review anyway (capped). Each Gemini
+# voice/scene-sync check round counts toward this cap, whether it found a
+# mismatch (and triggered a targeted re-run) or the check itself failed.
+MAX_AUTO_QA_FIX_ATTEMPTS = 3

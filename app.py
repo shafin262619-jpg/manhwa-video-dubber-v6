@@ -2221,11 +2221,22 @@ def _segment_review_block(job_id, entry):
     issue-tag checkboxes + free text + explicit "no issues" submit buttons,
     all wired to :func:`job_status_store.record_segment_review` via
     ``POST /segment-review/{job_id}/{index}``.
+
+    F14b Part 2: a round-1 entry that is only an automated-QA rerun
+    (``rerun: True``) is not a human review, so the form is still shown, and a
+    segment whose automated pre-review hit the attempt cap renders its Bengali
+    ``qa.note_bn`` banner above the card content.
     """
     index = entry.get("index")
     existing = job_status_store.get_segment_reviews(job_id, index, round_no=1)
     labels = job_status_store.SEGMENT_REVIEW_ISSUE_CATEGORIES
-    if existing is not None:
+    qa_note = (entry.get("qa") or {}).get("note_bn")
+    banner = ""
+    if qa_note:
+        banner = (
+            f'<p class="seg-review-qa-note">{html.escape(str(qa_note))}</p>'
+        )
+    if existing is not None and not existing.get("rerun"):
         summary = (
             f'<p class="seg-review-meta">রিভিউ রেকর্ড হয়েছে (রাউন্ড '
             f'{existing.get("round", 1)}):</p>'
@@ -2246,7 +2257,7 @@ def _segment_review_block(job_id, entry):
             summary += (
                 f'<p class="seg-review-notes">{html.escape(str(existing["notes"]))}</p>'
             )
-        return f'<div class="review-box seg-review">{summary}</div>'
+        return f'<div class="review-box seg-review">{banner}{summary}</div>'
     options = "".join(
         f'<label class="issue-tag"><input type="checkbox" name="issues" '
         f'value="{tag}"><span>{html.escape(bn)}</span></label>'
@@ -2254,6 +2265,7 @@ def _segment_review_block(job_id, entry):
     )
     return f"""
   <div class="review-box seg-review">
+    {banner}
     <h2>সেগমেন্ট {_seg_key(entry)} — রিভিউ</h2>
     <form method="post" action="/segment-review/{job_id}/{index}" class="trim-form">
       <fieldset>
