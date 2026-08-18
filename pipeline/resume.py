@@ -33,11 +33,30 @@ translate) is first missing from its artifact, using the same presence-proof
 pattern as the D2+ chain. The app wires that point back into
 ``_run_upload_pipeline`` so an interrupted upload resumes without re-running
 completed sub-stages.
+
+F13b (Part C): a segmented job (more than one segment in its plan) never has
+top-level ``subtitles_hi.json`` / D2+ artifacts — they live per segment under
+``segments_pipeline/seg_XXX/`` — so the whole-video resume logic must be
+skipped entirely. ``find_segmented_resume_point`` derives the resume point
+from the per-segment job status instead (the first segment whose state is not
+``done``), and ``resume_job`` re-enters ``segmented_pipeline``'s orchestration
+loop at that segment. This guard runs BEFORE the non-segmented upload-pipeline
+check so a segmented job can never fall through into the whole-video path
+(which would duplicate/corrupt per-segment work).
 """
 
 from pathlib import Path
 
-from pipeline import full_auto_chain, lang_files, render_final, video_ingest, voiceover_unify
+from pipeline import (
+    full_auto_chain,
+    job_status,
+    lang_files,
+    render_final,
+    segmented_pipeline,
+    segmentation,
+    video_ingest,
+    voiceover_unify,
+)
 
 # Upload-pipeline sub-stages and the artifact that proves each one finished.
 # Order matters: ``find_upload_resume_point`` returns the first missing one.
@@ -123,14 +142,101 @@ def find_upload_resume_point(job_id, upload_root=None):
     return None
 
 
+class SegmentedResumeError(RuntimeError):
+    """Raised when a segmented job cannot be safely resumed.
+
+    The exception message is the user-facing Bengali text; the app surfaces
+    ``str(exc)`` directly (HTTP 409 detail / error banner) so a clear message
+    reaches the user without a mapper.
+    """
+
+
+# Bengali user-facing messages for the segmented resume guard (F13b Part C).
+# Kept here so ``resume_job`` and the app endpoint stay in lock-step.
+SEGMENTED_ALREADY_COMPLETE_BN = "জব {job_id} ইতিমধ্যে সম্পূর্ণ — রিজিউম করার কিছু নেই।"
+SEGMENTED_STATUS_UNREADABLE_BN = (
+    "জব {job_id}-এর সেগমেন্ট স্ট্যাটাস পড়া যায়নি (অসম্পূর্ণ বা দূষিত); "
+    "নিরাপদে রিজিউম করা সম্ভব নয়।"
+)
+
+
+def _segmented_order(job_id, seg_map, upload_root=None):
+    """Segment indices in processing order: plan order when available.
+
+    The persisted plan is the authoritative order (the status map mirrors it),
+    but falls back to a sorted-by-index walk of the status map when the plan
+    file is unreadable so the resume decision never hard-crashes on a missing
+    sidecar.
+    """
+    try:
+        plan = segmentation.load_plan(job_id, upload_root)
+        return [int(seg["index"]) for seg in (plan.get("segments") or [])]
+    except (OSError, ValueError, KeyError):
+        pass
+    indices = []
+    for entry in seg_map.values():
+        if isinstance(entry, dict) and entry.get("index") is not None:
+            indices.append(int(entry["index"]))
+    return sorted(indices)
+
+
+def find_segmented_resume_point(job_id, upload_root=None):
+    """Return the next incomplete segment for a segmented job, or ``None``.
+
+    The decision is built purely from the per-segment job status the
+    orchestrator writes (``job_status.segments`` map + ``segmented`` block):
+    segments are walked in plan order and the first segment whose ``state`` is
+    not ``"done"`` is the resume point (the stage to continue from inside that
+    segment is resolved by the orchestrator's artifact-presence skips).
+    ``None`` means every segment is complete.
+
+    Raises :class:`SegmentedResumeError` (Bengali message) when the status is
+    too malformed to trust — no ``segments``/``segmented`` block, or a segment
+    entry missing its ``state``/``index`` — so the caller never guesses and
+    risks duplicating or corrupting per-segment work.
+    """
+    data = job_status.read_status(job_id, upload_root)
+    seg_map = data.get("segments")
+    segmented = data.get("segmented")
+    if not isinstance(seg_map, dict) or not isinstance(segmented, dict):
+        raise SegmentedResumeError(SEGMENTED_STATUS_UNREADABLE_BN.format(job_id=job_id))
+
+    for index in _segmented_order(job_id, seg_map, upload_root):
+        entry = seg_map.get(segmentation.segment_key(index))
+        if not isinstance(entry, dict) or entry.get("index") is None:
+            raise SegmentedResumeError(SEGMENTED_STATUS_UNREADABLE_BN.format(job_id=job_id))
+        if "state" not in entry:
+            raise SegmentedResumeError(SEGMENTED_STATUS_UNREADABLE_BN.format(job_id=job_id))
+        if entry.get("state") != "done":
+            return {"segment_index": int(index)}
+    return None
+
+
 def resume_job(job_id, upload_root=None):
     """Continue an interrupted job from its first missing artifact onward.
 
     Returns the chain result dict (see ``run_auto_tts_chain`` /
-    ``run_user_upload_chain``). Raises ``RuntimeError`` when the job is
-    already complete or has not finished the upload pipeline; stage failures
-    propagate exactly like a normal chain run.
+    ``run_user_upload_chain``, or ``run_segmented_pipeline`` for segmented
+    jobs). Raises ``RuntimeError`` when the job is already complete or has not
+    finished the upload pipeline; stage failures propagate exactly like a
+    normal chain run.
+
+    F13b (Part C): a segmented job is detected first and resumes by re-entering
+    the per-segment orchestrator at its first incomplete segment — the
+    non-segmented upload-pipeline/dubbing-chain logic below never runs for it.
     """
+    if segmentation.is_segmented(job_id, upload_root):
+        point = find_segmented_resume_point(job_id, upload_root)
+        if point is None:
+            raise SegmentedResumeError(
+                SEGMENTED_ALREADY_COMPLETE_BN.format(job_id=job_id)
+            )
+        return segmented_pipeline.run_segmented_pipeline(
+            job_id,
+            upload_root=upload_root,
+            start_segment_index=point["segment_index"],
+        )
+
     point = find_resume_point(job_id, upload_root)
     if point is None:
         raise RuntimeError(f"job {job_id} is already complete — nothing to resume")

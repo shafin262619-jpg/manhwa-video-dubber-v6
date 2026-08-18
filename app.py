@@ -1117,18 +1117,23 @@ def upload_status_page(job_id: str) -> HTMLResponse:
         auto_stage = stages.get("auto_full_render") or {}
         if auto_stage.get("state") == "done":
             return _render_chain_final_result(job_id, "auto_full_render")
-        if not auto_stage and (stages.get("upload_pipeline") or {}).get("state") == "done":
-            # FA-E1: the chain never started — the upload thread either was
-            # still in B1/B2/C1 when this page loaded (FA-C1 starts it right
-            # after) or stopped at upload_pipeline done (a manual override to
-            # auto_tts via /voiceover/{job_id}/choose after upload). Resume
-            # it so the page converges to the final video instead of polling a
-            # stage that would otherwise never run.
-            _start_stage(job_id, "auto_full_render", _run_auto_full_render)
-        return _polling_page(
-            job_id, "Uploading & Extracting", f"/upload/{job_id}",
-            "auto_full_render",
-        )
+        if not segmentation.is_segmented(job_id):
+            if not auto_stage and (stages.get("upload_pipeline") or {}).get("state") == "done":
+                # FA-E1: the chain never started — the upload thread either was
+                # still in B1/B2/C1 when this page loaded (FA-C1 starts it right
+                # after) or stopped at upload_pipeline done (a manual override to
+                # auto_tts via /voiceover/{job_id}/choose after upload). Resume
+                # it so the page converges to the final video instead of polling a
+                # stage that would otherwise never run.
+                _start_stage(job_id, "auto_full_render", _run_auto_full_render)
+            return _polling_page(
+                job_id, "Uploading & Extracting", f"/upload/{job_id}",
+                "auto_full_render",
+            )
+        # F13b: a segmented auto_tts job already ran its per-segment D2 -> F3
+        # chains inside the segmented pipeline — the whole-video chain must
+        # never be kicked. Fall through to the upload-complete result page.
+        return _render_segmented_result(job_id)
 
     # FA-D2: after the user uploads their own audio the job continues (same
     # page as the entry point): while user_audio_pipeline runs, stay on the
@@ -1657,6 +1662,13 @@ def resume_polling_page(job_id: str) -> HTMLResponse:
     status = job_status_store.read_status(job_id)
     if status.get("stage") == "unknown":
         raise HTTPException(status_code=404, detail=f"unknown job {job_id}")
+    # F13b (Part C): a segmented job resumes through the per-segment
+    # orchestrator on the "resume" stage (its top-level artifacts never exist,
+    # so the whole-video upload/dubbing resume logic below must not run).
+    if segmentation.is_segmented(job_id):
+        return _polling_page(
+            job_id, "Resuming segmented job", f"/upload/{job_id}", "resume"
+        )
     upload_point = resume.find_upload_resume_point(job_id)
     if upload_point not in (None, "upload_pipeline"):
         return _polling_page(
@@ -1682,7 +1694,29 @@ def resume_job_endpoint(job_id: str) -> dict:
     picks the first missing upload sub-stage and the existing upload thread
     continues from there (skipping completed sub-stages). Only a job with no
     upload work done at all keeps returning 409.
+
+    F13b (Part C): a segmented job (more than one segment in its plan) is
+    handled FIRST — its per-segment status derives the resume segment, the
+    per-segment orchestrator re-enters there, and the whole-video resume logic
+    below is never reached (it would re-run B2 on the top level and corrupt
+    per-segment work).
     """
+    if segmentation.is_segmented(job_id):
+        try:
+            point = resume.find_segmented_resume_point(job_id)
+        except resume.SegmentedResumeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        if point is None:
+            raise HTTPException(
+                status_code=409,
+                detail=resume.SEGMENTED_ALREADY_COMPLETE_BN.format(job_id=job_id),
+            )
+        _start_stage(job_id, "resume", _run_resume)
+        return {
+            "job_id": job_id,
+            "resume_point": f"segment_{point['segment_index']:03d}",
+            "status": "processing",
+        }
     try:
         point = resume.find_resume_point(job_id)
     except Exception as exc:  # noqa: BLE001 - guard; find_resume_point never raises normally
@@ -2174,6 +2208,58 @@ def final_page(job_id: str) -> HTMLResponse:
     return _render_final_result(job_id)
 
 
+def _render_segmented_result(job_id: str) -> HTMLResponse:
+    """Result page for a segmented job: per-segment final videos.
+
+    F13b (Part C): a segmented auto_tts job has no whole-video
+    ``final_video``, so ``/upload/{job_id}`` renders the per-segment final
+    videos instead of kicking the whole-video chain (which must never run for
+    a segmented job). Also the landing page after a segmented resume.
+    """
+    data = job_status_store.read_status(job_id)
+    seg_map = data.get("segments") or {}
+    badge_class = {
+        "done": "badge-done",
+        "error": "badge-error",
+        "running": "badge-running",
+    }
+    rows = []
+    for key in sorted(seg_map):
+        entry = seg_map[key]
+        if not isinstance(entry, dict):
+            continue
+        index = entry.get("index")
+        state = entry.get("state", "unknown")
+        cls = badge_class.get(state, "badge-idle")
+        final_path = entry.get("final_path")
+        link = "—"
+        if final_path and Path(final_path).exists():
+            link = (
+                f'<a href="/download/{job_id}/segment/{index}">'
+                "Download final video</a>"
+            )
+        rows.append(
+            f"<tr><td><code>{key}</code></td>"
+            f"<td><span class=\"history-badge {cls}\">{html.escape(str(state))}</span></td>"
+            f"<td>{entry.get('start_sec')} → {entry.get('end_sec')}s</td>"
+            f"<td>{link}</td></tr>"
+        )
+    segmented = data.get("segmented") or {}
+    summary = (
+        f"{segmented.get('completed_count', 0)}/{segmented.get('total_count', 0)} "
+        "segments complete"
+    )
+    body = f"""<h1>Segmented job — {job_id}</h1>
+  <p>{summary} (overall: <strong>{html.escape(str(segmented.get('overall_state', 'unknown')))}</strong>).</p>
+  <table class="keys-table">
+    <thead><tr><th>Segment</th><th>State</th><th>Range</th><th>Final video</th></tr></thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>"""
+    return HTMLResponse(
+        ui.page(f"Segmented Job — {job_id} — Manhwa Video Dubber", body)
+    )
+
+
 def _render_final_result(job_id: str, result=None, warnings=None) -> HTMLResponse:
     if not isinstance(result, dict):
         stage = job_status_store.read_status(job_id).get("stages", {}).get(
@@ -2216,6 +2302,22 @@ def download_final(job_id: str) -> FileResponse:
             detail=f"no final_video.mp4 for job {job_id} (final render not done yet?)",
         )
     return FileResponse(path, media_type="video/mp4", filename="final_video.mp4")
+
+
+@app.get("/download/{job_id}/segment/{seg_index}", response_class=FileResponse)
+def download_segment_final(job_id: str, seg_index: int) -> FileResponse:
+    """Per-segment final video (F13b): the only final artifact a segmented job
+    produces — there is no whole-video ``final_video.mp4`` for it."""
+    path = segmented_pipeline.segment_final_path(job_id, seg_index)
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"no final video for segment {seg_index} of job {job_id}",
+        )
+    key = segmentation.segment_key(seg_index)
+    return FileResponse(
+        path, media_type="video/mp4", filename=f"{key}_final_video.mp4"
+    )
 
 
 if __name__ == "__main__":

@@ -133,42 +133,53 @@ def run_segment_voiceover_chain(job_id, segment, seg_dir, upload_root,
                                 call_budget, logger_=None):
     """auto_tts D2 -> D4 -> E1 -> E2 -> F3 for one segment.
 
+    Each stage is skipped when its artifact already exists in the segment dir,
+    so a resumed pipeline never re-runs completed per-segment work (mirrors
+    ``run_segment_upload_chain``). On a fresh segment no artifact exists yet,
+    so every stage still runs — behavior is byte-identical to a first pass.
     Raises on failure; returns the segment's final video path.
     """
     log = logger_ or logger
     index = segment["index"]
-    log.info("job %s seg %d: D2 auto voiceover", job_id, index)
-    _run_segment_stage(
-        job_id, index, "D2_voiceover",
-        voiceover_auto.generate_auto_voiceover, job_id,
-        upload_root=upload_root, call_budget=call_budget, job_dir=seg_dir,
-    )
-    _run_segment_stage(
-        job_id, index, "D4_unify",
-        voiceover_unify.unify_voiceover_timestamps, job_id,
-        upload_root=upload_root, job_dir=seg_dir,
-    )
-    _run_segment_stage(
-        job_id, index, "E1_guideline",
-        edit_guideline.build_edit_guideline, job_id,
-        upload_root=upload_root, job_dir=seg_dir,
-    )
-    _run_segment_stage(
-        job_id, index, "E2_draft",
-        auto_cut.build_draft_video, job_id,
-        upload_root=upload_root, job_dir=seg_dir,
-    )
+    lang = lang_files.target_lang(job_id, upload_root)
+    if not (seg_dir / lang_files.timestamps_auto(lang)).exists():
+        log.info("job %s seg %d: D2 auto voiceover", job_id, index)
+        _run_segment_stage(
+            job_id, index, "D2_voiceover",
+            voiceover_auto.generate_auto_voiceover, job_id,
+            upload_root=upload_root, call_budget=call_budget, job_dir=seg_dir,
+        )
+    if not (seg_dir / lang_files.timestamps_final(lang)).exists():
+        _run_segment_stage(
+            job_id, index, "D4_unify",
+            voiceover_unify.unify_voiceover_timestamps, job_id,
+            upload_root=upload_root, job_dir=seg_dir,
+        )
+    if not (seg_dir / "edit_guideline.json").exists():
+        _run_segment_stage(
+            job_id, index, "E1_guideline",
+            edit_guideline.build_edit_guideline, job_id,
+            upload_root=upload_root, job_dir=seg_dir,
+        )
+    if not (seg_dir / "draft_final_video.mp4").exists():
+        _run_segment_stage(
+            job_id, index, "E2_draft",
+            auto_cut.build_draft_video, job_id,
+            upload_root=upload_root, job_dir=seg_dir,
+        )
     final_path = segment_final_path(job_id, index)
-    log.info("job %s seg %d: F3 final render", job_id, index)
-    _run_segment_stage(
-        job_id, index, "F3_final",
-        render_final.finalize_video, job_id,
-        upload_root=upload_root, job_dir=seg_dir, output_path=final_path,
-    )
+    if not final_path.exists():
+        log.info("job %s seg %d: F3 final render", job_id, index)
+        _run_segment_stage(
+            job_id, index, "F3_final",
+            render_final.finalize_video, job_id,
+            upload_root=upload_root, job_dir=seg_dir, output_path=final_path,
+        )
     return final_path
 
 
-def run_segmented_pipeline(job_id, upload_root=None, call_budget=None):
+def run_segmented_pipeline(job_id, upload_root=None, call_budget=None,
+                           start_segment_index=0):
     """Run the whole downstream chain per segment, sequentially (F13b).
 
     Loads the persisted segment plan, materialises + processes each segment
@@ -176,6 +187,12 @@ def run_segmented_pipeline(job_id, upload_root=None, call_budget=None):
     ``auto_tts`` jobs continue straight through D2 -> F3 per segment; other
     voice sources stop after per-segment C1 (the user_upload continuation is
     triggered once the audio arrives).
+
+    ``start_segment_index`` (F13b Part C) re-enters the loop at a specific
+    segment instead of the first one — the resume path continues from the
+    first incomplete segment, never re-processing completed ones. Segments
+    already marked ``done`` in job status are skipped outright (idempotent
+    re-entry) so a repeated resume can never duplicate work.
 
     Raises on the first failing segment so the caller can persist the error.
     """
@@ -187,6 +204,34 @@ def run_segmented_pipeline(job_id, upload_root=None, call_budget=None):
     segments_results = []
     for segment in plan["segments"]:
         index = segment["index"]
+        entry = job_status_store.read_segment_status(job_id, index, upload_root)
+        if index < start_segment_index:
+            if entry.get("state") == "done":
+                segments_results.append(
+                    {
+                        "index": index,
+                        "start_sec": segment["start_sec"],
+                        "end_sec": segment["end_sec"],
+                        "entries_count": segment["entries_count"],
+                        "final_path": entry.get("final_path"),
+                        "status": "ok",
+                    }
+                )
+            continue
+        if entry.get("state") == "done":
+            log.info("job %s: segment %d already complete — skipping",
+                     job_id, index)
+            segments_results.append(
+                {
+                    "index": index,
+                    "start_sec": segment["start_sec"],
+                    "end_sec": segment["end_sec"],
+                    "entries_count": segment["entries_count"],
+                    "final_path": entry.get("final_path"),
+                    "status": "ok",
+                }
+            )
+            continue
         log.info("job %s: processing segment %d [%.3f, %.3f)",
                  job_id, index, segment["start_sec"], segment["end_sec"])
         try:
