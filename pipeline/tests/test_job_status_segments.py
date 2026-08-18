@@ -159,3 +159,106 @@ class SegmentSummaryTest(JobStatusSegmentsBase):
             key = segmentation.segment_key(seg["index"])
             self.assertIn(key, data["segments"])
             self.assertEqual(data["segments"][key]["index"], seg["index"])
+
+
+class SegmentReviewRecordingTest(JobStatusSegmentsBase):
+    def setUp(self):
+        super().setUp()
+        store.init_segments("job-x", _plan())
+
+    def test_record_persists_tags_notes_and_timestamp(self):
+        store.record_segment_review(
+            "job-x", 0,
+            issues=["timing_mismatch", "tts_quality"],
+            notes="গ্যালারিতে দৃশ্য দেখা যাচ্ছে না",
+        )
+        entry = store.get_segment_reviews("job-x", 0, round_no=1)
+        self.assertEqual(entry["round"], 1)
+        self.assertEqual(entry["issues"], ["timing_mismatch", "tts_quality"])
+        self.assertEqual(entry["notes"], "গ্যালারিতে দৃশ্য দেখা যাচ্ছে না")
+        self.assertIn("reviewed_at", entry)
+        data = json.loads(
+            (self.upload_root / "job-x" / "job_status.json").read_text(encoding="utf-8")
+        )
+        round_entry = data["segments"]["seg_000"]["reviews"]["1"]
+        self.assertEqual(round_entry["issues"], ["timing_mismatch", "tts_quality"])
+        self.assertEqual(round_entry["notes"], "গ্যালারিতে দৃশ্য দেখা যাচ্ছে না")
+
+    def test_no_issues_is_distinct_from_no_report(self):
+        store.record_segment_review("job-x", 0, issues=[])
+        approved = store.get_segment_reviews("job-x", 0, round_no=1)
+        self.assertIsNotNone(approved)
+        self.assertEqual(approved["issues"], [])
+        unreviewed = store.get_segment_reviews("job-x", 1, round_no=1)
+        self.assertIsNone(unreviewed)
+        self.assertEqual(store.get_segment_reviews("job-x", 1), {})
+
+    def test_multiple_rounds_coexist_without_overwrite(self):
+        store.record_segment_review(
+            "job-x", 0, issues=["timing_mismatch"], notes="round one", round_no=1
+        )
+        store.record_segment_review(
+            "job-x", 0, issues=["bad_translation"], round_no=2
+        )
+        r1 = store.get_segment_reviews("job-x", 0, round_no=1)
+        r2 = store.get_segment_reviews("job-x", 0, round_no=2)
+        self.assertEqual(r1["issues"], ["timing_mismatch"])
+        self.assertEqual(r1["notes"], "round one")
+        self.assertEqual(r2["issues"], ["bad_translation"])
+        self.assertNotIn("notes", r2)
+        reviews = store.get_segment_reviews("job-x", 0)
+        self.assertEqual(sorted(reviews.keys()), ["1", "2"])
+
+    def test_default_round_is_one(self):
+        store.record_segment_review("job-x", 0, issues=["audio_glitch"])
+        entry = store.get_segment_reviews("job-x", 0, round_no=1)
+        self.assertEqual(entry["issues"], ["audio_glitch"])
+
+    def test_review_for_segment_does_not_alter_other_segment_state(self):
+        store.mark_segment_done("job-x", 1, final_path="/out/seg_001.mp4")
+        store.record_segment_review(
+            "job-x", 0, issues=["tts_quality"], round_no=1
+        )
+        seg1 = store.read_segment_status("job-x", 1)
+        self.assertEqual(seg1["state"], "done")
+        self.assertEqual(seg1["final_path"], "/out/seg_001.mp4")
+        seg0 = store.read_segment_status("job-x", 0)
+        self.assertEqual(seg0["state"], "pending")
+        summary = store.segmented_summary("job-x")
+        self.assertEqual(summary["completed_count"], 1)
+        self.assertEqual(summary["overall_state"], "running")
+
+    def test_unknown_issue_tag_raises(self):
+        with self.assertRaises(ValueError):
+            store.record_segment_review(
+                "job-x", 0, issues=["not_a_real_tag"], round_no=1
+            )
+
+    def test_invalid_round_raises(self):
+        with self.assertRaises(ValueError):
+            store.record_segment_review("job-x", 0, issues=[], round_no=0)
+
+    def test_duplicate_tags_are_collapsed(self):
+        store.record_segment_review(
+            "job-x", 0, issues=["other", "other"], notes="dupe", round_no=1
+        )
+        entry = store.get_segment_reviews("job-x", 0, round_no=1)
+        self.assertEqual(entry["issues"], ["other"])
+
+    def test_f13b_functions_are_unaffected(self):
+        store.write_segment_status("job-x", 0, "B2_subtitles", "done")
+        store.record_segment_review("job-x", 0, issues=["audio_glitch"])
+        store.mark_segment_done("job-x", 0, final_path="/f0.mp4")
+        store.mark_segment_done("job-x", 1, final_path="/f1.mp4")
+        data = store.read_status("job-x")
+        self.assertEqual(data["segmented"]["completed_count"], 2)
+        self.assertEqual(data["segmented"]["overall_state"], "done")
+        self.assertEqual(data["state"], "done")
+        self.assertEqual(
+            store.read_segment_status("job-x", 0)["stages"]["B2_subtitles"]["state"],
+            "done",
+        )
+        self.assertEqual(
+            store.get_segment_reviews("job-x", 0, round_no=1)["issues"],
+            ["audio_glitch"],
+        )

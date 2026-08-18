@@ -321,6 +321,110 @@ def _update_segmented_overall(data):
     data["state"] = overall
 
 
+# ---------------------------------------------------------------------------
+# Per-segment review recording (F14a/Part1)
+#
+# As each segment finishes, the user can report problems with it, possibly
+# across multiple fix rounds (a future chunk adds rounds 2+; the schema
+# supports them from the start). Reviews live under
+# ``data["segments"]["seg_XXX"]["reviews"]``, a map keyed by round number so
+# rounds never overwrite each other. A round entry with an empty ``issues``
+# list is the explicit "reviewed, no issues" state — distinct from a segment
+# that has never been reviewed (no entry at all). Recording a review only
+# touches the given segment's entry, so it never disturbs the processing
+# state of any other segment.
+# ---------------------------------------------------------------------------
+
+SEGMENT_REVIEW_ISSUE_CATEGORIES = {
+    "timing_mismatch": "ভয়েস ও দৃশ্যের টাইমিং মিসম্যাচ",
+    "bad_translation": "ভুল বা দুর্বল অনুবাদ",
+    "subtitle_timing": "সাবটাইটেল টাইমিং ঠিক নেই",
+    "tts_quality": "উচ্চারণ বা ভয়েস কোয়ালিটি সমস্যা",
+    "audio_glitch": "অডিও কোয়ালিটি সমস্যা",
+    "other": "অন্য কোনো সমস্যা (ফ্রি টেক্সট)",
+}
+
+DEFAULT_REVIEW_ROUND = 1
+
+
+def record_segment_review(job_id, seg_index, issues=None,
+                          round_no=DEFAULT_REVIEW_ROUND, notes=None,
+                          upload_root=None):
+    """Record a per-segment issue report for one review round.
+
+    Writes ``data["segments"]["seg_XXX"]["reviews"][round]`` holding the list
+    of issue tags, optional free text and a UTC timestamp. ``issues`` must be
+    a list of :data:`SEGMENT_REVIEW_ISSUE_CATEGORIES` keys; an empty list (or
+    ``None``) records the explicit "reviewed, no issues" state for this round.
+    Multiple rounds coexist under ``reviews`` and never overwrite each other.
+    Only the given segment's entry is modified — the processing state of other
+    segments is left untouched.
+    """
+    unknown = [
+        tag for tag in (issues or []) if tag not in SEGMENT_REVIEW_ISSUE_CATEGORIES
+    ]
+    if unknown:
+        raise ValueError(
+            f"invalid issue tag(s) {unknown!r}; expected one of "
+            f"{sorted(SEGMENT_REVIEW_ISSUE_CATEGORIES)}"
+        )
+    if round_no < 1:
+        raise ValueError(f"invalid review round {round_no!r}; rounds start at 1")
+    seen = set()
+    clean = []
+    for tag in issues or []:
+        if tag not in seen:
+            seen.add(tag)
+            clean.append(tag)
+    path = status_path(job_id, upload_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _lock_for(job_id):
+        data = read_status(job_id, upload_root)
+        seg_map = data.get("segments")
+        if not isinstance(seg_map, dict):
+            seg_map = {}
+            data["segments"] = seg_map
+        key = segmentation.segment_key(seg_index)
+        entry = seg_map.get(key)
+        if not isinstance(entry, dict):
+            entry = {"index": int(seg_index), "stages": {}}
+            seg_map[key] = entry
+        reviews = entry.get("reviews")
+        if not isinstance(reviews, dict):
+            reviews = {}
+            entry["reviews"] = reviews
+        round_entry = {
+            "round": int(round_no),
+            "issues": clean,
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if notes:
+            round_entry["notes"] = str(notes)
+        reviews[str(int(round_no))] = round_entry
+        _atomic_write(path, data)
+
+
+def get_segment_reviews(job_id, seg_index, round_no=None, upload_root=None):
+    """Return recorded reviews for one segment.
+
+    With ``round_no`` returns that round's entry (or ``None`` when the segment
+    has no review for that round yet). Without it returns the full per-round
+    map (``{}`` when nothing has been recorded). An entry whose ``issues`` is
+    ``[]`` is the explicit "reviewed, no issues" state; a missing round means
+    the segment has not been reviewed in that round.
+    """
+    key = segmentation.segment_key(seg_index)
+    data = read_status(job_id, upload_root)
+    entry = data.get("segments", {}).get(key)
+    if isinstance(entry, dict) and isinstance(entry.get("reviews"), dict):
+        reviews = entry["reviews"]
+    else:
+        reviews = {}
+    if round_no is None:
+        return reviews
+    return reviews.get(str(int(round_no)))
+
+
 def _atomic_write(path, data):
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(
