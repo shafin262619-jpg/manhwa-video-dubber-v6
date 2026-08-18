@@ -467,7 +467,8 @@ def _replace_range_entries(entries, start, end, new_subs):
 
 
 def repair_flagged_regions(job_id, entries, diagnostics, upload_root=None,
-                           call_budget=None, logger_=None, max_attempts=None):
+                           call_budget=None, logger_=None, max_attempts=None,
+                           job_dir=None, time_offset_sec=0.0):
     """Bounded targeted-repair orchestration over A3 diagnostics.
 
     Builds a merged, weight-ordered list of time ranges from
@@ -477,6 +478,13 @@ def repair_flagged_regions(job_id, entries, diagnostics, upload_root=None,
     replaces the raw entries overlapping each successfully-repaired window
     with the freshly extracted absolute-timed subtitles. The whole list is
     re-serialized at the end.
+
+    ``job_dir`` (optional) points the artifact writes at a different
+    directory (a per-segment mini job, F13b) than ``upload_root / job_id``.
+    ``time_offset_sec`` (optional, F13b) re-bases segment-relative repair
+    windows back to absolute video time for ``extract_window`` (which always
+    cuts the whole ``source.mp4``) and re-bases the extracted subtitles back
+    to segment-relative.
 
     Never raises: a range whose extraction returns ``None`` is skipped and the
     next one proceeds. Ranges beyond ``max_attempts`` are not attempted and are
@@ -505,12 +513,21 @@ def repair_flagged_regions(job_id, entries, diagnostics, upload_root=None,
             continue
         attempted += 1
         new_subs = subtitle_extract.extract_window(
-            job_id, start, end,
+            job_id, start + time_offset_sec, end + time_offset_sec,
             upload_root=upload_root, call_budget=call_budget, logger_=log,
         )
         if new_subs is None:
             failed += 1
             continue
+        if time_offset_sec:
+            new_subs = [
+                dict(
+                    s,
+                    start_sec=round(float(s.get("start_sec", 0.0)) - time_offset_sec, 3),
+                    end_sec=round(float(s.get("end_sec", 0.0)) - time_offset_sec, 3),
+                )
+                for s in new_subs
+            ]
         succeeded += 1
         repaired = _replace_range_entries(repaired, start, end, new_subs)
 
@@ -523,7 +540,8 @@ def repair_flagged_regions(job_id, entries, diagnostics, upload_root=None,
     return _serialize(repaired), summary
 
 
-def build_subtitle_list(job_id, upload_root=None, call_budget=None, auto_repair=True):
+def build_subtitle_list(job_id, upload_root=None, call_budget=None, auto_repair=True,
+                        job_dir=None, time_offset_sec=0.0):
     """Build ``subtitles_zh.json`` from ``subtitles_zh_raw.json``. Returns list.
 
     Side artifact: also writes ``subtitle_qa.json`` with coverage-gap and
@@ -534,9 +552,15 @@ def build_subtitle_list(job_id, upload_root=None, call_budget=None, auto_repair=
     The return value is unchanged (still the serialized entries list) for
     backward compatibility. ``call_budget`` and ``auto_repair`` default to
     ``None`` / ``True`` so existing callers keep working.
+
+    ``job_dir`` (optional) runs the stage against a different directory (a
+    per-segment mini job, F13b) instead of ``upload_root / job_id``;
+    ``time_offset_sec`` (optional, F13b) is forwarded to the auto-repair pass
+    so its segment-relative windows are re-based for the whole-video
+    ``extract_window`` cuts.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
-    job_dir = upload_root / job_id
+    job_dir = Path(job_dir) if job_dir else upload_root / job_id
     raw = _load_json(job_dir / "subtitles_zh_raw.json")
     meta = _load_json_optional(job_dir / "job_meta.json")
     duration = _duration_of(meta, raw.get("subtitles", []))
@@ -556,6 +580,7 @@ def build_subtitle_list(job_id, upload_root=None, call_budget=None, auto_repair=
             result, repair_summary = repair_flagged_regions(
                 job_id, entries, diagnostics,
                 upload_root=upload_root, call_budget=call_budget,
+                job_dir=job_dir, time_offset_sec=time_offset_sec,
             )
             entries = _entries_from_serialized(result)
     else:
@@ -578,14 +603,14 @@ def build_subtitle_list(job_id, upload_root=None, call_budget=None, auto_repair=
     if repair_summary is not None:
         diagnostics["repair"] = repair_summary
     refresh_qa(
-        job_id, result, upload_root=upload_root,
+        job_id, result, upload_root=upload_root, job_dir=job_dir,
         repair_summary=repair_summary, collision_clusters=collision_clusters,
     )
     return result
 
 
 def refresh_qa(job_id, serialized_entries, upload_root=None, repair_summary=None,
-               collision_clusters=None):
+               collision_clusters=None, job_dir=None):
     """Rewrite ``subtitle_qa.json`` + ``subtitles_zh.json`` from entries.
 
     Recomputes the QA diagnostics (gaps, duplicate clusters, collision
@@ -598,7 +623,7 @@ def refresh_qa(job_id, serialized_entries, upload_root=None, repair_summary=None
     diagnostics dict.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
-    job_dir = upload_root / job_id
+    job_dir = Path(job_dir) if job_dir else upload_root / job_id
     meta = _load_json_optional(job_dir / "job_meta.json")
     duration = _duration_of(meta, serialized_entries)
     if collision_clusters is None:
@@ -642,14 +667,14 @@ def _entries_from_serialized(serialized):
     ]
 
 
-def load_subtitle_qa(job_id, upload_root=None):
+def load_subtitle_qa(job_id, upload_root=None, job_dir=None):
     """Read ``subtitle_qa.json`` and return its dict.
 
     Never raises: when the file is missing or malformed, returns a default
     dict with empty diagnostics lists.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
-    job_dir = upload_root / job_id
+    job_dir = Path(job_dir) if job_dir else upload_root / job_id
     path = job_dir / "subtitle_qa.json"
     if not path.exists():
         return {

@@ -131,16 +131,19 @@ def _normalize_and_concat(clip_paths, out_path):
         )
 
 
-def generate_auto_voiceover(job_id, upload_root=None, call_budget=None):
+def generate_auto_voiceover(job_id, upload_root=None, call_budget=None,
+                            job_dir=None):
     """Generate the full voiceover for a job. Returns a result dict.
 
     The voice is picked per ``target_lang`` from ``config.TTS_VOICES`` (hi
     keeps the pre-F12f placeholder voice). Raises FileNotFoundError when the
     job has no ``subtitles_<target_lang>.json``. Never raises on per-line TTS
-    failures (silence placeholders are used).
+    failures (silence placeholders are used). ``job_dir`` (optional) runs the
+    stage against a different directory (a per-segment mini job, F13b) instead
+    of ``upload_root / job_id``.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
-    job_dir = upload_root / job_id
+    job_dir = Path(job_dir) if job_dir else upload_root / job_id
     lang = lang_files.target_lang(job_id, upload_root)
     voice = config.TTS_VOICES.get(lang, config.TTS_VOICE_HINDI)
     sub_name = lang_files.subtitles_json(lang)

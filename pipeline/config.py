@@ -77,6 +77,18 @@ SUBTITLE_OVERLAP_SEC = 30.0
 # seconds are treated as overlap duplicates and de-duplicated.
 SUBTITLE_DEDUP_TOLERANCE_SEC = 10.0
 
+# F13b: target length (seconds) of each per-segment pipeline run. Long videos
+# are split at natural transcript gaps (never mid-dialogue) into segments of
+# roughly this duration, and the whole downstream chain (B2 -> C1 -> D2-F3)
+# runs independently on one segment at a time. A video with no usable gaps or
+# shorter than the target yields exactly one segment (the existing flow).
+SEGMENT_TARGET_DURATION_SEC = 300
+
+# F13b: a trailing piece of video shorter than this fraction of the target
+# duration is folded into the previous segment instead of becoming a tiny
+# final segment.
+SEGMENT_MIN_TRAILING_RATIO = 0.5
+
 # Gemini model used for video-understanding subtitle extraction.
 # gemini-2.0-flash shut down on 2026-06-01; Google's recommended replacement is
 # gemini-3.6-flash (no shutdown date announced).

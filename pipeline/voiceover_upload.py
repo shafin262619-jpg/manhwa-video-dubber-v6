@@ -341,15 +341,17 @@ def _resolve_whisper_language(target_lang, logger_=None):
     return job_config.DEFAULT_TARGET_LANG
 
 
-def align_uploaded_voiceover(job_id, upload_root=None):
+def align_uploaded_voiceover(job_id, upload_root=None, job_dir=None):
     """Align ``text_hi`` lines to the uploaded voiceover. Never raises on
     Gemini/Whisper failures.
 
     Raises FileNotFoundError when the job has no ``voiceover_hi.wav`` or no
-    ``subtitles_hi.json``. Writes ``timestamps_hi_upload.json``.
+    ``subtitles_hi.json``. Writes ``timestamps_hi_upload.json``. ``job_dir``
+    (optional) runs the stage against a different directory (a per-segment
+    mini job, F13b) instead of ``upload_root / job_id``.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
-    job_dir = upload_root / job_id
+    job_dir = Path(job_dir) if job_dir else upload_root / job_id
     lang = lang_files.target_lang(job_id, upload_root)
     audio_name = lang_files.voiceover_audio(lang)
     audio_path = job_dir / audio_name

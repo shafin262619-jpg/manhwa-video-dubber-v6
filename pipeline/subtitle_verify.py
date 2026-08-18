@@ -43,13 +43,16 @@ def _skipped_result(reason, covered_sec, collision_clusters=None):
     }
 
 
-def whisper_cross_check(job_id, upload_root=None, logger_=None):
+def whisper_cross_check(job_id, upload_root=None, logger_=None, job_dir=None):
     """Extract audio from ``source.mp4`` (ffmpeg, mono wav at
     ``config.TTS_SAMPLE_RATE``, same pattern as
     ``voiceover_upload._convert_to_wav()``), transcribe it with
     ``config.WHISPER_MODEL`` (segment-level, language auto-detect), and
     compare the Whisper-measured spoken duration against the Gemini-extracted
     covered duration from ``subtitle_qa.json`` (A3).
+
+    ``job_dir`` (optional) runs the check against a different directory (a
+    per-segment mini job, F13b) instead of ``upload_root / job_id``.
 
     Returns::
 
@@ -73,10 +76,11 @@ def whisper_cross_check(job_id, upload_root=None, logger_=None):
     """
     log = logger_ or logger
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
-    job_dir = upload_root / job_id
+    job_dir = Path(job_dir) if job_dir else upload_root / job_id
     source_path = job_dir / "source.mp4"
 
-    qa = subtitle_builder.load_subtitle_qa(job_id, upload_root=upload_root)
+    qa = subtitle_builder.load_subtitle_qa(job_id, upload_root=upload_root,
+                                           job_dir=job_dir)
     try:
         covered_sec = float(qa.get("covered_duration_sec", 0.0))
     except (TypeError, ValueError):

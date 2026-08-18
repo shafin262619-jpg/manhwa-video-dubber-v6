@@ -45,15 +45,21 @@ def _normalize_command(src, dst):
     ]
 
 
-def finalize_video(job_id, upload_root=None, output_root=None):
+def finalize_video(job_id, upload_root=None, output_root=None, job_dir=None,
+                   output_path=None):
     """Copy/normalize the draft into ``outputs/<job_id>/final_video.mp4``.
+
+    ``job_dir`` (optional) reads the draft from a different directory (a
+    per-segment mini job, F13b) instead of ``upload_root / job_id``.
+    ``output_path`` (optional) overrides the destination file path entirely
+    (used for per-segment final videos).
 
     Returns a result dict with the final path and duration. Raises
     FileNotFoundError when the job or ``draft_final_video.mp4`` is missing;
     RuntimeError when the ffmpeg step fails or the output is not produced.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
-    job_dir = upload_root / job_id
+    job_dir = Path(job_dir) if job_dir else upload_root / job_id
     if not job_dir.is_dir():
         raise FileNotFoundError(f"job not found: {job_id}")
 
@@ -62,7 +68,7 @@ def finalize_video(job_id, upload_root=None, output_root=None):
         raise FileNotFoundError(f"no draft_final_video.mp4 for job {job_id}")
 
     job_logger = job_logging.get_job_logger(job_id, upload_root)
-    out_path = final_video_path(job_id, output_root)
+    out_path = Path(output_path) if output_path else final_video_path(job_id, output_root)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     auto_cut._run(_normalize_command(draft, out_path))

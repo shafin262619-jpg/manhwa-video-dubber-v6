@@ -230,7 +230,7 @@ def _build_output(entries, translations, fallback):
 
 
 def translate_subtitles(
-    job_id, upload_root=None, call_budget=None, max_split_rounds=4
+    job_id, upload_root=None, call_budget=None, max_split_rounds=4, job_dir=None
 ):
     """Translate all subtitle entries. Returns the output list.
 
@@ -238,10 +238,12 @@ def translate_subtitles(
     whole translation — including every recursive split-repair call — draws
     from; when it is exhausted the already-matched lines are kept and the rest
     fall back, never raising. ``max_split_rounds`` bounds the batch-split
-    repair recursion (default 4).
+    repair recursion (default 4). ``job_dir`` (optional) runs the stage
+    against a different directory (a per-segment mini job, F13b) instead of
+    ``upload_root / job_id``.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
-    job_dir = upload_root / job_id
+    job_dir = Path(job_dir) if job_dir else upload_root / job_id
     in_path = job_dir / "subtitles_zh.json"
     if not in_path.exists():
         raise FileNotFoundError(f"no subtitles_zh.json for job {job_id}")

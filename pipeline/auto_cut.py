@@ -294,12 +294,15 @@ def _duration_warning(expected_duration_sec, actual_duration_sec):
     return None
 
 
-def build_draft_video(job_id, upload_root=None, progress_cb=None):
+def build_draft_video(job_id, upload_root=None, progress_cb=None, job_dir=None):
     """Render ``draft_final_video.mp4`` for a job. Returns a result dict.
 
     ``progress_cb(processed, total)`` (optional) is called after every serial
     clip is rendered, with the 1-based count over the total guideline entries,
     so the job-status wiring can report per-clip progress (F9).
+
+    ``job_dir`` (optional) runs the stage against a different directory (a
+    per-segment mini job, F13b) instead of ``upload_root / job_id``.
 
     Raises FileNotFoundError when the job, ``edit_guideline.json``,
     ``source.mp4`` or ``voiceover_hi.wav`` is missing; RuntimeError when an
@@ -307,7 +310,7 @@ def build_draft_video(job_id, upload_root=None, progress_cb=None):
     fails the ffprobe validation.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
-    job_dir = upload_root / job_id
+    job_dir = Path(job_dir) if job_dir else upload_root / job_id
     if not job_dir.is_dir():
         raise FileNotFoundError(f"job not found: {job_id}")
 

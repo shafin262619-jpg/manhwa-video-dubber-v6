@@ -32,6 +32,8 @@ from pipeline import (
     render_final,
     resume,
     review,
+    segmentation,
+    segmented_pipeline,
     stages,
     subtitle_builder,
     subtitle_extract,
@@ -384,6 +386,7 @@ def _run_upload_pipeline(job_id):
     """
     try:
         job_dir = video_ingest.UPLOAD_ROOT / job_id
+        auto_continue = False
         if (
             job_dir
             / lang_files.subtitles_json(lang_files.target_lang(job_id))
@@ -438,63 +441,101 @@ def _run_upload_pipeline(job_id):
                     call_budget=budget,
                     progress_cb=_stage_progress(job_id, "F1_extract"),
                 )
-            if not (job_dir / "subtitles_zh.json").exists():
-                subtitle_builder.build_subtitle_list(job_id, call_budget=budget)
-            if (job_dir / "subtitle_qa_whisper.json").exists():
-                whisper_check = _load_whisper_check(job_dir)
+            # F13b: long videos are split at natural transcript gaps and the
+            # whole downstream chain runs per segment, sequentially. Exactly
+            # one segment keeps today's whole-video flow (short videos behave
+            # byte-identically). user_transcript imports take the same route —
+            # the plan reads subtitles_zh_raw.json regardless of its origin.
+            # A plan can't be built for jobs without a transcript or a probeable
+            # video (e.g. resumed jobs whose source was cleaned up), so any
+            # failure here falls back to the existing whole-video flow.
+            try:
+                segment_plan = segmentation.build_segment_plan(job_id)
+            except Exception as exc:  # noqa: BLE001 - segmentation is optional
+                logger.warning(
+                    "segment plan unavailable for job %s (falling back to "
+                    "whole-video flow): %s", job_id, exc,
+                )
+                segment_plan = None
+            if segment_plan and len(segment_plan["segments"]) > 1:
+                job_status_store.init_segments(job_id, segment_plan)
+                segmented_pipeline.run_segmented_pipeline(
+                    job_id, call_budget=budget
+                )
+                extra = {
+                    "extraction_status": extraction["status"],
+                    "segmented": True,
+                    "segments_count": len(segment_plan["segments"]),
+                }
+                if extraction["status"] != "ok":
+                    extra["errors"] = _extraction_error_summary(extraction)
+                if gap_stats.get("detected"):
+                    extra["gap_fill_stats"] = gap_stats
+                    if gap_stats.get("failed"):
+                        extra["gap_fill_warning_bn"] = TRANSCRIPT_GAP_FILL_WARNING_BN
             else:
-                try:
-                    whisper_check = subtitle_verify.whisper_cross_check(
-                        job_id,
-                        logger_=job_logging.get_job_logger(job_id),
-                    )
-                except Exception as exc:  # noqa: BLE001 - best-effort, never break upload_pipeline
-                    logger.warning(
-                        "whisper cross-check failed for job %s (non-fatal): %s",
-                        job_id, exc,
-                    )
-                    whisper_check = {"status": "skipped"}
-            # C1 is always reached with subtitles_hi.json missing (the top-level
-            # branch above already handled the fully-complete case), so the
-            # translation stage always runs here.
-            translation = job_status_store.run_stage(
-                job_id,
-                "C1_translate",
-                translator.translate_subtitles,
-                job_id,
-                call_budget=budget,
-            )
-            extra = {
-                "extraction_status": extraction["status"],
-                "serials": len(translation),
-                "whisper_check_status": whisper_check.get("status", "skipped"),
-            }
-            if extraction["status"] != "ok":
-                extra["errors"] = _extraction_error_summary(extraction)
-            if gap_stats.get("detected"):
-                extra["gap_fill_stats"] = gap_stats
-                if gap_stats.get("failed"):
-                    extra["gap_fill_warning_bn"] = TRANSCRIPT_GAP_FILL_WARNING_BN
-            # F12c Part B: after the automatic repair/translation retries are
-            # exhausted, any segments still flagged (repair gaps/clusters or
-            # translation fallbacks) are surfaced — non-blocking — via the same
-            # warning channel as gap-fill, and the user can ask for one more
-            # retry or mark them acceptable.
-            unresolved_items, _warning = unresolved.collect_unresolved(job_id)
-            if unresolved_items:
-                unresolved.persist_unresolved(job_id, unresolved_items)
-                extra.update(_unresolved_extra(job_id))
+                if not (job_dir / "subtitles_zh.json").exists():
+                    subtitle_builder.build_subtitle_list(job_id, call_budget=budget)
+                if (job_dir / "subtitle_qa_whisper.json").exists():
+                    whisper_check = _load_whisper_check(job_dir)
+                else:
+                    try:
+                        whisper_check = subtitle_verify.whisper_cross_check(
+                            job_id,
+                            logger_=job_logging.get_job_logger(job_id),
+                        )
+                    except Exception as exc:  # noqa: BLE001 - best-effort, never break upload_pipeline
+                        logger.warning(
+                            "whisper cross-check failed for job %s (non-fatal): %s",
+                            job_id, exc,
+                        )
+                        whisper_check = {"status": "skipped"}
+                # C1 is always reached with subtitles_hi.json missing (the top-level
+                # branch above already handled the fully-complete case), so the
+                # translation stage always runs here.
+                translation = job_status_store.run_stage(
+                    job_id,
+                    "C1_translate",
+                    translator.translate_subtitles,
+                    job_id,
+                    call_budget=budget,
+                )
+                extra = {
+                    "extraction_status": extraction["status"],
+                    "serials": len(translation),
+                    "whisper_check_status": whisper_check.get("status", "skipped"),
+                }
+                if extraction["status"] != "ok":
+                    extra["errors"] = _extraction_error_summary(extraction)
+                if gap_stats.get("detected"):
+                    extra["gap_fill_stats"] = gap_stats
+                    if gap_stats.get("failed"):
+                        extra["gap_fill_warning_bn"] = TRANSCRIPT_GAP_FILL_WARNING_BN
+                # F12c Part B: after the automatic repair/translation retries are
+                # exhausted, any segments still flagged (repair gaps/clusters or
+                # translation fallbacks) are surfaced — non-blocking — via the same
+                # warning channel as gap-fill, and the user can ask for one more
+                # retry or mark them acceptable.
+                unresolved_items, _warning = unresolved.collect_unresolved(job_id)
+                if unresolved_items:
+                    unresolved.persist_unresolved(job_id, unresolved_items)
+                    extra.update(_unresolved_extra(job_id))
+                # FA-C1: for the auto_tts path the upload chain now continues,
+                # on the SAME thread, straight through the full-auto chain down
+                # to the final video (D2 -> D4 -> E1 -> E2 -> F3), so the user
+                # gets a zero-click result. The user_upload path (or a job with
+                # no choice yet) keeps the old behavior and stops here — group
+                # D handles that path. F13b: a segmented job already ran its
+                # per-segment D2 -> F3 chains inside run_segmented_pipeline, so
+                # the whole-video chain is never re-run.
+                auto_continue = (
+                    voiceover_unify.get_voice_source(job_id) == "auto_tts"
+                )
         job_status_store.write_status(
             job_id, "upload_pipeline", "done", extra=extra
         )
 
-        # FA-C1: for the auto_tts path the upload chain now continues, on the
-        # SAME thread, straight through the full-auto chain down to the final
-        # video (D2 -> D4 -> E1 -> E2 -> F3), so the user gets a zero-click
-        # result. The user_upload path (or a job with no choice yet) keeps the
-        # old behavior and stops here — group D handles that path.
-        voice_source = voiceover_unify.get_voice_source(job_id)
-        if voice_source == "auto_tts":
+        if auto_continue:
             _run_auto_full_render(job_id)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         logger.error("post-upload pipeline failed for job %s: %s", job_id, exc)
@@ -524,14 +565,22 @@ def _run_voiceover_auto(job_id):
         # U2b: the auto-TTS chain shares the same per-job CallBudget pattern as
         # the upload chain (one cap across extraction/translation/TTS calls).
         budget = gemini_rotation.CallBudget(config.MAX_API_CALLS_PER_JOB)
-        result = job_status_store.run_stage(
-            job_id,
-            "D2_voiceover",
-            voiceover_auto.generate_auto_voiceover,
-            job_id,
-            call_budget=budget,
-        )
-        _continue_from_voiceover(job_id)
+        # F13b: a segmented job runs the whole D2 -> F3 chain per segment
+        # instead of the whole-video chain (whose top-level artifacts do not
+        # exist for it).
+        if segmentation.is_segmented(job_id):
+            result = segmented_pipeline.run_segmented_pipeline(
+                job_id, call_budget=budget
+            )
+        else:
+            result = job_status_store.run_stage(
+                job_id,
+                "D2_voiceover",
+                voiceover_auto.generate_auto_voiceover,
+                job_id,
+                call_budget=budget,
+            )
+            _continue_from_voiceover(job_id)
         job_status_store.write_status(
             job_id,
             "voiceover_auto",
@@ -583,7 +632,12 @@ def _run_user_audio_pipeline(job_id):
     status so the polling page can surface them.
     """
     try:
-        result = full_auto_chain.run_user_upload_chain(job_id)
+        # F13b: a segmented job aligns the uploaded audio globally once, slices
+        # it per segment and renders D4 -> E1 -> E2 -> F3 per segment.
+        if segmentation.is_segmented(job_id):
+            result = segmented_pipeline.run_segmented_user_audio_pipeline(job_id)
+        else:
+            result = full_auto_chain.run_user_upload_chain(job_id)
         job_status_store.write_status(
             job_id, "user_audio_pipeline", "done", extra={"result": result}
         )

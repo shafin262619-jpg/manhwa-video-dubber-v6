@@ -123,15 +123,17 @@ def _build_entry(serial, zh_entry, hi_entry):
     }
 
 
-def build_edit_guideline(job_id, upload_root=None):
+def build_edit_guideline(job_id, upload_root=None, job_dir=None):
     """Build ``edit_guideline.json`` for a job. Returns a result dict.
 
     Raises FileNotFoundError when the job, ``subtitles_zh.json`` or
     ``timestamps_hi_final.json`` is missing; ValueError on malformed input.
     Never crashes on zero/negative durations (safe 1.0 multiplier + flag).
+    ``job_dir`` (optional) runs the stage against a different directory (a
+    per-segment mini job, F13b) instead of ``upload_root / job_id``.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
-    job_dir = upload_root / job_id
+    job_dir = Path(job_dir) if job_dir else upload_root / job_id
     if not job_dir.is_dir():
         raise FileNotFoundError(f"job not found: {job_id}")
 

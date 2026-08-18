@@ -232,7 +232,7 @@ def _missing_serials(job_dir, final_entries, lang):
     return sorted(sub_serials - final_serials)
 
 
-def unify_voiceover_timestamps(job_id, upload_root=None):
+def unify_voiceover_timestamps(job_id, upload_root=None, job_dir=None):
     """Merge the chosen voiceover path into one common format (D4).
 
     Reads ``voice_source_choice.json``, picks ``timestamps_hi_auto.json``
@@ -253,10 +253,12 @@ def unify_voiceover_timestamps(job_id, upload_root=None):
     Raises FileNotFoundError when the job, the voice source choice, the chosen
     timestamps file or the voiceover audio is missing; ValueError on malformed
     timestamps; VoiceoverAlignmentError when a subtitle segment has no aligned
-    voiceover timestamp.
+    voiceover timestamp. ``job_dir`` (optional) runs the stage against a
+    different directory (a per-segment mini job, F13b) instead of
+    ``upload_root / job_id``.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
-    job_dir = upload_root / job_id
+    job_dir = Path(job_dir) if job_dir else upload_root / job_id
     if not job_dir.is_dir():
         raise FileNotFoundError(f"job not found: {job_id}")
 
