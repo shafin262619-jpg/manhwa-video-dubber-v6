@@ -35,6 +35,7 @@ from pathlib import Path
 from pipeline import (
     auto_cut,
     edit_guideline,
+    error_bn,
     job_logging,
     job_status as job_status_store,
     lang_files,
@@ -437,3 +438,374 @@ def run_segmented_user_audio_pipeline(job_id, upload_root=None):
             }
         )
     return {"segmented": True, "mode": "user_upload", "segments": segments_results}
+
+
+# ---------------------------------------------------------------------------
+# Targeted per-segment correction re-run (F14b Part 1)
+#
+# When a reviewer flags a completed segment's output, the fix is NOT a blind
+# full re-run: only the pipeline stage that owns the reported problem is
+# re-run (fed its own previous output plus a clear correction instruction),
+# then every downstream stage that consumes the corrected stage's output is
+# mechanically re-run in order. Stages upstream of or independent from the
+# corrected stage are never re-run, and no other segment is touched.
+# ---------------------------------------------------------------------------
+
+# The per-segment stage order (job_status ``segments`` map keys).
+SEGMENT_STAGE_ORDER = (
+    "B2_subtitles",
+    "whisper_cross_check",
+    "C1_translate",
+    "D2_voiceover",
+    "D4_unify",
+    "E1_guideline",
+    "E2_draft",
+    "F3_final",
+)
+
+# Per-segment runnable stages by voice source. D3 (user upload alignment) is a
+# whole-video operation, so it is never part of a per-segment re-run.
+MODE_SEGMENT_STAGES = {
+    "auto_tts": SEGMENT_STAGE_ORDER,
+    "user_upload": (
+        "B2_subtitles",
+        "whisper_cross_check",
+        "C1_translate",
+        "D4_unify",
+        "E1_guideline",
+        "E2_draft",
+        "F3_final",
+    ),
+}
+
+# Issue tag -> owning stage. Multi-tag rounds target the EARLIEST mapped stage
+# in pipeline order: correcting it cascades to every later stage anyway.
+ISSUE_TAG_TO_STAGE = {
+    "bad_translation": "C1_translate",
+    "subtitle_timing": "B2_subtitles",
+    "tts_quality": "D2_voiceover",
+    "timing_mismatch": "D4_unify",
+    "audio_glitch": "E2_draft",
+    # Free-text-only complaints have no single owning stage; re-running from
+    # translation forward is the safest broad net (covers every artifact a
+    # human can review) without touching the out-of-scope F1 whole-video
+    # extraction or F13 boundary logic.
+    "other": "C1_translate",
+}
+
+# F14b Part 1 re-run fallback stage when a mapped stage is not runnable in the
+# current voice-source mode (e.g. ``tts_quality`` on a ``user_upload`` job has
+# no auto-TTS to regenerate).
+RERUN_FALLBACK_STAGE = "C1_translate"
+
+# Map a stage key to the artifact that stage itself produced last time, for
+# the correction instruction's "previous output" section.
+def _previous_output_name(stage_key, job_id, upload_root):
+    lang = lang_files.target_lang(job_id, upload_root)
+    return {
+        "B2_subtitles": "subtitles_zh.json",
+        "whisper_cross_check": "subtitle_qa_whisper.json",
+        "C1_translate": lang_files.subtitles_json(lang),
+        "D2_voiceover": lang_files.timestamps_auto(lang),
+        "D4_unify": lang_files.timestamps_final(lang),
+        "E1_guideline": "edit_guideline.json",
+        "E2_draft": "draft_final_video.mp4",
+        "F3_final": "final_video.mp4",
+    }.get(stage_key)
+
+
+def _load_stage_previous_output(job_id, seg_dir, stage_key, upload_root):
+    """Load the target stage's own previous output for this segment as text.
+
+    Returns a short human/LLM-readable summary of whatever artifact the stage
+    produced last time (its translated text, TTS timestamps, aligned
+    timestamps, guideline, etc.). Binary media artifacts are summarised by
+    path/size rather than dumped raw.
+    """
+    name = _previous_output_name(stage_key, job_id, upload_root)
+    if name is None:
+        return "(no recorded artifact for this stage)"
+    if stage_key in ("E2_draft", "F3_final"):
+        if stage_key == "E2_draft":
+            path = seg_dir / "draft_final_video.mp4"
+        else:
+            path = segment_final_path(job_id, _segment_index_of(seg_dir))
+        if not path.exists():
+            return f"(no previous {name} on disk)"
+        return f"{name}: binary media file, {path.stat().st_size} bytes"
+    path = seg_dir / name
+    if not path.exists():
+        return f"(no previous {name} on disk)"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return f"{name}: unreadable artifact"
+    text = text.strip()
+    if len(text) > 4000:
+        text = text[:4000] + "\n[truncated]"
+    return text
+
+
+def _segment_index_of(seg_dir):
+    name = Path(seg_dir).name
+    return int(name.rsplit("_", 1)[1]) if "_" in name else 0
+
+
+def build_correction_instruction(issues, labels_bn, notes, previous_output):
+    """Assemble the explicit correction instruction fed to a re-run stage.
+
+    Combines the Bengali issue-category labels, the reviewer's free text and
+    the stage's own previous output, framed so the underlying model call is
+    told plainly what was wrong and what to fix while preserving the parts of
+    the previous output that were not flagged.
+    """
+    parts = [
+        "CORRECTION INSTRUCTION: the previous output of this segment was "
+        "reviewed. Fix ONLY the problem(s) reported below and keep every part "
+        "of the previous output that was not flagged.",
+        "Reported issue(s):",
+    ]
+    parts.extend(f"- {label}" for label in (labels_bn or []))
+    parts.append(
+        "Reviewer notes: " + (str(notes).strip() if notes else "(none)")
+    )
+    parts.append("Previous output (fix only the flagged parts):")
+    parts.append(str(previous_output or "(none)"))
+    return "\n".join(parts)
+
+
+def _invoke_rerun_stage(stage, job_id, seg_dir, root, call_budget, log,
+                        segment, correction_hint):
+    """Invoke one re-run stage against the segment's mini-job directory.
+
+    ``correction_hint`` is forwarded only to the correction-capable owning
+    stages (B2/C1/D2); downstream stages re-run mechanically on the corrected
+    input. Raises on failure — the caller decides how to record it.
+    """
+    if stage == "B2_subtitles":
+        return subtitle_builder.build_subtitle_list(
+            job_id, upload_root=root, call_budget=call_budget,
+            job_dir=seg_dir, time_offset_sec=segment["start_sec"],
+            correction_hint=correction_hint,
+        )
+    if stage == "whisper_cross_check":
+        return subtitle_verify.whisper_cross_check(
+            job_id, upload_root=root, logger_=log, job_dir=seg_dir
+        )
+    if stage == "C1_translate":
+        return translator.translate_subtitles(
+            job_id, upload_root=root, call_budget=call_budget,
+            job_dir=seg_dir, correction_hint=correction_hint,
+        )
+    if stage == "D2_voiceover":
+        return voiceover_auto.generate_auto_voiceover(
+            job_id, upload_root=root, call_budget=call_budget,
+            job_dir=seg_dir, correction_hint=correction_hint,
+        )
+    if stage == "D4_unify":
+        return voiceover_unify.unify_voiceover_timestamps(
+            job_id, upload_root=root, job_dir=seg_dir
+        )
+    if stage == "E1_guideline":
+        return edit_guideline.build_edit_guideline(
+            job_id, upload_root=root, job_dir=seg_dir
+        )
+    if stage == "E2_draft":
+        return auto_cut.build_draft_video(
+            job_id, upload_root=root, job_dir=seg_dir
+        )
+    if stage == "F3_final":
+        return render_final.finalize_video(
+            job_id, upload_root=root, job_dir=seg_dir,
+            output_path=segment_final_path(job_id, segment["index"]),
+        )
+    raise ValueError(f"unknown rerun stage {stage!r}")
+
+
+def _stages_from(target, runnable):
+    """Runnable stages at or downstream of ``target``, in pipeline order."""
+    target_pos = SEGMENT_STAGE_ORDER.index(target)
+    return [
+        stage for stage in runnable
+        if SEGMENT_STAGE_ORDER.index(stage) >= target_pos
+    ]
+
+
+def rerun_segment_stage(job_id, seg_index, round_no=None, review=None,
+                        upload_root=None, call_budget=None, logger_=None):
+    """Targeted re-run of the owning stage for a segment's review round (F14b).
+
+    Given a completed segment and one of its recorded review rounds, this
+    re-runs ONLY the pipeline stage that owns the reported problem — fed its
+    own previous output plus a correction instruction — and then mechanically
+    re-runs every downstream stage that consumes the corrected stage's output.
+    No stage upstream of or independent from the corrected stage is re-run and
+    no other segment is touched. One call produces one new review round (the
+    triggering round + 1) via ``job_status.record_segment_rerun``; it never
+    auto-loops.
+
+    ``round_no`` selects the review round to correct (default: the most recent
+    round that reported issues); ``review`` overrides the loaded round entry.
+    Raises ValueError when the segment has no review for that round or the
+    round reported no issues; FileNotFoundError when the job/segment/plan or
+    the segment's mini-job directory is missing.
+
+    A failed correction attempt never crashes the job: the attempt is recorded
+    as a failed rerun round (Bengali ``rerun_error_bn``), the segment is rolled
+    back to its last-good round's state, and a result dict is returned so a
+    later UI chunk can offer retry/continue.
+    """
+    root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
+    log = logger_ or job_logging.get_job_logger(job_id, upload_root)
+    plan = segmentation.load_plan(job_id, root)
+    segment = next(
+        (s for s in plan.get("segments") or [] if int(s.get("index")) == int(seg_index)),
+        None,
+    )
+    if segment is None:
+        raise FileNotFoundError(
+            f"no segment {seg_index} in plan for job {job_id}"
+        )
+
+    if review is None:
+        if round_no is None:
+            reviews = job_status_store.get_segment_reviews(
+                job_id, seg_index, upload_root=root
+            )
+            flagged = [
+                (int(key), entry)
+                for key, entry in reviews.items()
+                if str(key).isdigit() and isinstance(entry, dict)
+                and entry.get("issues")
+            ]
+            if not flagged:
+                raise ValueError(
+                    f"segment {seg_index} of job {job_id} has no review "
+                    "with reported issues to correct"
+                )
+            round_no = max(candidate for candidate, _ in flagged)
+            review = next(
+                dict(entry) for candidate, entry in flagged
+                if candidate == round_no
+            )
+        else:
+            review = job_status_store.get_segment_reviews(
+                job_id, seg_index, round_no=round_no, upload_root=root
+            )
+    if not isinstance(review, dict):
+        raise ValueError(
+            f"no review for segment {seg_index} of job {job_id} "
+            f"(round {round_no})"
+        )
+    issues = [t for t in (review.get("issues") or []) if t in ISSUE_TAG_TO_STAGE]
+    if not issues:
+        raise ValueError(
+            f"review round {review.get('round', round_no)} for segment "
+            f"{seg_index} reported no issues"
+        )
+
+    triggered_round = int(review.get("round") or round_no or 1)
+    mode = voiceover_unify.get_voice_source(job_id, root)
+    runnable = MODE_SEGMENT_STAGES.get(mode, SEGMENT_STAGE_ORDER)
+
+    mapped = [ISSUE_TAG_TO_STAGE[tag] for tag in issues]
+    candidates = [stage for stage in runnable if stage in mapped]
+    if not candidates:
+        candidates = [stage for stage in runnable if stage == RERUN_FALLBACK_STAGE]
+    if not candidates:
+        raise ValueError(
+            f"no runnable owning stage for issues {issues} in mode {mode!r}"
+        )
+    target = min(candidates, key=lambda stage: SEGMENT_STAGE_ORDER.index(stage))
+    order = _stages_from(target, runnable)
+
+    seg_dir = segmentation.segment_dir(job_id, seg_index, root)
+    if not seg_dir.is_dir():
+        raise FileNotFoundError(f"no segment mini-job dir for {seg_index}: {seg_dir}")
+
+    labels_bn = [
+        job_status_store.SEGMENT_REVIEW_ISSUE_CATEGORIES[tag]
+        for tag in issues if tag in job_status_store.SEGMENT_REVIEW_ISSUE_CATEGORIES
+    ]
+    previous = _load_stage_previous_output(job_id, seg_dir, target, root)
+    correction = build_correction_instruction(
+        issues, labels_bn, review.get("notes"), previous
+    )
+
+    prior = job_status_store.read_segment_status(job_id, seg_index, upload_root=root)
+    log.info(
+        "job %s seg %d: targeted re-run for round %d -> target stage %s, "
+        "stages %s", job_id, seg_index, triggered_round, target, list(order),
+    )
+    ran = []
+    try:
+        for stage in order:
+            log.info("job %s seg %d: re-running stage %s", job_id, seg_index, stage)
+            _run_segment_stage(
+                job_id, seg_index, stage, _invoke_rerun_stage,
+                stage, job_id, seg_dir, root, call_budget, log, segment,
+                correction if stage == target else None,
+            )
+            ran.append(stage)
+    except Exception as exc:  # noqa: BLE001 - persist + rollback, never crash
+        bn = error_bn.explain_bn(exc, stage=target)
+        log.error(
+            "job %s seg %d: correction re-run failed at %s: %s",
+            job_id, seg_index, target, exc,
+        )
+        try:
+            job_status_store.restore_segment_state(
+                job_id, seg_index, prior, upload_root=root
+            )
+        except Exception:  # noqa: BLE001 - status is advisory
+            pass
+        try:
+            job_status_store.record_segment_rerun(
+                job_id, seg_index, triggered_by_round=triggered_round,
+                issues=issues, target_stage=target,
+                status=job_status_store.SEGMENT_RERUN_FAILED,
+                error_message=bn, correction=correction, upload_root=root,
+            )
+        except Exception:  # noqa: BLE001 - status is advisory
+            pass
+        return {
+            "rerun": True,
+            "status": "failed",
+            "seg_index": int(seg_index),
+            "round": triggered_round,
+            "target_stage": target,
+            "stages_rerun": ran,
+            "error_bn": bn,
+            "correction": correction,
+        }
+
+    new_round = None
+    try:
+        new_round = job_status_store.record_segment_rerun(
+            job_id, seg_index, triggered_by_round=triggered_round,
+            issues=issues, target_stage=target,
+            status=job_status_store.SEGMENT_RERUN_OK,
+            correction=correction, upload_root=root,
+        )
+    except Exception as exc:  # noqa: BLE001 - status is advisory
+        log.error("job %s seg %d: failed to record rerun round: %s",
+                  job_id, seg_index, exc)
+    try:
+        job_status_store.mark_segment_done(
+            job_id, seg_index,
+            final_path=str(segment_final_path(job_id, seg_index)),
+            extra={"status": "ok", "entries_count": segment.get("entries_count")},
+            upload_root=root,
+        )
+    except Exception:  # noqa: BLE001 - status is advisory
+        pass
+    return {
+        "rerun": True,
+        "status": "ok",
+        "seg_index": int(seg_index),
+        "round": new_round,
+        "rerun_of_round": triggered_round,
+        "target_stage": target,
+        "stages_rerun": order,
+        "correction": correction,
+    }

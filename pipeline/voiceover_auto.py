@@ -42,16 +42,26 @@ logger = logging.getLogger(__name__)
 CLIP_DIR_NAME = "auto_tts_clips"
 
 
-def _call_tts(key, text, voice_name):
+def _call_tts(key, text, voice_name, correction_hint=None):
     """Send one line to Gemini TTS and return the raw audio bytes.
 
     ``voice_name`` is the ``config.TTS_VOICES[target_lang]`` style voice
     resolved by the caller; the spoken language itself comes from ``text``.
+    ``correction_hint`` (optional, F14b) is a reviewer-framed correction
+    instruction; when given it leads the TTS call (the report + previous
+    output) so the model can re-pronounce the line against the flagged
+    problem, and the plain ``text`` is still the final line to speak.
     """
     client = genai.Client(api_key=key)
+    contents = text
+    if correction_hint:
+        contents = (
+            f"{correction_hint}\n\n"
+            f"Text to speak (keep this line exactly, correcting pronunciation):\n{text}"
+        )
     response = client.models.generate_content(
         model=config.TTS_MODEL,
-        contents=text,
+        contents=contents,
         config=genai_types.GenerateContentConfig(
             response_modalities=["AUDIO"],
             speech_config=genai_types.SpeechConfig(
@@ -132,7 +142,7 @@ def _normalize_and_concat(clip_paths, out_path):
 
 
 def generate_auto_voiceover(job_id, upload_root=None, call_budget=None,
-                            job_dir=None):
+                            job_dir=None, correction_hint=None):
     """Generate the full voiceover for a job. Returns a result dict.
 
     The voice is picked per ``target_lang`` from ``config.TTS_VOICES`` (hi
@@ -141,6 +151,11 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None,
     failures (silence placeholders are used). ``job_dir`` (optional) runs the
     stage against a different directory (a per-segment mini job, F13b) instead
     of ``upload_root / job_id``.
+
+    ``correction_hint`` (optional, F14b) is a reviewer-framed correction
+    instruction. When given it disables the U1c clip-reuse heuristic (a
+    correction must produce fresh TTS audio, never reuse the flagged clips)
+    and is forwarded to every ``_call_tts`` so the model hears what was wrong.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = Path(job_dir) if job_dir else upload_root / job_id
@@ -201,9 +216,10 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None,
         # U1c resumability: reuse an existing clip if it already has positive
         # duration. Heuristic: if the clip is at least TTS_FAIL_SILENCE_SEC
         # long (plus tolerance) we treat it as a real TTS result, otherwise
-        # regenerate it.
+        # regenerate it. A F14b correction re-run disables reuse entirely so a
+        # flagged clip can never be carried over.
         reuse_existing = False
-        if clip_path.exists():
+        if clip_path.exists() and not correction_hint:
             try:
                 existing_dur = _probe_audio_duration(clip_path)
                 tolerance = 0.2
@@ -215,8 +231,11 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None,
         if reuse_existing:
             tts_failed = False
         elif text:
+            # Only forward the correction hint to _call_tts when it exists, so
+            # 3-arg TTS mocks/callables keep working unchanged on first pass.
+            tts_args = (text, voice, correction_hint) if correction_hint else (text, voice)
             audio, rotation, _ = subtitle_extract.call_with_rotation(
-                keys, rotation, _call_tts, text, voice,
+                keys, rotation, _call_tts, *tts_args,
                 call_budget=call_budget, logger_=job_logger,
             )
             if audio is not None:
@@ -263,8 +282,9 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None,
                 still_failed.append(serial)
                 continue
             clip_path = clips_dir / f"serial_{serial}.wav"
+            tts_args = (text, voice, correction_hint) if correction_hint else (text, voice)
             audio, rotation, _ = subtitle_extract.call_with_rotation(
-                keys, rotation, _call_tts, text, voice,
+                keys, rotation, _call_tts, *tts_args,
                 call_budget=call_budget, logger_=job_logger,
             )
             if audio is None:

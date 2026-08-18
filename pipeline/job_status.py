@@ -425,6 +425,121 @@ def get_segment_reviews(job_id, seg_index, round_no=None, upload_root=None):
     return reviews.get(str(int(round_no)))
 
 
+def next_review_round(job_id, seg_index, upload_root=None):
+    """The next free review-round number for a segment (max round + 1)."""
+    reviews = get_segment_reviews(job_id, seg_index, upload_root=upload_root)
+    rounds = [int(key) for key in reviews if str(key).isdigit()]
+    return (max(rounds) if rounds else 0) + 1
+
+
+# ``rerun_status`` values for a correction round (F14b).
+SEGMENT_RERUN_OK = "ok"
+SEGMENT_RERUN_FAILED = "failed"
+
+
+def record_segment_rerun(job_id, seg_index, *, triggered_by_round, issues,
+                         target_stage, status=SEGMENT_RERUN_OK,
+                         error_message=None, correction=None,
+                         upload_root=None):
+    """Record a targeted correction re-run as the segment's next round (F14b).
+
+    Writes ``data["segments"]["seg_XXX"]["reviews"][round]`` where ``round``
+    is ``next_review_round`` — one correction attempt produces exactly one new
+    round, and later rounds never overwrite earlier ones (no automatic retry
+    loop). The round entry reuses the F14a review schema (``round`` /
+    ``issues`` / timestamp) and adds ``rerun`` markers: ``triggered_by_round``
+    (the reviewed round this re-run corrects), ``target_stage`` (the owning
+    pipeline stage), ``rerun_status`` (``ok`` / ``failed``), an optional
+    Bengali ``rerun_error_bn`` for failed attempts and the ``correction``
+    instruction built for the stage. Only the given segment's entry is
+    modified; other segments are untouched. Returns the round number written.
+    """
+    if status not in (SEGMENT_RERUN_OK, SEGMENT_RERUN_FAILED):
+        raise ValueError(f"invalid rerun status {status!r}")
+    unknown = [
+        tag for tag in (issues or []) if tag not in SEGMENT_REVIEW_ISSUE_CATEGORIES
+    ]
+    if unknown:
+        raise ValueError(
+            f"invalid issue tag(s) {unknown!r}; expected one of "
+            f"{sorted(SEGMENT_REVIEW_ISSUE_CATEGORIES)}"
+        )
+    seen = set()
+    clean = []
+    for tag in issues or []:
+        if tag not in seen:
+            seen.add(tag)
+            clean.append(tag)
+    path = status_path(job_id, upload_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _lock_for(job_id):
+        data = read_status(job_id, upload_root)
+        seg_map = data.get("segments")
+        if not isinstance(seg_map, dict):
+            seg_map = {}
+            data["segments"] = seg_map
+        key = segmentation.segment_key(seg_index)
+        entry = seg_map.get(key)
+        if not isinstance(entry, dict):
+            entry = {"index": int(seg_index), "stages": {}}
+            seg_map[key] = entry
+        reviews = entry.get("reviews")
+        if not isinstance(reviews, dict):
+            reviews = {}
+            entry["reviews"] = reviews
+        round_no = next_review_round(job_id, seg_index, upload_root)
+        round_entry = {
+            "round": round_no,
+            "issues": clean,
+            "rerun": True,
+            "rerun_of_round": int(triggered_by_round),
+            "target_stage": str(target_stage),
+            "rerun_status": status,
+            "rerun_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if error_message is not None:
+            round_entry["rerun_error_bn"] = str(error_message)[:500]
+        if correction is not None:
+            round_entry["correction"] = str(correction)
+        reviews[str(round_no)] = round_entry
+        _atomic_write(path, data)
+    return round_no
+
+
+def restore_segment_state(job_id, seg_index, prior_entry, upload_root=None):
+    """Restore a segment's processing state to a snapshot (F14b rollback).
+
+    Rewrites ``stage`` / ``state`` / ``stages`` / ``final_path`` /
+    ``completed_at`` / ``error_detail`` from ``prior_entry`` (the entry read
+    before a correction attempt) so a failed re-run leaves the segment at its
+    last-good round's state. ``reviews`` is always preserved — a failed
+    attempt's rerun round must survive the rollback. The top-level
+    ``segmented`` summary is recomputed.
+    """
+    path = status_path(job_id, upload_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _lock_for(job_id):
+        data = read_status(job_id, upload_root)
+        key = segmentation.segment_key(seg_index)
+        entry = data.get("segments", {}).get(key)
+        if not isinstance(entry, dict):
+            return
+        reviews = entry.get("reviews")
+        restored = dict(prior_entry) if isinstance(prior_entry, dict) else {}
+        for field in (
+            "stage", "state", "stages", "final_path", "completed_at",
+            "error_detail",
+        ):
+            if field in restored:
+                entry[field] = restored[field]
+            else:
+                entry.pop(field, None)
+        if isinstance(reviews, dict):
+            entry["reviews"] = reviews
+        _update_segmented_overall(data)
+        _atomic_write(path, data)
+
+
 def _atomic_write(path, data):
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(

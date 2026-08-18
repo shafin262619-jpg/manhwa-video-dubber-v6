@@ -541,7 +541,7 @@ def repair_flagged_regions(job_id, entries, diagnostics, upload_root=None,
 
 
 def build_subtitle_list(job_id, upload_root=None, call_budget=None, auto_repair=True,
-                        job_dir=None, time_offset_sec=0.0):
+                        job_dir=None, time_offset_sec=0.0, correction_hint=None):
     """Build ``subtitles_zh.json`` from ``subtitles_zh_raw.json``. Returns list.
 
     Side artifact: also writes ``subtitle_qa.json`` with coverage-gap and
@@ -558,6 +558,12 @@ def build_subtitle_list(job_id, upload_root=None, call_budget=None, auto_repair=
     ``time_offset_sec`` (optional, F13b) is forwarded to the auto-repair pass
     so its segment-relative windows are re-based for the whole-video
     ``extract_window`` cuts.
+
+    ``correction_hint`` (optional, F14b) is a reviewer-framed correction
+    instruction for a segment-level re-run. It is carried into the QA
+    diagnostics so the re-run attempt is auditable; the underlying auto-repair
+    (``subtitle_extract.extract_window``) is shared whole-video machinery and
+    is intentionally left untouched (F1/F13 out of scope).
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = Path(job_dir) if job_dir else upload_root / job_id
@@ -600,6 +606,8 @@ def build_subtitle_list(job_id, upload_root=None, call_budget=None, auto_repair=
         "duplicate_clusters": duplicate_clusters,
         "collision_clusters": collision_clusters,
     }
+    if correction_hint:
+        diagnostics["correction"] = str(correction_hint)
     if repair_summary is not None:
         diagnostics["repair"] = repair_summary
     refresh_qa(

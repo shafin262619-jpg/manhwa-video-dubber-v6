@@ -64,6 +64,13 @@ RETRY_PROMPT = (
     "Chinese lines:\n{lines}"
 )
 
+CORRECTION_PROMPT = (
+    "\n\nCORRECTION: the previous translation of this segment was reviewed "
+    "and the problem(s) below were reported. Re-translate the Chinese lines "
+    "above, fixing ONLY what the report flags and keeping the parts that "
+    "were not flagged. The report and the previous output follow:\n{instruction}"
+)
+
 
 def _call_gemini_text(key, prompt):
     client = genai.Client(api_key=key)
@@ -97,16 +104,19 @@ def _extract_lines(text):
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-def _translate_lines(key, lines, expected_count, emphasis, language):
+def _translate_lines(key, lines, expected_count, emphasis, language,
+                     correction_hint=None):
     prompt = (RETRY_PROMPT if emphasis else TRANSLATION_PROMPT).format(
         count=expected_count, language=language, lines="\n".join(lines)
     )
+    if correction_hint:
+        prompt += CORRECTION_PROMPT.format(instruction=correction_hint)
     text = _call_gemini_text(key, prompt)
     return _extract_lines(text)
 
 
 def _translate_chunk(keys, rotation, lines, depth, max_depth, language,
-                     call_budget=None, logger_=None):
+                     call_budget=None, logger_=None, correction_hint=None):
     """Attempt a strict translation of ``lines``; on count mismatch, split.
 
     Returns ``(translations, rotation)`` where ``translations`` is aligned
@@ -125,7 +135,7 @@ def _translate_chunk(keys, rotation, lines, depth, max_depth, language,
     n = len(lines)
     result, rotation, error = subtitle_extract.call_with_rotation(
         keys, rotation, _translate_lines, lines, n, True, language,
-        call_budget=call_budget, logger_=logger_,
+        correction_hint, call_budget=call_budget, logger_=logger_,
     )
     if error is not None:
         return [None] * n, rotation
@@ -134,11 +144,12 @@ def _translate_chunk(keys, rotation, lines, depth, max_depth, language,
     return _repair_split(
         keys, rotation, lines, depth + 1, max_depth, language,
         call_budget=call_budget, logger_=logger_,
+        correction_hint=correction_hint,
     )
 
 
 def _repair_split(keys, rotation, lines, depth, max_depth, language,
-                  call_budget=None, logger_=None):
+                  call_budget=None, logger_=None, correction_hint=None):
     """Split ``lines`` into two roughly equal halves and repair each one.
 
     ``depth`` counts how many times this chunk has already been split. A chunk
@@ -153,10 +164,12 @@ def _repair_split(keys, rotation, lines, depth, max_depth, language,
     left, rotation = _translate_chunk(
         keys, rotation, lines[:mid], depth, max_depth, language,
         call_budget=call_budget, logger_=logger_,
+        correction_hint=correction_hint,
     )
     right, rotation = _translate_chunk(
         keys, rotation, lines[mid:], depth, max_depth, language,
         call_budget=call_budget, logger_=logger_,
+        correction_hint=correction_hint,
     )
     return left + right, rotation
 
@@ -230,7 +243,8 @@ def _build_output(entries, translations, fallback):
 
 
 def translate_subtitles(
-    job_id, upload_root=None, call_budget=None, max_split_rounds=4, job_dir=None
+    job_id, upload_root=None, call_budget=None, max_split_rounds=4, job_dir=None,
+    correction_hint=None,
 ):
     """Translate all subtitle entries. Returns the output list.
 
@@ -241,6 +255,12 @@ def translate_subtitles(
     repair recursion (default 4). ``job_dir`` (optional) runs the stage
     against a different directory (a per-segment mini job, F13b) instead of
     ``upload_root / job_id``.
+
+    ``correction_hint`` (optional, F14b) is a reviewer-framed correction
+    instruction (issue labels + notes + the previous translation). When given,
+    it is appended to every Gemini translation prompt so the model is told
+    plainly what was wrong and what to fix while re-translating; when ``None``
+    the prompt is byte-identical to a first pass.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = Path(job_dir) if job_dir else upload_root / job_id
@@ -271,7 +291,7 @@ def translate_subtitles(
             rotation = 0
             translations, rotation, error = subtitle_extract.call_with_rotation(
                 keys, rotation, _translate_lines, lines, expected, False, language,
-                call_budget=call_budget, logger_=job_logger,
+                correction_hint, call_budget=call_budget, logger_=job_logger,
             )
             if translations is not None and len(translations) != expected:
                 job_logger.warning(
@@ -281,7 +301,7 @@ def translate_subtitles(
                 translations, rotation, error = (
                     subtitle_extract.call_with_rotation(
                         keys, rotation, _translate_lines, lines, expected, True, language,
-                        call_budget=call_budget, logger_=job_logger,
+                        correction_hint, call_budget=call_budget, logger_=job_logger,
                     )
                 )
             if translations is None or len(translations) != expected:
@@ -303,6 +323,7 @@ def translate_subtitles(
                     translations, rotation = _repair_split(
                         keys, rotation, lines, 0, max_split_rounds, language,
                         call_budget=call_budget, logger_=job_logger,
+                        correction_hint=correction_hint,
                     )
 
     output = _build_output(entries, translations, fallback)
