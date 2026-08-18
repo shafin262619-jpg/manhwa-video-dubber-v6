@@ -1095,7 +1095,11 @@ def _render_chain_final_result(job_id: str, stage: str) -> HTMLResponse:
 
 
 @app.get("/upload/{job_id}", response_class=HTMLResponse)
-def upload_status_page(job_id: str) -> HTMLResponse:
+def upload_status_page(
+    job_id: str,
+    reviewed: int | None = Query(None),
+    verdict: str | None = Query(None),
+) -> HTMLResponse:
     """Status/result page for the upload_pipeline stage (fixes UI2: the home
     page's upload form used to POST directly to /upload and land the browser
     on that endpoint's raw JSON body — no styling, just Chrome's built-in
@@ -1133,7 +1137,9 @@ def upload_status_page(job_id: str) -> HTMLResponse:
         # F13b: a segmented auto_tts job already ran its per-segment D2 -> F3
         # chains inside the segmented pipeline — the whole-video chain must
         # never be kicked. Fall through to the upload-complete result page.
-        return _render_segmented_result(job_id)
+        return _render_segmented_result(
+            job_id, reviewed=reviewed, verdict=verdict
+        )
 
     # FA-D2: after the user uploads their own audio the job continues (same
     # page as the entry point): while user_audio_pipeline runs, stay on the
@@ -2208,13 +2214,85 @@ def final_page(job_id: str) -> HTMLResponse:
     return _render_final_result(job_id)
 
 
-def _render_segmented_result(job_id: str) -> HTMLResponse:
-    """Result page for a segmented job: per-segment final videos.
+def _segment_review_block(job_id, entry):
+    """Per-segment review card (F14a Part 2) for one done segment.
+
+    Shows the recorded round-1 review state once submitted; otherwise the
+    issue-tag checkboxes + free text + explicit "no issues" submit buttons,
+    all wired to :func:`job_status_store.record_segment_review` via
+    ``POST /segment-review/{job_id}/{index}``.
+    """
+    index = entry.get("index")
+    existing = job_status_store.get_segment_reviews(job_id, index, round_no=1)
+    labels = job_status_store.SEGMENT_REVIEW_ISSUE_CATEGORIES
+    if existing is not None:
+        summary = (
+            f'<p class="seg-review-meta">রিভিউ রেকর্ড হয়েছে (রাউন্ড '
+            f'{existing.get("round", 1)}):</p>'
+        )
+        if existing.get("issues"):
+            names = "".join(
+                f"<li>{html.escape(labels[t])}</li>"
+                for t in existing["issues"]
+                if t in labels
+            )
+            summary += f"<ul>{names}</ul>"
+        else:
+            summary += (
+                '<p class="seg-review-meta">কোনো সমস্যা নেই — '
+                "এই সেগমেন্ট ঠিক আছে।</p>"
+            )
+        if existing.get("notes"):
+            summary += (
+                f'<p class="seg-review-notes">{html.escape(str(existing["notes"]))}</p>'
+            )
+        return f'<div class="review-box seg-review">{summary}</div>'
+    options = "".join(
+        f'<label class="issue-tag"><input type="checkbox" name="issues" '
+        f'value="{tag}"><span>{html.escape(bn)}</span></label>'
+        for tag, bn in labels.items()
+    )
+    return f"""
+  <div class="review-box seg-review">
+    <h2>সেগমেন্ট {_seg_key(entry)} — রিভিউ</h2>
+    <form method="post" action="/segment-review/{job_id}/{index}" class="trim-form">
+      <fieldset>
+        <legend>কোন সমস্যা আছে? (যা প্রযোজ্য সব বেছে নিন)</legend>
+        <div class="issue-tags">{options}</div>
+        <label for="notes-{index}">অন্যান্য মন্তব্য (ঐচ্ছিক)</label>
+        <textarea id="notes-{index}" name="notes" rows="2"
+                  placeholder="অন্য কোনো সমস্যা থাকলে এখানে লিখুন…"></textarea>
+      </fieldset>
+      <div class="seg-review-actions">
+        <button name="verdict" value="issues" type="submit">সমস্যা সাবমিট করুন</button>
+        <button name="verdict" value="clean" type="submit" class="btn-clean">
+          কোনো সমস্যা নেই — ঠিক আছে
+        </button>
+      </div>
+    </form>
+  </div>"""
+
+
+def _seg_key(entry):
+    """``seg_000`` display key for a segment entry."""
+    index = entry.get("index")
+    return segmentation.segment_key(int(index)) if index is not None else "?"
+
+
+def _render_segmented_result(job_id: str, reviewed=None, verdict=None) -> HTMLResponse:
+    """Result page for a segmented job: per-segment final videos + review.
 
     F13b (Part C): a segmented auto_tts job has no whole-video
     ``final_video``, so ``/upload/{job_id}`` renders the per-segment final
     videos instead of kicking the whole-video chain (which must never run for
     a segmented job). Also the landing page after a segmented resume.
+
+    F14a (Part 2): each done segment below the summary table gets a review
+    card — inline player (source is ``/download/{job_id}/segment/{index}``)
+    plus issue-tag checkboxes, free text and an explicit "no issues" submit.
+    A small poll reuses the existing ``/api/jobs/{job_id}/status`` mechanism
+    so newly-done segments appear without a manual refresh; polling stops
+    once the overall segmented state is ``done``.
     """
     data = job_status_store.read_status(job_id)
     seg_map = data.get("segments") or {}
@@ -2224,6 +2302,7 @@ def _render_segmented_result(job_id: str) -> HTMLResponse:
         "running": "badge-running",
     }
     rows = []
+    cards = []
     for key in sorted(seg_map):
         entry = seg_map[key]
         if not isinstance(entry, dict):
@@ -2233,7 +2312,8 @@ def _render_segmented_result(job_id: str) -> HTMLResponse:
         cls = badge_class.get(state, "badge-idle")
         final_path = entry.get("final_path")
         link = "—"
-        if final_path and Path(final_path).exists():
+        has_final = bool(final_path) and Path(final_path).exists()
+        if has_final:
             link = (
                 f'<a href="/download/{job_id}/segment/{index}">'
                 "Download final video</a>"
@@ -2244,19 +2324,122 @@ def _render_segmented_result(job_id: str) -> HTMLResponse:
             f"<td>{entry.get('start_sec')} → {entry.get('end_sec')}s</td>"
             f"<td>{link}</td></tr>"
         )
+        if state == "done":
+            player = ""
+            if has_final:
+                player = (
+                    f'<video controls preload="metadata" '
+                    f'src="/download/{job_id}/segment/{index}"></video>'
+                )
+            cards.append(
+                f'<div class="review-box seg-playback">'
+                f"<h2>{html.escape(str(key))} — সমাপ্ত</h2>{player}"
+                f"{_segment_review_block(job_id, entry)}</div>"
+            )
     segmented = data.get("segmented") or {}
     summary = (
         f"{segmented.get('completed_count', 0)}/{segmented.get('total_count', 0)} "
         "segments complete"
+    )
+    confirm = ""
+    if reviewed is not None:
+        if verdict == "clean":
+            confirm = (
+                f'<div class="review-confirm">সেগমেন্ট {int(reviewed)} চেক করা '
+                "হয়েছে — কোনো সমস্যা নেই।</div>"
+            )
+        else:
+            confirm = (
+                f'<div class="review-confirm">সেগমেন্ট {int(reviewed)}-এর রিভিউ '
+                "রেকর্ড হয়েছে।</div>"
+            )
+    sig = "|".join(
+        f"{key}:{entry.get('state')}"
+        for key, entry in sorted(seg_map.items())
+        if isinstance(entry, dict)
+    )
+    cards_html = "".join(cards) or (
+        '<p class="seg-review-meta">আপাতত কোনো সেগমেন্ট শেষ হয়নি — '
+        "প্রসেসিং চলছে।</p>"
     )
     body = f"""<h1>Segmented job — {job_id}</h1>
   <p>{summary} (overall: <strong>{html.escape(str(segmented.get('overall_state', 'unknown')))}</strong>).</p>
   <table class="keys-table">
     <thead><tr><th>Segment</th><th>State</th><th>Range</th><th>Final video</th></tr></thead>
     <tbody>{''.join(rows)}</tbody>
-  </table>"""
+  </table>
+  {confirm}
+  <h2>পার-সেগমেন্ট রিভিউ</h2>
+  {cards_html}
+  <script>
+    var SEG_JOB_ID = {json.dumps(job_id)};
+    var SEG_STATE_SIG = {json.dumps(sig)};
+    function segStatusSig(s) {{
+      var seg = s.segments || {{}};
+      var keys = Object.keys(seg).sort();
+      return keys.map(function (k) {{ return k + ':' + (seg[k].state || ''); }}).join('|');
+    }}
+    function segPoll() {{
+      fetch('/api/jobs/' + encodeURIComponent(SEG_JOB_ID) + '/status')
+        .then(function (r) {{ return r.json(); }})
+        .then(function (s) {{
+          if (segStatusSig(s) !== SEG_STATE_SIG) {{ window.location.reload(); return; }}
+          if (!s.segmented || s.segmented.overall_state !== 'done') {{
+            setTimeout(segPoll, 2000);
+          }}
+        }})
+        .catch(function () {{ setTimeout(segPoll, 3000); }});
+    }}
+    segPoll();
+  </script>"""
     return HTMLResponse(
         ui.page(f"Segmented Job — {job_id} — Manhwa Video Dubber", body)
+    )
+
+
+@app.post("/segment-review/{job_id}/{seg_index}")
+def segment_review_submit(
+    job_id: str,
+    seg_index: int,
+    verdict: str = Form("issues"),
+    issues: list[str] | None = Form(None),
+    notes: str | None = Form(None),
+) -> RedirectResponse:
+    """Record a per-segment review (F14a Part 2) for one review round.
+
+    Wired to :func:`job_status_store.record_segment_review` — no review
+    logic lives here. ``verdict=clean`` records the explicit "no issues"
+    state; otherwise the checked issue tags + free text are recorded. A
+    review for one segment never touches any other segment's state. On
+    success the browser redirects back to the segmented result page with a
+    Bengali confirmation banner.
+    """
+    data = job_status_store.read_status(job_id)
+    seg_map = data.get("segments") or {}
+    key = segmentation.segment_key(seg_index)
+    if not segmentation.is_segmented(job_id) or not isinstance(
+        seg_map.get(key), dict
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail=f"no segment {seg_index} of segmented job {job_id}",
+        )
+    if verdict == "clean":
+        issue_list = []
+    else:
+        issue_list = [tag for tag in (issues or []) if isinstance(tag, str)]
+    try:
+        job_status_store.record_segment_review(
+            job_id,
+            seg_index,
+            issues=issue_list,
+            notes=(notes or None),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return RedirectResponse(
+        url=f"/upload/{job_id}?reviewed={seg_index}&verdict={verdict}",
+        status_code=303,
     )
 
 

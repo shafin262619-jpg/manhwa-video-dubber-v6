@@ -874,6 +874,110 @@ code {
   color: var(--text-muted);
 }
 
+/* Per-segment review (F14a Part 2) */
+.seg-playback video {
+  max-width: 480px;
+  width: 100%;
+  margin: 0.5rem 0 0;
+}
+
+.seg-review {
+  margin-top: 0.9rem;
+}
+
+.seg-review h2 {
+  margin-top: 0;
+  font-size: 1rem;
+}
+
+.seg-review fieldset {
+  margin: 0.4rem 0 0.6rem;
+  padding: 0.8rem 1rem 0.9rem;
+}
+
+.seg-review legend {
+  font-weight: 700;
+  color: var(--text);
+  padding: 0 0.3rem;
+}
+
+.issue-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.4rem 0 0.2rem;
+}
+
+.issue-tag {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.issue-tag input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.issue-tag span {
+  display: inline-block;
+  padding: 0.45rem 0.95rem;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: 0.86rem;
+  font-weight: 600;
+  transition: background .15s ease, color .15s ease, border-color .15s ease;
+}
+
+.issue-tag input:checked + span {
+  background: rgba(63, 167, 150, .22);
+  border-color: rgba(63, 167, 150, .65);
+  color: var(--text);
+}
+
+.issue-tag input:focus-visible + span {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.seg-review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  margin-top: 0.4rem;
+}
+
+.seg-review-actions .btn-clean {
+  background: var(--surface-2);
+  border: 1px solid rgba(63, 167, 150, .55);
+  color: #9fe8d4;
+}
+
+.review-confirm {
+  border: 1px solid rgba(63, 167, 150, .55);
+  background: rgba(63, 167, 150, .14);
+  color: #9fe8d4;
+  border-radius: 10px;
+  padding: 0.85rem 1.1rem;
+  margin: 1.1rem 0 0.6rem;
+  font-weight: 700;
+}
+
+.seg-review-meta {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.seg-review-notes {
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
 /* Sidebar collapses to a horizontal top bar below ~860px */
 @media (max-width: 860px) {
   .app-shell {
