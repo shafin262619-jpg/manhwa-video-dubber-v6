@@ -177,6 +177,7 @@ def init_segments(job_id, plan, upload_root=None):
             "total_count": len(seg_map),
             "completed_count": 0,
             "overall_state": "running",
+            "review_state": SEGMENT_REVIEW_IN_REVIEW,
         }
         data["stage"] = "segmented_pipeline"
         data["state"] = "running"
@@ -636,6 +637,166 @@ def get_segment_qa(job_id, seg_index, upload_root=None):
     entry = read_segment_status(job_id, seg_index, upload_root)
     qa = entry.get("qa")
     return qa if isinstance(qa, dict) else {}
+
+
+# ---------------------------------------------------------------------------
+# All-segments-done-reviewing + final video assembly state (F14c Part 1)
+#
+# Once every segment has reached "done-reviewing" (its latest review round is
+# a clean human review — no issues, not a rerun), the job-wide final video is
+# assembled by concatenating each segment's latest-round output in order.
+# The overall review state lives on the ``segmented`` block as
+# ``review_state`` (in_review -> final_ready -> assembly_failed), and the
+# assembly result (path / version / per-segment rounds / error) lives in
+# ``segmented.final_assembly``. Both are additive: the existing
+# ``overall_state`` (processing progress) is never touched here.
+# ---------------------------------------------------------------------------
+
+# ``segmented.review_state`` values (F14c Part 1).
+SEGMENT_REVIEW_IN_REVIEW = "in_review"
+SEGMENT_REVIEW_FINAL_READY = "final_ready"
+SEGMENT_REVIEW_ASSEMBLY_FAILED = "assembly_failed"
+
+# ``segmented.final_assembly.state`` values.
+SEGMENT_ASSEMBLY_READY = "ready"
+SEGMENT_ASSEMBLY_STALE = "stale"
+SEGMENT_ASSEMBLY_FAILED = "failed"
+
+
+def segment_latest_review_round(entry):
+    """The latest review-round number recorded for a segment entry, or None."""
+    if not isinstance(entry, dict):
+        return None
+    reviews = entry.get("reviews")
+    if not isinstance(reviews, dict):
+        return None
+    rounds = [
+        int(key) for key in reviews
+        if str(key).isdigit() and isinstance(reviews.get(key), dict)
+    ]
+    return max(rounds) if rounds else None
+
+
+def segment_latest_review_rounds(job_id, upload_root=None):
+    """Map ``seg_XXX`` -> latest review round for every segment (no round =
+    ``None``)."""
+    data = read_status(job_id, upload_root)
+    seg_map = data.get("segments")
+    if not isinstance(seg_map, dict):
+        return {}
+    return {
+        key: segment_latest_review_round(entry)
+        for key, entry in seg_map.items()
+    }
+
+
+def _entry_review_complete(entry):
+    """True when a segment's LATEST review round is a clean human review.
+
+    A rerun round (``rerun: True``) is never done-reviewing, and neither is a
+    round that reported issues — those both mean the segment is mid-fix or
+    awaiting a fresh human verdict on the corrected output.
+    """
+    latest_round = segment_latest_review_round(entry)
+    if latest_round is None:
+        return False
+    reviews = entry.get("reviews") if isinstance(entry, dict) else {}
+    latest = reviews.get(str(latest_round))
+    if not isinstance(latest, dict):
+        return False
+    if latest.get("rerun"):
+        return False
+    return not latest.get("issues")
+
+
+def is_segment_review_complete(job_id, seg_index, upload_root=None):
+    """True when the given segment has reached done-reviewing (F14c)."""
+    return _entry_review_complete(read_segment_status(job_id, seg_index, upload_root))
+
+
+def all_segments_review_complete(job_id, upload_root=None):
+    """True only when EVERY segment's latest round is done-reviewing.
+
+    Never raises and never errors on partially-processed jobs: a missing
+    segment map, a segment still processing/awaiting review, or a segment
+    mid-fix simply returns False. A single-segment job is handled the same as
+    any other — it is complete only once that one segment is reviewed clean.
+    """
+    data = read_status(job_id, upload_root)
+    seg_map = data.get("segments")
+    if not isinstance(seg_map, dict) or not seg_map:
+        return False
+    for entry in seg_map.values():
+        if not _entry_review_complete(entry):
+            return False
+    return True
+
+
+def invalidate_final_assembly(job_id, upload_root=None):
+    """Revert the overall review state when a NEW issue is reported (F14c).
+
+    Called right after an issue report lands on a segment that may already
+    have a job-wide final video: the assembled video is no longer current, so
+    ``review_state`` returns to ``in_review`` and the recorded assembly block
+    is marked ``stale`` (the file itself is left for the user to inspect).
+    """
+    path = status_path(job_id, upload_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _lock_for(job_id):
+        data = read_status(job_id, upload_root)
+        segmented = data.get("segmented")
+        if not isinstance(segmented, dict):
+            segmented = {}
+            data["segmented"] = segmented
+        segmented["review_state"] = SEGMENT_REVIEW_IN_REVIEW
+        assembly = segmented.get("final_assembly")
+        if isinstance(assembly, dict):
+            assembly["state"] = SEGMENT_ASSEMBLY_STALE
+            assembly["invalidated_at"] = datetime.now(timezone.utc).isoformat()
+        _atomic_write(path, data)
+
+
+def mark_final_assembly_ready(job_id, final_path, segment_rounds, version,
+                              upload_root=None):
+    """Record a successful job-wide assembly as the current final video."""
+    path = status_path(job_id, upload_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _lock_for(job_id):
+        data = read_status(job_id, upload_root)
+        segmented = data.get("segmented")
+        if not isinstance(segmented, dict):
+            segmented = {}
+            data["segmented"] = segmented
+        segmented["review_state"] = SEGMENT_REVIEW_FINAL_READY
+        segmented["final_assembly"] = {
+            "state": SEGMENT_ASSEMBLY_READY,
+            "final_path": str(final_path),
+            "version": int(version),
+            "assembled_at": datetime.now(timezone.utc).isoformat(),
+            "segment_rounds": dict(segment_rounds or {}),
+        }
+        _atomic_write(path, data)
+
+
+def mark_final_assembly_failed(job_id, error_bn, upload_root=None):
+    """Record a failed assembly: Bengali error + retryable state."""
+    path = status_path(job_id, upload_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _lock_for(job_id):
+        data = read_status(job_id, upload_root)
+        segmented = data.get("segmented")
+        if not isinstance(segmented, dict):
+            segmented = {}
+            data["segmented"] = segmented
+        segmented["review_state"] = SEGMENT_REVIEW_ASSEMBLY_FAILED
+        assembly = segmented.get("final_assembly")
+        if not isinstance(assembly, dict):
+            assembly = {}
+            segmented["final_assembly"] = assembly
+        assembly["state"] = SEGMENT_ASSEMBLY_FAILED
+        assembly["error_bn"] = str(error_bn)[:500]
+        assembly["error_at"] = datetime.now(timezone.utc).isoformat()
+        _atomic_write(path, data)
 
 
 def _atomic_write(path, data):

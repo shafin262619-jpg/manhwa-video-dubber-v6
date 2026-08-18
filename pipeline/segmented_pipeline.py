@@ -29,6 +29,7 @@ user's audio is uploaded.
 
 import json
 import logging
+import os
 import subprocess
 from pathlib import Path
 
@@ -1149,3 +1150,182 @@ def run_auto_qa_gate(job_id, segment, seg_dir, final_path, upload_root=None,
                 "job %s seg %d: auto QA fix attempt %d failed: %s",
                 job_id, index, attempt, rerun.get("error_bn"),
             )
+
+
+# ---------------------------------------------------------------------------
+# Job-wide final video assembly (F14c Part 1)
+#
+# Once every segment has reached done-reviewing, the whole job's final video
+# is assembled by concatenating each segment's LATEST-round final video in
+# segment order. Segments were cut at exact transcript-gap boundaries in F13b,
+# so an in-order concat (the same ``build_concat_command`` demuxer pattern
+# auto_cut uses for its clips) reproduces a seamless, gap-free whole.
+# ---------------------------------------------------------------------------
+
+# Scratch directory for the concat list under ``outputs/<job_id>/``.
+FINAL_ASSEMBLY_WORK_DIR = ".assembly"
+
+
+def assemble_final_video(job_id, upload_root=None):
+    """Concatenate every segment's latest-round final video into one video.
+
+    For each segment in plan order, resolves its LATEST round's final video
+    (the entry's ``final_path``, which every successful re-run overwrites with
+    that round's output — a failed re-run rolls it back to the last-good
+    round) and concatenates them in order with the same ffmpeg concat demuxer
+    ``auto_cut.build_concat_command`` uses for its clips. The result is a
+    single playable mp4 at ``render_final.final_video_path(job_id)``.
+
+    Raises FileNotFoundError when a segment has no recorded final video or its
+    file is missing/empty on disk; RuntimeError when the concat or its probe
+    validation fails. Returns a result dict with the final path, duration and
+    the per-segment round numbers that went into the assembly.
+    """
+    root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
+    plan = segmentation.load_plan(job_id, root)
+    segments = sorted(
+        (
+            s for s in (plan.get("segments") or [])
+            if isinstance(s, dict) and s.get("index") is not None
+        ),
+        key=lambda s: int(s["index"]),
+    )
+    if not segments:
+        raise ValueError(f"job {job_id}: segment plan has no segments")
+
+    inputs = []
+    segment_rounds = {}
+    for segment in segments:
+        index = int(segment["index"])
+        entry = job_status_store.read_segment_status(job_id, index, upload_root=root)
+        final_path = entry.get("final_path")
+        if not final_path:
+            raise FileNotFoundError(
+                f"segment {index} of job {job_id}: no final video recorded "
+                "for its latest review round"
+            )
+        final_path = Path(final_path)
+        if not final_path.exists() or final_path.stat().st_size == 0:
+            raise FileNotFoundError(
+                f"segment {index} of job {job_id}: final video missing or "
+                f"empty: {final_path}"
+            )
+        inputs.append(final_path)
+        segment_rounds[segmentation.segment_key(index)] = (
+            job_status_store.segment_latest_review_round(entry)
+        )
+
+    out_root = Path(render_final.OUTPUT_ROOT)
+    work_dir = out_root / job_id / FINAL_ASSEMBLY_WORK_DIR
+    work_dir.mkdir(parents=True, exist_ok=True)
+    concat_list = work_dir / "concat.txt"
+    concat_list.write_text(
+        "".join(f"file '{path}'\n" for path in inputs), encoding="utf-8"
+    )
+    final_path = render_final.final_video_path(job_id)
+    try:
+        # Concat the segment finals in order, then normalize the combined
+        # stream to the same deliverable profile the whole-video F3 path uses
+        # (H.264/AAC + faststart), so the assembled file is playable and
+        # streamable exactly like a non-segmented final video.
+        concat_video = work_dir / "concat_video.mp4"
+        auto_cut._run(auto_cut.build_concat_command(concat_list, concat_video))
+        assembled_tmp = work_dir / "final_video.assembled.mp4"
+        auto_cut._run(render_final._normalize_command(concat_video, assembled_tmp))
+    except Exception as exc:  # noqa: BLE001 - wrap with a clear message
+        raise RuntimeError(
+            f"final assembly concat failed for job {job_id}: {exc}"
+        ) from exc
+    if not assembled_tmp.exists() or assembled_tmp.stat().st_size == 0:
+        raise RuntimeError(f"final assembly produced no output for job {job_id}")
+
+    probe = auto_cut._probe(assembled_tmp)
+    streams = probe.get("streams") or []
+    has_video = any(s.get("codec_type") == "video" for s in streams)
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
+    if not (has_video and has_audio):
+        raise RuntimeError(
+            f"final assembly output for job {job_id} is missing a video/audio "
+            "stream"
+        )
+    # Atomic replace: the current final path only ever holds a fully-assembled
+    # file (a failed attempt never leaves a corrupt half-written deliverable).
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(assembled_tmp, final_path)
+    try:
+        duration_sec = float(probe.get("format", {}).get("duration"))
+    except (TypeError, ValueError):
+        duration_sec = None
+
+    return {
+        "job_id": job_id,
+        "status": "ok",
+        "final_path": str(final_path),
+        "duration_sec": duration_sec,
+        "segment_count": len(inputs),
+        "segment_rounds": segment_rounds,
+    }
+
+
+def maybe_assemble_final_video(job_id, upload_root=None):
+    """Trigger job-wide assembly once every segment is done-reviewing (F14c).
+
+    Called on the state transitions that can complete the last segment (a
+    clean review submission, and after a correction re-run finishes). Runs the
+    assembly when :func:`all_segments_review_complete` is true AND the
+    current per-segment review rounds differ from what was last assembled (so
+    an already-current final video is not rebuilt). Never raises: an assembly
+    failure is recorded in job status as a Bengali error and the job stays
+    retryable (a later trigger re-attempts it). Returns ``None`` when nothing
+    to do, otherwise a result dict describing the outcome.
+    """
+    root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
+    try:
+        if not job_status_store.all_segments_review_complete(job_id, root):
+            return None
+        data = job_status_store.read_status(job_id, root)
+        segmented = data.get("segmented") or {}
+        assembly = segmented.get("final_assembly") or {}
+        current_rounds = job_status_store.segment_latest_review_rounds(job_id, root)
+        if (
+            segmented.get("review_state") == job_status_store.SEGMENT_REVIEW_FINAL_READY
+            and isinstance(assembly, dict)
+            and assembly.get("state") == job_status_store.SEGMENT_ASSEMBLY_READY
+            and assembly.get("segment_rounds") == current_rounds
+        ):
+            return {
+                "assembled": True,
+                "status": "already_ready",
+                "final_path": assembly.get("final_path"),
+                "version": assembly.get("version"),
+            }
+
+        try:
+            result = assemble_final_video(job_id, root)
+        except Exception as exc:  # noqa: BLE001 - persist + keep retryable
+            bn = error_bn.explain_bn(exc, stage="final_assembly")
+            try:
+                job_status_store.mark_final_assembly_failed(
+                    job_id, bn, upload_root=root
+                )
+            except Exception:  # noqa: BLE001 - status is advisory
+                pass
+            return {"assembled": False, "status": "failed", "error_bn": bn}
+
+        version = int(assembly.get("version") or 0) + 1
+        try:
+            job_status_store.mark_final_assembly_ready(
+                job_id, result["final_path"], result["segment_rounds"],
+                version, upload_root=root,
+            )
+        except Exception:  # noqa: BLE001 - status is advisory
+            pass
+        return {
+            "assembled": True,
+            "status": "ok",
+            "final_path": result["final_path"],
+            "duration_sec": result.get("duration_sec"),
+            "version": version,
+        }
+    except Exception:  # noqa: BLE001 - the trigger must never crash a request
+        return None

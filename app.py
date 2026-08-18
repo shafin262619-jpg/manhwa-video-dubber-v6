@@ -2542,6 +2542,11 @@ def _run_segment_rerun(job_id, seg_index, round_no):
             )
         except Exception:  # noqa: BLE001 - logging is best-effort
             pass
+    finally:
+        try:
+            segmented_pipeline.maybe_assemble_final_video(job_id)
+        except Exception:  # noqa: BLE001 - status is advisory
+            pass
 
 
 @app.post("/segment-review/{job_id}/{seg_index}")
@@ -2591,11 +2596,25 @@ def segment_review_submit(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     if issue_list:
+        # A new issue report invalidates any previously-assembled job-wide
+        # final video: the overall review state returns to in_review and the
+        # recorded assembly is marked stale (F14c Part 1).
+        try:
+            job_status_store.invalidate_final_assembly(job_id)
+        except Exception:  # noqa: BLE001 - status is advisory
+            pass
         threading.Thread(
             target=_run_segment_rerun,
             args=(job_id, seg_index, round_no),
             daemon=True,
         ).start()
+    else:
+        # A clean review may be the one that completes the LAST segment —
+        # trigger the job-wide assembly on this state transition (F14c).
+        try:
+            segmented_pipeline.maybe_assemble_final_video(job_id)
+        except Exception:  # noqa: BLE001 - status is advisory
+            pass
     return RedirectResponse(
         url=f"/upload/{job_id}?reviewed={seg_index}&verdict={verdict}",
         status_code=303,

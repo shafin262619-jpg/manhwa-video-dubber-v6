@@ -26,6 +26,7 @@ _UMBRELLA_LABELS_BN = {
     "auto_full_render": "ফুল-অটো রেন্ডার",
     "resume": "রিজিউম",
     "final_render": "ফাইনাল রেন্ডার",
+    "final_assembly": "চূড়ান্ত ভিডিও একত্রকরণ",
 }
 
 # ``RunStageError`` style messages the pipeline raises for ffmpeg/ffprobe
