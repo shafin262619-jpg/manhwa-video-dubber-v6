@@ -1137,6 +1137,17 @@ def upload_status_page(
         # F13b: a segmented auto_tts job already ran its per-segment D2 -> F3
         # chains inside the segmented pipeline — the whole-video chain must
         # never be kicked. Fall through to the upload-complete result page.
+        # F14c Part 2: once the job-wide final video is ready (or the user has
+        # confirmed it, or assembly failed), route to the final review page
+        # instead of the plain per-segment list; only jobs still in the
+        # per-segment review loop render the segment review page.
+        review_state = (status.get("segmented") or {}).get("review_state")
+        if review_state in (
+            job_status_store.SEGMENT_REVIEW_FINAL_READY,
+            job_status_store.SEGMENT_REVIEW_CONFIRMED,
+            job_status_store.SEGMENT_REVIEW_ASSEMBLY_FAILED,
+        ):
+            return _render_final_review_page(job_id)
         return _render_segmented_result(
             job_id, reviewed=reviewed, verdict=verdict
         )
@@ -1632,7 +1643,19 @@ def _history_card(entry):
             f'<a class="history-view" href="/upload/{job_id}">চলমান — দেখুন</a>'
         )
     elif state == "done":
-        view_link = f'<a class="history-view" href="/review/{job_id}">দেখুন</a>'
+        # F14c Part 2: a segmented job never has the whole-video review page
+        # (/review/{job_id} would 404 — it needs edit_guideline.json). Route
+        # its view link to /upload/{job_id} instead, which dispatches to the
+        # per-segment review page while still in the review loop and to the
+        # final review page (final_ready / confirmed / assembly_failed) once
+        # the job-wide video exists — keeping the final page reachable from
+        # History, not only via a fresh polling redirect.
+        if isinstance(job_status_store.read_status(job_id).get("segmented"), dict):
+            view_link = (
+                f'<a class="history-view" href="/upload/{job_id}">দেখুন</a>'
+            )
+        else:
+            view_link = f'<a class="history-view" href="/review/{job_id}">দেখুন</a>'
     else:
         view_link = ""
     return f"""
@@ -2476,8 +2499,19 @@ def _render_segmented_result(job_id: str, reviewed=None, verdict=None) -> HTMLRe
                 f'<div class="review-confirm">সেগমেন্ট {int(reviewed)}-এর রিভিউ '
                 "রেকর্ড হয়েছে।</div>"
             )
+    # F14c Part 2: the poll signature also folds in each segment's review-round
+    # count, so a completed background correction (which only adds a review
+    # round — the segment's processing ``state`` stays "done") reloads the page
+    # and shows the new review form, and the re-loop returns to the final
+    # review page once the job reaches final_ready again.
+    def _review_count(entry):
+        reviews = entry.get("reviews") if isinstance(entry, dict) else None
+        if not isinstance(reviews, dict):
+            return 0
+        return sum(1 for k in reviews if str(k).isdigit())
+
     sig = "|".join(
-        f"{key}:{entry.get('state')}"
+        f"{key}:{entry.get('state')}:r{_review_count(entry)}"
         for key, entry in sorted(seg_map.items())
         if isinstance(entry, dict)
     )
@@ -2500,7 +2534,12 @@ def _render_segmented_result(job_id: str, reviewed=None, verdict=None) -> HTMLRe
     function segStatusSig(s) {{
       var seg = s.segments || {{}};
       var keys = Object.keys(seg).sort();
-      return keys.map(function (k) {{ return k + ':' + (seg[k].state || ''); }}).join('|');
+      return keys.map(function (k) {{
+        var e = seg[k] || {{}};
+        var rev = e.reviews || {{}};
+        var n = Object.keys(rev).filter(function (r) {{ return /^\d+$/.test(r); }}).length;
+        return k + ':' + (e.state || '') + ':r' + n;
+      }}).join('|');
     }}
     function segPoll() {{
       fetch('/api/jobs/' + encodeURIComponent(SEG_JOB_ID) + '/status')
@@ -2517,6 +2556,152 @@ def _render_segmented_result(job_id: str, reviewed=None, verdict=None) -> HTMLRe
   </script>"""
     return HTMLResponse(
         ui.page(f"Segmented Job — {job_id} — Manhwa Video Dubber", body)
+    )
+
+
+def _render_final_review_page(job_id: str) -> HTMLResponse:
+    """Final review page for a segmented job (F14c Part 2).
+
+    Rendered from ``/upload/{job_id}`` when ``segmented.review_state`` is
+    ``final_ready`` / ``confirmed`` / ``assembly_failed`` — i.e. once F14c
+    Part 1 has assembled the job-wide final video. The full assembled video
+    sits prominently at the top; below it, the existing F14a/F14b per-segment
+    review cards (done-reviewing summary + the issue-reporting form, which
+    reuses the existing ``POST /segment-review/{job_id}/{index}`` route — no
+    separate mechanism) let the user pinpoint a segment problem spotted while
+    watching the full video. State-specific controls:
+
+    - ``final_ready``     -> "চূর্তিম নিশ্চিতকরণ" confirm button; every segment
+      card offers issue reporting (reporting reverts the job to ``in_review``
+      and, via Part 1's re-trigger, re-assembles once resolved).
+    - ``confirmed``       -> terminal: Bengali confirmation banner; the video
+      stays viewable/downloadable but no confirm/issue controls are shown.
+    - ``assembly_failed`` -> Bengali error banner + a retry button that
+      re-triggers ``maybe_assemble_final_video``; segment cards stay usable.
+
+    A small poll reuses the existing ``/api/jobs/{job_id}/status`` feed (the
+    same mechanism the segment review page uses) and reloads whenever the
+    overall review state or the assembled version changes — so a reverted job
+    returns to the segment review page and a finished re-assembly replaces the
+    old video — and stops once the job is confirmed.
+    """
+    data = job_status_store.read_status(job_id)
+    seg_map = data.get("segments") or {}
+    segmented = data.get("segmented") or {}
+    review_state = segmented.get("review_state")
+    assembly = segmented.get("final_assembly") or {}
+    confirmed = review_state == job_status_store.SEGMENT_REVIEW_CONFIRMED
+
+    final_path = assembly.get("final_path")
+    has_final = bool(final_path) and Path(str(final_path)).exists()
+    if has_final:
+        video_html = (
+            f'<video controls preload="metadata" src="/download/{job_id}"></video>'
+            f'<p><a href="/download/{job_id}">Download final video</a></p>'
+        )
+    else:
+        video_html = (
+            '<p class="seg-review-meta">সমাপ্ত ভিডিও ফাইল পাওয়া যায়নি — '
+            "দয়া করে আবার চেষ্টা করুন।</p>"
+        )
+
+    version = assembly.get("version")
+    assembly_meta = ""
+    if version is not None:
+        assembled_at = (assembly.get("assembled_at") or "")[:19].replace("T", " ")
+        assembly_meta = (
+            '<p class="seg-review-meta">একত্রিত ভিডিও — সংস্করণ '
+            f'{int(version)}{" · " + assembled_at if assembled_at else ""}</p>'
+        )
+
+    if confirmed:
+        header = (
+            '<div class="review-confirm">ভিডিওটি চূর্তিমভাবে নিশ্চিত হয়েছে। '
+            "জব প্রক্রিয়াকরণ সম্পন্ন।</div>"
+        )
+    elif review_state == job_status_store.SEGMENT_REVIEW_ASSEMBLY_FAILED:
+        error_bn = html.escape(
+            str(assembly.get("error_bn") or "অজানা ত্রুটি")
+        )
+        header = (
+            '<div class="error-banner">'
+            '<p class="error-banner-title">চূর্তিম ভিডিও একত্রকরণ ব্যর্থ হয়েছে</p>'
+            f"<p>{error_bn}</p>"
+            "</div>"
+            f'<form method="post" action="/jobs/{job_id}/final-assembly/retry">'
+            '<button type="submit" class="error-banner-retry">আবার চেষ্টা করুন</button>'
+            "</form>"
+        )
+    else:
+        header = (
+            '<p class="seg-review-meta">সব সেগমেন্টের রিভিউ সম্পন্ন — নিচের পুরো '
+            "ভিডিওটি দেখে চূর্তিম নিশ্চিতকরণ দিন।</p>"
+            f'<form method="post" action="/jobs/{job_id}/final-confirm">'
+            '<button type="submit">চূর্তিম নিশ্চিতকরণ</button>'
+            "</form>"
+        )
+
+    cards = []
+    for key in sorted(seg_map):
+        entry = seg_map[key]
+        if not isinstance(entry, dict) or entry.get("state") != "done":
+            continue
+        index = entry.get("index")
+        player = ""
+        if index is not None:
+            seg_path = entry.get("final_path")
+            if seg_path and Path(str(seg_path)).exists():
+                player = (
+                    f'<video controls preload="metadata" '
+                    f'src="/download/{job_id}/segment/{index}"></video>'
+                )
+        summary = _segment_review_block(job_id, entry)
+        issue_form = ""
+        if not confirmed:
+            issue_form = _review_form_block(job_id, index)
+        cards.append(
+            f'<div class="review-box seg-playback">'
+            f"<h2>{html.escape(str(key))} — সমাপ্ত</h2>"
+            f"{player}{summary}{issue_form}</div>"
+        )
+    cards_html = "".join(cards) or (
+        '<p class="seg-review-meta">আপাতত কোনো সেগমেন্ট শেষ হয়নি।</p>'
+    )
+
+    sig = "|".join([
+        str(review_state),
+        str(assembly.get("state")),
+        str(assembly.get("version") or 0),
+    ])
+    body = f"""<h1>Final video — job {job_id}</h1>
+  <p>Status: <strong>{html.escape(str(review_state))}</strong>.</p>
+  {header}
+  {assembly_meta}
+  {video_html}
+  <h2>পার-সেগমেন্ট রিভিউ</h2>
+  {cards_html}
+  <script>
+    var FJOB_ID = {json.dumps(job_id)};
+    var FSIG = {json.dumps(sig)};
+    function finalStatusSig(s) {{
+      var seg = s.segmented || {{}};
+      var asm = seg.final_assembly || {{}};
+      return [seg.review_state || '', asm.state || '', asm.version || 0].join('|');
+    }}
+    function finalPoll() {{
+      fetch('/api/jobs/' + encodeURIComponent(FJOB_ID) + '/status')
+        .then(function (r) {{ return r.json(); }})
+        .then(function (s) {{
+          if (finalStatusSig(s) !== FSIG) {{ window.location.reload(); return; }}
+          var seg = s.segmented || {{}};
+          if (seg.review_state !== 'confirmed') {{ setTimeout(finalPoll, 2000); }}
+        }})
+        .catch(function () {{ setTimeout(finalPoll, 3000); }});
+    }}
+    finalPoll();
+  </script>"""
+    return HTMLResponse(
+        ui.page(f"Final Video — {job_id} — Manhwa Video Dubber", body)
     )
 
 
@@ -2619,6 +2804,65 @@ def segment_review_submit(
         url=f"/upload/{job_id}?reviewed={seg_index}&verdict={verdict}",
         status_code=303,
     )
+
+
+@app.post("/jobs/{job_id}/final-confirm")
+def final_confirm_submit(job_id: str) -> RedirectResponse:
+    """Record the terminal "user confirmed the final video" state (F14c Part 2).
+
+    Only valid while the segmented job is in ``final_ready`` with a ready
+    assembled final video; an already-confirmed job is a no-op redirect back to
+    the page. Records ``confirmed_at`` + ``user_confirmed: true`` (via
+    :func:`job_status_store.mark_final_confirmed`) — the definitive end of the
+    job's processing. Redirects to ``/upload/{job_id}``, which renders the
+    confirmed page: video still viewable/downloadable, no further
+    review/fix/confirm controls.
+    """
+    data = job_status_store.read_status(job_id)
+    segmented = data.get("segmented") or {}
+    review_state = segmented.get("review_state")
+    if review_state == job_status_store.SEGMENT_REVIEW_CONFIRMED:
+        return RedirectResponse(url=f"/upload/{job_id}", status_code=303)
+    if (
+        not segmentation.is_segmented(job_id)
+        or review_state != job_status_store.SEGMENT_REVIEW_FINAL_READY
+    ):
+        raise HTTPException(
+            status_code=409, detail="job is not in the final-ready state"
+        )
+    if (
+        (segmented.get("final_assembly") or {}).get("state")
+        != job_status_store.SEGMENT_ASSEMBLY_READY
+    ):
+        raise HTTPException(
+            status_code=409, detail="final video is not ready to confirm"
+        )
+    job_status_store.mark_final_confirmed(job_id)
+    return RedirectResponse(url=f"/upload/{job_id}", status_code=303)
+
+
+@app.post("/jobs/{job_id}/final-assembly/retry")
+def final_assembly_retry(job_id: str) -> RedirectResponse:
+    """Re-trigger the job-wide final video assembly after a failure (F14c Part 2).
+
+    Only valid while ``review_state == assembly_failed``. Calls the same
+    :func:`segmented_pipeline.maybe_assemble_final_video` trigger F14c Part 1
+    uses (idempotent, never raises): on success the redirect lands back on the
+    final review page with the fresh video; on a repeated failure the page
+    stays on the Bengali error banner.
+    """
+    data = job_status_store.read_status(job_id)
+    segmented = data.get("segmented") or {}
+    if (
+        not segmentation.is_segmented(job_id)
+        or segmented.get("review_state")
+        != job_status_store.SEGMENT_REVIEW_ASSEMBLY_FAILED
+    ):
+        raise HTTPException(
+            status_code=409, detail="job is not in the assembly-failed state"
+        )
+    segmented_pipeline.maybe_assemble_final_video(job_id)
+    return RedirectResponse(url=f"/upload/{job_id}", status_code=303)
 
 
 def _render_final_result(job_id: str, result=None, warnings=None) -> HTMLResponse:

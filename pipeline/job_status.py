@@ -652,10 +652,11 @@ def get_segment_qa(job_id, seg_index, upload_root=None):
 # ``overall_state`` (processing progress) is never touched here.
 # ---------------------------------------------------------------------------
 
-# ``segmented.review_state`` values (F14c Part 1).
+# ``segmented.review_state`` values (F14c Part 1 + Part 2).
 SEGMENT_REVIEW_IN_REVIEW = "in_review"
 SEGMENT_REVIEW_FINAL_READY = "final_ready"
 SEGMENT_REVIEW_ASSEMBLY_FAILED = "assembly_failed"
+SEGMENT_REVIEW_CONFIRMED = "confirmed"
 
 # ``segmented.final_assembly.state`` values.
 SEGMENT_ASSEMBLY_READY = "ready"
@@ -796,6 +797,32 @@ def mark_final_assembly_failed(job_id, error_bn, upload_root=None):
         assembly["state"] = SEGMENT_ASSEMBLY_FAILED
         assembly["error_bn"] = str(error_bn)[:500]
         assembly["error_at"] = datetime.now(timezone.utc).isoformat()
+        _atomic_write(path, data)
+
+
+def mark_final_confirmed(job_id, upload_root=None):
+    """Record the terminal "user confirmed the final video" state (F14c Part 2).
+
+    Sets ``segmented.review_state`` to ``confirmed`` and writes the
+    ``segmented.final_confirmation`` block (``user_confirmed`` + UTC
+    ``confirmed_at``). This is the definitive end of the job's processing:
+    the page stops offering any further review/fix/confirm controls. The
+    recorded ``final_assembly`` (path/version) is left untouched — the
+    confirmed video stays viewable/downloadable.
+    """
+    path = status_path(job_id, upload_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _lock_for(job_id):
+        data = read_status(job_id, upload_root)
+        segmented = data.get("segmented")
+        if not isinstance(segmented, dict):
+            segmented = {}
+            data["segmented"] = segmented
+        segmented["review_state"] = SEGMENT_REVIEW_CONFIRMED
+        segmented["final_confirmation"] = {
+            "user_confirmed": True,
+            "confirmed_at": datetime.now(timezone.utc).isoformat(),
+        }
         _atomic_write(path, data)
 
 
