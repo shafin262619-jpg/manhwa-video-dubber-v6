@@ -15,12 +15,15 @@ import cycle.
 import json
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pipeline import segmentation, video_ingest
 
-ALLOWED_STATES = ("running", "done", "error")
+# ``api_limit_wait`` (F15 Part 2A): a stage cannot make progress because every
+# configured Gemini key failed with a rate limit until the daily quota resets.
+# Additive — existing states are never renamed or removed.
+ALLOWED_STATES = ("running", "done", "error", "api_limit_wait")
 
 DEFAULT_STATUS = {"stage": "unknown", "state": "not_started"}
 
@@ -832,3 +835,121 @@ def _atomic_write(path, data):
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# API rate-limit exhaustion wait (F15 Part 2A)
+#
+# When every configured Gemini key fails with a rate limit (429), the affected
+# stage cannot make progress until the daily quota resets. ``api_limit_wait``
+# is an allowed state (see :data:`ALLOWED_STATES`) a stage can transition to,
+# and the details live in a top-level ``api_limit_wait`` block — additive,
+# exactly like F14c's ``segmented.final_assembly``:
+#
+#   "api_limit_wait": {
+#     "stage": "<stage that hit the limit>",
+#     "hit_at": "<iso>",
+#     "next_retry_at": "<iso>",
+#     "attempt_count": 2
+#   }
+#
+# ``next_retry_at`` follows :func:`compute_next_retry`: the first hit waits a
+# full 24h quota window, each later hit re-queues one hour after the previous
+# attempt's retry time. No rendering/UI or pipeline wiring exists yet — the
+# four Gemini call sites that can produce a ``rate_limit`` result dict consume
+# this in a later chunk.
+# ---------------------------------------------------------------------------
+
+
+def _as_utc_datetime(value):
+    """Coerce a datetime or ISO-8601 string to a timezone-aware UTC datetime.
+
+    A naive datetime is treated as UTC; ``datetime.fromisoformat`` (3.11)
+    also accepts a trailing ``Z``.
+    """
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+    if not isinstance(value, datetime):
+        raise TypeError(
+            f"expected datetime or ISO-8601 string, got {type(value).__name__}"
+        )
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def compute_next_retry(hit_at, attempt_number):
+    """The next retry time after a rate-limit exhaustion hit.
+
+    Attempt 1 waits a full daily-quota window (``hit_at + 24h``); every later
+    attempt re-queues one hour after the previous attempt's retry time, so
+    attempt 2 is ``hit_at + 25h``, attempt 3 ``hit_at + 26h``, and so on —
+    never another full 24h. ``hit_at`` may be a timezone-aware datetime or an
+    ISO-8601 string. Returns a timezone-aware UTC datetime.
+    """
+    attempt = int(attempt_number)
+    if attempt < 1:
+        raise ValueError(
+            f"invalid attempt number {attempt_number!r}; attempts start at 1"
+        )
+    hit = _as_utc_datetime(hit_at)
+    return hit + timedelta(hours=24 + (attempt - 1))
+
+
+def record_api_limit_wait(job_id, stage, *, hit_at=None, attempt_count=None,
+                          upload_root=None):
+    """Record that a stage hit API rate-limit exhaustion (F15 Part 2A).
+
+    Writes the top-level ``api_limit_wait`` block (``stage`` / ``hit_at`` /
+    ``next_retry_at`` / ``attempt_count``) and transitions that stage's entry
+    plus the top-level ``stage``/``state`` to ``api_limit_wait`` so the polling
+    endpoint reflects the wait. When ``attempt_count`` is omitted it
+    increments the previously recorded count (first hit -> 1, next -> 2, ...);
+    ``hit_at`` defaults to now. ``next_retry_at`` is computed with
+    :func:`compute_next_retry`. Returns the recorded block.
+    """
+    hit = _as_utc_datetime(hit_at) if hit_at is not None else datetime.now(timezone.utc)
+    prior = get_api_limit_wait(job_id, upload_root)
+    if attempt_count is not None:
+        count = int(attempt_count)
+    else:
+        count = int(prior.get("attempt_count", 0)) + 1 if prior else 1
+    if count < 1:
+        raise ValueError(
+            f"invalid attempt count {attempt_count!r}; attempts start at 1"
+        )
+    next_retry = compute_next_retry(hit, count)
+    block = {
+        "stage": str(stage),
+        "hit_at": hit.isoformat(),
+        "next_retry_at": next_retry.isoformat(),
+        "attempt_count": count,
+    }
+    path = status_path(job_id, upload_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _lock_for(job_id):
+        data = read_status(job_id, upload_root)
+        data["api_limit_wait"] = block
+        stages = data.get("stages")
+        if not isinstance(stages, dict):
+            stages = {}
+            data["stages"] = stages
+        entry = stages.get(str(stage))
+        if not isinstance(entry, dict):
+            entry = {"stage": str(stage), "stages": {}}
+            stages[str(stage)] = entry
+        entry["state"] = "api_limit_wait"
+        entry["hit_at"] = block["hit_at"]
+        entry["next_retry_at"] = block["next_retry_at"]
+        entry["attempt_count"] = count
+        data["stage"] = str(stage)
+        data["state"] = "api_limit_wait"
+        _atomic_write(path, data)
+    return block
+
+
+def get_api_limit_wait(job_id, upload_root=None):
+    """The recorded ``api_limit_wait`` block (or ``None`` when never recorded)."""
+    data = read_status(job_id, upload_root)
+    block = data.get("api_limit_wait")
+    return block if isinstance(block, dict) else None

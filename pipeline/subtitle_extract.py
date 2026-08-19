@@ -343,6 +343,20 @@ def call_with_rotation(keys, rotation, callable_, *args, call_budget=None, logge
         return None, rotation, {"type": ftype, "message": str(exc)}
 
 
+def is_rate_limit_result(result):
+    """True when a stage result/error dict is a rate-limit exhaustion (F15).
+
+    Shared predicate across every Gemini call site (extraction, translation,
+    voiceover, the segmented QA gate): :func:`call_with_rotation` catches
+    ``AllKeysExhausted`` and returns an error dict whose ``type`` is
+    ``"rate_limit"`` (see :func:`_failure_type`). A success result, ``None``,
+    or any other error type (transient/network, malformed, content-blocked,
+    unrelated) is not a rate-limit exhaustion. Deliberately extraction-
+    agnostic: it only inspects the ``type`` field of the dict it is given.
+    """
+    return isinstance(result, dict) and result.get("type") == "rate_limit"
+
+
 def _generate_with_rotation(
     keys, rotation, prompt, video_path, offset_sec, call_budget=None, logger_=None
 ):
