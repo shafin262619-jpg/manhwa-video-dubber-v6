@@ -128,6 +128,12 @@ def list_history(upload_root=None):
     Each entry carries the job_config (or the pre-F9 defaults), the voice
     source, the source filename and the current status stage/state. Missing
     job dirs (files already deleted) are skipped. Never raises.
+
+    F15 Part 4D: entries also carry the job's API rate-limit wait info so the
+    system-wide key-limit modal can detect it without a new status field —
+    ``api_limit_wait`` is the existing top-level block (``None`` when the job
+    is not waiting) and ``api_limit_wait_segments`` lists the segment keys
+    whose automated QA gate is waiting (empty when none).
     """
     root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     out = []
@@ -141,6 +147,11 @@ def list_history(upload_root=None):
         voice_source = cfg.get("voice_source") or voiceover_unify.get_voice_source(
             job_id, root
         )
+        seg_wait_keys = [
+            key for key, seg in (status.get("segments") or {}).items()
+            if isinstance(seg, dict)
+            and (seg.get("qa") or {}).get("state") == "api_limit_wait"
+        ]
         out.append(
             {
                 "job_id": job_id,
@@ -156,6 +167,8 @@ def list_history(upload_root=None):
                 "voice_source": voice_source,
                 "stage": status.get("stage"),
                 "state": status.get("state"),
+                "api_limit_wait": status.get("api_limit_wait"),
+                "api_limit_wait_segments": seg_wait_keys,
             }
         )
     return out

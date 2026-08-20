@@ -18,7 +18,17 @@ from pathlib import Path
 from unittest import mock
 
 import app as app_module
-from pipeline import job_status, key_store, subtitle_extract, translator, video_ingest, voiceover_auto
+from fastapi.testclient import TestClient
+from pipeline import (
+    history_store,
+    job_status,
+    key_store,
+    subtitle_extract,
+    translator,
+    ui,
+    video_ingest,
+    voiceover_auto,
+)
 
 
 class ApiLimitWaitStateTest(unittest.TestCase):
@@ -872,6 +882,179 @@ class ApiLimitWaitBadgeTest(unittest.TestCase):
         html = app_module._render_segmented_result(self.job_id).body.decode()
         self.assertIn("badge-wait", html)
         self.assertIn("api_limit_wait", html)
+
+
+# ---------------------------------------------------------------------------
+# F15 Part 4D: history API exposes wait info for the system-wide modal.
+# ---------------------------------------------------------------------------
+
+
+class ApiLimitWaitHistoryApiTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._orig_root = video_ingest.UPLOAD_ROOT
+        video_ingest.UPLOAD_ROOT = Path(self._tmp.name) / "uploads"
+        self.job_id = "job-history-api-wait"
+        (video_ingest.UPLOAD_ROOT / self.job_id).mkdir(parents=True)
+        self.client = TestClient(app_module.app)
+
+    def tearDown(self):
+        video_ingest.UPLOAD_ROOT = self._orig_root
+
+    def test_history_api_exposes_top_level_wait_block(self):
+        job_status.record_api_limit_wait(
+            self.job_id, "C1_translate",
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        history_store.register_job(
+            self.job_id,
+            meta={"target_video_name": "test.mp4"},
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        res = self.client.get("/api/history")
+        self.assertEqual(res.status_code, 200)
+        entry = res.json()["history"][0]
+        self.assertIsInstance(entry["api_limit_wait"], dict)
+        self.assertEqual(entry["api_limit_wait"]["stage"], "C1_translate")
+        self.assertEqual(entry["api_limit_wait_segments"], [])
+
+    def test_history_api_exposes_segment_wait_keys(self):
+        job_status.init_segments(
+            self.job_id,
+            {"segments": [{"index": 0, "start_sec": 0, "end_sec": 10}]},
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        job_status.record_segment_api_limit_wait(
+            self.job_id, 0, "qa_gate",
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        job_status.record_segment_qa(
+            self.job_id, 0, job_status.SEGMENT_QA_API_LIMIT_WAIT,
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        history_store.register_job(
+            self.job_id,
+            meta={"target_video_name": "test.mp4"},
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        res = self.client.get("/api/history")
+        self.assertEqual(res.status_code, 200)
+        entry = res.json()["history"][0]
+        # No top-level block, but segment wait keys.
+        self.assertIsNone(entry.get("api_limit_wait"))
+        self.assertEqual(entry["api_limit_wait_segments"], ["seg_000"])
+
+    def test_history_api_non_waiting_job_omits_block(self):
+        job_status.write_status(
+            self.job_id, "C1_translate", "done",
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        history_store.register_job(
+            self.job_id,
+            meta={"target_video_name": "test.mp4"},
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        res = self.client.get("/api/history")
+        self.assertEqual(res.status_code, 200)
+        entry = res.json()["history"][0]
+        self.assertIsNone(entry.get("api_limit_wait"))
+        self.assertEqual(entry["api_limit_wait_segments"], [])
+
+
+# ---------------------------------------------------------------------------
+# F15 Part 4D: every page includes the key-limit modal.
+# ---------------------------------------------------------------------------
+
+
+class ApiLimitWaitModalTest(unittest.TestCase):
+    def test_every_page_has_key_limit_modal(self):
+        html = ui.page("Test", "<p>hello</p>")
+        self.assertIn("key-limit-modal", html)
+        self.assertIn("/api/history", html)
+        self.assertIn("keyLimitPoll", html)
+        self.assertIn("key-limit-modal-close", html)
+
+
+# ---------------------------------------------------------------------------
+# F15 Part 4E: instant retry when a new key is added.
+# ---------------------------------------------------------------------------
+
+
+class ApiLimitWaitKeyAddTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._orig_root = video_ingest.UPLOAD_ROOT
+        video_ingest.UPLOAD_ROOT = Path(self._tmp.name) / "uploads"
+        self._orig_key_store = key_store.KEY_STORE_PATH
+        key_store.KEY_STORE_PATH = Path(self._tmp.name) / "gemini_keys_store.json"
+        self.job_id = "job-key-add"
+        (video_ingest.UPLOAD_ROOT / self.job_id).mkdir(parents=True)
+        self.client = TestClient(app_module.app)
+
+    def tearDown(self):
+        video_ingest.UPLOAD_ROOT = self._orig_root
+        key_store.KEY_STORE_PATH = self._orig_key_store
+
+    def _record_wait(self):
+        # Fresh hit at now -> next_retry_at = now + 24h (future, not yet due).
+        job_status.record_api_limit_wait(
+            self.job_id, "C1_translate",
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        history_store.register_job(
+            self.job_id,
+            meta={"target_video_name": "test.mp4"},
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+
+    def test_force_retry_bypasses_schedule(self):
+        """force=True retries even when next_retry_at is in the future."""
+        self._record_wait()
+        # Poll trigger (force=False) must NOT retry (future retry).
+        with mock.patch.object(app_module, "_start_stage") as start:
+            started = app_module._retry_due_api_limit_wait(self.job_id)
+        self.assertFalse(started)
+        start.assert_not_called()
+        # Key-add trigger (force=True) must retry.
+        with mock.patch.object(app_module, "_start_stage") as start:
+            started = app_module._retry_api_limit_wait_job(self.job_id, force=True)
+        self.assertTrue(started)
+        start.assert_called_once_with(
+            self.job_id, "upload_pipeline", app_module._run_upload_pipeline,
+        )
+
+    def test_retry_waiting_jobs_on_key_add_scans_history(self):
+        self._record_wait()
+        # Mock the inner retry function to verify it's called for each waiting job.
+        with mock.patch.object(
+            app_module, "_retry_api_limit_wait_job",
+        ) as retry_job:
+            app_module._retry_waiting_jobs_on_key_add()
+        retry_job.assert_called_once_with(self.job_id, force=True)
+
+    def test_settings_key_add_triggers_immediate_retry(self):
+        self._record_wait()
+        with mock.patch.object(
+            app_module, "_retry_waiting_jobs_on_key_add",
+        ) as trigger:
+            res = self.client.post(
+                "/settings/keys", data={"key": "AIza-fresh-key"},
+            )
+        self.assertEqual(res.status_code, 200)
+        trigger.assert_called_once()
+
+    def test_settings_key_bulk_add_triggers_immediate_retry(self):
+        self._record_wait()
+        with mock.patch.object(
+            app_module, "_retry_waiting_jobs_on_key_add",
+        ) as trigger:
+            res = self.client.post(
+                "/settings/keys/bulk", data={"keys": "AIza-key1"},
+            )
+        self.assertEqual(res.status_code, 200)
+        trigger.assert_called_once()
 
 
 if __name__ == "__main__":

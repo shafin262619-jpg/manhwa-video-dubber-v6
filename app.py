@@ -1291,6 +1291,8 @@ def add_key(key: str | None = Form(None), label: str | None = Form(None)) -> dic
         entry = key_store.add_key(key, label)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    # F15 Part 4E: a new key may unblock jobs waiting out an API rate limit.
+    _retry_waiting_jobs_on_key_add()
     return {"added": entry}
 
 
@@ -1300,6 +1302,8 @@ def add_keys_bulk(keys: str | None = Form(None)) -> dict:
         entries = key_store.add_keys(keys)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    # F15 Part 4E: a new key may unblock jobs waiting out an API rate limit.
+    _retry_waiting_jobs_on_key_add()
     return {"added": entries}
 
 
@@ -1868,21 +1872,20 @@ def _retry_time_passed(next_retry_at):
     return due <= datetime.now(timezone.utc)
 
 
-def _retry_due_api_limit_wait(job_id):
-    """Start the auto-retry for a job whose api_limit_wait has come due (F15).
+def _retry_api_limit_wait_job(job_id, force=False):
+    """Start retries for every api_limit_wait state recorded on a job (F15).
 
-    Checks the top-level ``api_limit_wait`` block on every poll. When the block
-    exists and its ``next_retry_at`` has passed, the stuck stage is re-run the
-    same way it would normally run — ``_run_upload_pipeline`` for the
-    extraction/translation stages, ``_run_voiceover_auto`` for the auto-TTS
-    stage, and the segmented resume path for segmented jobs — so the job
-    resumes without any manual click. A second quota hit inside the retried
-    stage re-records the wait (attempt_count auto-increments) via the stage's
-    own wiring, and this poll re-triggers again once the new retry time passes.
-
-    F15 Part 3: also scans every segment's ``qa.state`` for ``api_limit_wait``
-    and re-runs the automated QA gate for any segment whose wait has come due.
-    Returns True when a retry was started.
+    Dispatches the same way the poll trigger does — ``_run_upload_pipeline``
+    for the extraction/translation stages, ``_run_voiceover_auto`` for the
+    auto-TTS stage, the segmented resume path for segmented jobs, and a
+    per-segment QA gate re-run for segment waits. ``force`` bypasses the
+    ``next_retry_at`` schedule: the poll trigger (``force=False``) waits for
+    the scheduled time, while the key-add trigger (:func:`_retry_waiting_jobs_on_key_add`)
+    uses ``force=True`` so a freshly added key is tried immediately. The same
+    freshness guards apply in both cases — the top-level state must still be
+    ``api_limit_wait`` and a segment's ``qa.state`` must still be
+    ``api_limit_wait`` — so a stale block never re-triggers. Returns True when
+    a retry was started.
     """
     started = False
     data = job_status_store.read_status(job_id)
@@ -1892,8 +1895,8 @@ def _retry_due_api_limit_wait(job_id):
     block = data.get("api_limit_wait")
     if (
         isinstance(block, dict)
-        and _retry_time_passed(block.get("next_retry_at"))
         and data.get("state") == "api_limit_wait"
+        and (force or _retry_time_passed(block.get("next_retry_at")))
     ):
         stage = block.get("stage")
         if segmentation.is_segmented(job_id):
@@ -1914,9 +1917,9 @@ def _retry_due_api_limit_wait(job_id):
         if not isinstance(qa, dict) or qa.get("state") != "api_limit_wait":
             continue
         seg_block = entry.get("api_limit_wait")
-        if not isinstance(seg_block, dict) or not _retry_time_passed(
-            seg_block.get("next_retry_at")
-        ):
+        if not isinstance(seg_block, dict):
+            continue
+        if not force and not _retry_time_passed(seg_block.get("next_retry_at")):
             continue
         threading.Thread(
             target=_run_qa_gate_retry,
@@ -1925,6 +1928,42 @@ def _retry_due_api_limit_wait(job_id):
         ).start()
         started = True
     return started
+
+
+def _retry_due_api_limit_wait(job_id):
+    """Start the auto-retry for a job whose api_limit_wait has come due (F15).
+
+    Poll-triggered (called on every status request): the top-level
+    ``api_limit_wait`` block and every segment's QA-gate wait are re-run the
+    same way they would normally run once their ``next_retry_at`` has passed,
+    so the job resumes without any manual click. A second quota hit inside the
+    retried stage re-records the wait (attempt_count auto-increments) via the
+    stage's own wiring, and this poll re-triggers again once the new retry
+    time passes. Returns True when a retry was started.
+    """
+    return _retry_api_limit_wait_job(job_id, force=False)
+
+
+def _retry_waiting_jobs_on_key_add():
+    """Force an immediate retry of every waiting job after a new key is saved.
+
+    F15 Part 4E: the settings page's key-add endpoints call this right after a
+    key is persisted, so a job waiting out an API rate limit gets a fresh
+    attempt NOW instead of at its scheduled ``next_retry_at``. A successful
+    resume clears the wait through the normal path (the stage writes
+    running/done); another exhaustion re-records ``api_limit_wait`` with an
+    incremented attempt count and the existing schedule governs the next try.
+    Best-effort — never raises into the settings page.
+    """
+    try:
+        for entry in history_store.list_history():
+            job_id = entry.get("job_id")
+            if job_id:
+                _retry_api_limit_wait_job(job_id, force=True)
+    except Exception:  # noqa: BLE001 - never break the settings page
+        logger.warning(
+            "forced api_limit_wait retry after key add failed", exc_info=True
+        )
 
 
 def _run_qa_gate_retry(job_id, seg_index):

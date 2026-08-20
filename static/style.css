@@ -556,6 +556,53 @@ code {
   color: #f5dca8;
 }
 
+/* F15 Part 4D: system-wide API key-limit warning modal — a fixed overlay on
+   every page, shown while any job is in api_limit_wait. */
+.key-limit-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(11, 9, 8, .72);
+  backdrop-filter: blur(3px);
+  padding: 1.5rem;
+}
+
+.key-limit-modal[hidden] {
+  display: none;
+}
+
+.key-limit-modal-box {
+  max-width: 34rem;
+  width: 100%;
+  border: 1px solid rgba(222, 165, 60, .6);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--card-shadow);
+  padding: 1.4rem 1.5rem;
+}
+
+.key-limit-modal-box p {
+  color: #f5dca8;
+}
+
+.key-limit-modal-box ul {
+  margin: 0.8rem 0;
+  padding-left: 1.2rem;
+  color: #f2c879;
+}
+
+.key-limit-modal-box li {
+  margin: 0.3rem 0;
+  word-break: break-word;
+}
+
+.key-limit-modal-box button {
+  margin-top: 0.6rem;
+}
+
 .page-nav {
   margin-top: 2.5rem;
   padding-top: 1rem;

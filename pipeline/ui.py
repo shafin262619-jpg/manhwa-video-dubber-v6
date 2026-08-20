@@ -113,6 +113,10 @@ def page(title, body, active=None):
     F10.5: every page ends with a consistent back/home nav so users never
     get stranded - "আগের পাতায় যান" (``history.back()``) first, then
     "হোমে যান".
+
+    F15 Part 4D: every page also includes the key-limit modal (a system-wide
+    overlay that appears when any job is in ``api_limit_wait``) — built into
+    the shared layout so the modal works on every page without per-page wiring.
     """
     return (
         page_head(title, active)
@@ -123,8 +127,89 @@ def page(title, body, active=None):
         '  <span class="page-nav-sep" aria-hidden="true">·</span>\n'
         '  <a href="/">হোমে যান</a>\n'
         "</nav>\n"
+        + _key_limit_modal()
         + "\n</main>\n"
         + "</div><!-- /app-main -->\n"
         + "</div><!-- /app-shell -->\n"
         + "</body>\n</html>\n"
     )
+
+
+def _key_limit_modal():
+    """System-wide API key-limit warning modal (F15 Part 4D).
+
+    Injected into every page. A small JS poll of ``/api/history`` (which now
+    carries each job's ``api_limit_wait`` block and waiting-segment keys)
+    shows the overlay whenever ANY job is waiting out an API rate limit —
+    top-level stage waits and per-segment QA-gate waits alike. It stays
+    visible until the condition clears (the next poll auto-hides it when no
+    job is waiting — never a timer) or the user closes it.
+    """
+    return """
+  <div id="key-limit-modal" class="key-limit-modal" hidden>
+    <div class="key-limit-modal-box">
+      <p class="wait-banner-title">সব জেমিনি API কী-এর দৈনিক কোটার সীমা পূর্ণ</p>
+      <p>এক বা একাধিক কাজ API কোটার সীমার কারণে অপেক্ষায় আছে — কাজগুলো
+      কোটার রিসেটের পরে (বা নতুন কী যোগ করার সাথে সাথে) স্বয়ংক্রিয়ভাবে
+      আবার শুরু হবে।</p>
+      <ul id="key-limit-modal-list"></ul>
+      <button type="button" id="key-limit-modal-close">বুঝেছি</button>
+    </div>
+  </div>
+  <script>
+    var keyLimitDismissed = false;
+    function keyLimitWaiting() {
+      return fetch('/api/history')
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          return (data.history || []).filter(function (e) {
+            return (e.api_limit_wait && typeof e.api_limit_wait === 'object') ||
+                   (e.api_limit_wait_segments || []).length > 0;
+          });
+        })
+        .catch(function () { return []; });
+    }
+    function renderKeyLimitModal(entries) {
+      var modal = document.getElementById('key-limit-modal');
+      if (!modal) return;
+      if (!entries.length) {
+        modal.hidden = true;
+        keyLimitDismissed = false;
+        return;
+      }
+      if (keyLimitDismissed) return;
+      var list = document.getElementById('key-limit-modal-list');
+      list.innerHTML = '';
+      entries.forEach(function (e) {
+        var li = document.createElement('li');
+        var block = e.api_limit_wait || {};
+        var label = 'জব ' + e.job_id;
+        if (block.stage) { label += ' — স্টেজ ' + block.stage; }
+        if (block.next_retry_at) {
+          label += ' (পরবর্তী চেষ্টা: ' + block.next_retry_at + ' UTC)';
+        }
+        if ((e.api_limit_wait_segments || []).length) {
+          label += ' — ' + e.api_limit_wait_segments.length + 'টি সেগমেন্ট অপেক্ষায়';
+        }
+        li.textContent = label;
+        list.appendChild(li);
+      });
+      modal.hidden = false;
+    }
+    function keyLimitPoll() {
+      keyLimitWaiting().then(function (entries) {
+        renderKeyLimitModal(entries);
+        setTimeout(keyLimitPoll, 15000);
+      });
+    }
+    document.addEventListener('DOMContentLoaded', function () {
+      var closeBtn = document.getElementById('key-limit-modal-close');
+      if (closeBtn) {
+        closeBtn.addEventListener('click', function () {
+          keyLimitDismissed = true;
+          document.getElementById('key-limit-modal').hidden = true;
+        });
+      }
+      keyLimitPoll();
+    });
+  </script>"""
