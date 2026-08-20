@@ -84,6 +84,10 @@ def _run_segment_stage(job_id, seg_index, stage, func, *args, **kwargs):
     Mirrors ``job_status.run_stage`` scoped to one segment: writes the
     segment's ``stages[stage]`` transition around ``func(*args, **kwargs)``.
     Status writes are best-effort; the stage result/error always wins.
+
+    F15 Part 2C: an ``ApiLimitWaitError`` is re-raised without writing
+    ``error`` — the stage already transitioned the job to ``api_limit_wait``
+    and the segment must stay resumable, not be marked failed.
     """
     try:
         job_status_store.write_segment_status(job_id, seg_index, stage, "running")
@@ -91,6 +95,8 @@ def _run_segment_stage(job_id, seg_index, stage, func, *args, **kwargs):
         pass
     try:
         result = func(*args, **kwargs)
+    except job_status_store.ApiLimitWaitError:
+        raise
     except Exception:
         try:
             job_status_store.write_segment_status(job_id, seg_index, stage, "error")
@@ -252,6 +258,10 @@ def run_segmented_pipeline(job_id, upload_root=None, call_budget=None,
                 final_path = run_segment_voiceover_chain(
                     job_id, segment, seg_dir, root, call_budget, logger_=log
                 )
+        except job_status_store.ApiLimitWaitError:
+            # F15 Part 2C: the job is already in api_limit_wait — the segment
+            # is NOT marked failed so the auto-retry resume can re-enter here.
+            raise
         except Exception as exc:  # noqa: BLE001 - persist + re-raise
             try:
                 job_status_store.mark_segment_error(

@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+import app as app_module
 from pipeline import job_status, key_store, subtitle_extract, translator, video_ingest, voiceover_auto
 
 
@@ -459,6 +460,171 @@ class VoiceoverApiLimitWaitTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["failed_serials"], [1])
+
+
+# ---------------------------------------------------------------------------
+# F15 Part 2C: automatic retry execution once next_retry_at has passed.
+# ---------------------------------------------------------------------------
+
+
+class ApiLimitWaitRetryTest(unittest.TestCase):
+    """Auto-retry dispatcher tests — the poll-triggered retry mechanism."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._orig_root = video_ingest.UPLOAD_ROOT
+        video_ingest.UPLOAD_ROOT = Path(self._tmp.name) / "uploads"
+        self.job_id = "job-api-retry"
+        self.hit = datetime(2020, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    def tearDown(self):
+        video_ingest.UPLOAD_ROOT = self._orig_root
+
+    # -- helpers -----------------------------------------------------------
+
+    def _record_wait(self, stage="C1_translate", hit_at=None):
+        job_status.record_api_limit_wait(
+            self.job_id, stage, hit_at=hit_at or self.hit,
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+
+    # -- guard: future next_retry_at ---------------------------------------
+
+    def test_stays_waiting_while_next_retry_in_future(self):
+        # Fresh hit at now -> next_retry_at = now + 24h (still in the future).
+        job_status.record_api_limit_wait(
+            self.job_id, "C1_translate",
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        with mock.patch.object(app_module, "_start_stage") as start:
+            started = app_module._retry_due_api_limit_wait(self.job_id)
+        self.assertFalse(started)
+        start.assert_not_called()
+        data = job_status.read_status(self.job_id)
+        self.assertEqual(data["state"], "api_limit_wait")
+
+    # -- dispatch: whole-video stages --------------------------------------
+
+    def test_f1_extract_retry_via_upload_pipeline(self):
+        self._record_wait(stage="F1_extract")
+        with mock.patch.object(app_module, "_start_stage") as start:
+            started = app_module._retry_due_api_limit_wait(self.job_id)
+        self.assertTrue(started)
+        start.assert_called_once_with(
+            self.job_id, "upload_pipeline", app_module._run_upload_pipeline,
+        )
+
+    def test_c1_translate_retry_via_upload_pipeline(self):
+        self._record_wait(stage="C1_translate")
+        with mock.patch.object(app_module, "_start_stage") as start:
+            started = app_module._retry_due_api_limit_wait(self.job_id)
+        self.assertTrue(started)
+        start.assert_called_once_with(
+            self.job_id, "upload_pipeline", app_module._run_upload_pipeline,
+        )
+
+    def test_d2_voiceover_retry_via_voiceover_auto(self):
+        self._record_wait(stage="D2_voiceover")
+        with mock.patch.object(app_module, "_start_stage") as start:
+            started = app_module._retry_due_api_limit_wait(self.job_id)
+        self.assertTrue(started)
+        start.assert_called_once_with(
+            self.job_id, "voiceover_auto", app_module._run_voiceover_auto,
+        )
+
+    # -- dispatch: segmented job routes to resume --------------------------
+
+    def test_segmented_job_retry_via_resume(self):
+        # Create a segment plan so is_segmented returns True.
+        from pipeline import segmentation
+        seg_dir = segmentation.segments_root(self.job_id)
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        (seg_dir / "segment_plan.json").write_text(
+            json.dumps({
+                "segments": [
+                    {"index": 0, "start_sec": 0, "end_sec": 10},
+                    {"index": 1, "start_sec": 10, "end_sec": 20},
+                ],
+            }),
+            encoding="utf-8",
+        )
+        self._record_wait(stage="C1_translate")
+        with mock.patch.object(app_module, "_start_stage") as start:
+            started = app_module._retry_due_api_limit_wait(self.job_id)
+        self.assertTrue(started)
+        start.assert_called_once_with(
+            self.job_id, "resume", app_module._run_resume,
+        )
+
+    # -- stale block guard ------------------------------------------------
+
+    def test_stale_block_after_done_does_not_retrigger(self):
+        self._record_wait()
+        job_status.write_status(
+            self.job_id, "C1_translate", "done",
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        # Block exists but state is "done" — no retry.
+        with mock.patch.object(app_module, "_start_stage") as start:
+            started = app_module._retry_due_api_limit_wait(self.job_id)
+        self.assertFalse(started)
+        start.assert_not_called()
+
+    # -- second exhaustion recomputes next_retry_at -----------------------
+
+    def test_second_exhaustion_recomputes_next_retry(self):
+        attempt_1 = job_status.record_api_limit_wait(
+            self.job_id, "C1_translate", hit_at=self.hit,
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        self.assertEqual(attempt_1["attempt_count"], 1)
+        self.assertEqual(
+            attempt_1["next_retry_at"],
+            (self.hit + timedelta(hours=24)).isoformat(),
+        )
+
+        attempt_2 = job_status.record_api_limit_wait(
+            self.job_id, "C1_translate", hit_at=self.hit,
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        self.assertEqual(attempt_2["attempt_count"], 2)
+        self.assertEqual(
+            attempt_2["next_retry_at"],
+            (self.hit + timedelta(hours=25)).isoformat(),
+        )
+
+    # -- _run_resume guard ------------------------------------------------
+
+    def test_run_resume_skips_error_status_on_api_limit_wait(self):
+        self._record_wait()
+        with mock.patch.object(
+            app_module.resume, "resume_job",
+            side_effect=job_status.ApiLimitWaitError("wait"),
+        ):
+            app_module._run_resume(self.job_id)
+        # State must still be api_limit_wait — the error handler skipped it.
+        data = job_status.read_status(self.job_id)
+        self.assertEqual(data["state"], "api_limit_wait")
+
+    # -- _retry_time_passed ------------------------------------------------
+
+    def test_retry_time_passed_past(self):
+        self.assertTrue(
+            app_module._retry_time_passed(
+                (self.hit + timedelta(hours=1)).isoformat()
+            )
+        )
+
+    def test_retry_time_passed_future(self):
+        future = datetime.now(timezone.utc) + timedelta(hours=48)
+        self.assertFalse(app_module._retry_time_passed(future.isoformat()))
+
+    def test_retry_time_passed_none(self):
+        self.assertFalse(app_module._retry_time_passed(None))
+
+    def test_retry_time_passed_invalid(self):
+        self.assertFalse(app_module._retry_time_passed("not-a-date"))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import json
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
@@ -1818,11 +1819,65 @@ def _run_resume(job_id):
         auto_cut.DraftValidationError,
         voiceover_unify.VoiceoverAlignmentError,
     ) as exc:
+        if isinstance(exc, job_status_store.ApiLimitWaitError):
+            # F15 Part 2C: the stage already recorded api_limit_wait; the
+            # resume's exception handler must not write error status.
+            return
         logger.error("resume failed for job %s: %s", job_id, exc)
         _write_error_status(job_id, "resume", exc)
     except Exception as exc:  # noqa: BLE001 — daemon thread must never die
         logger.exception("unexpected resume failure for job %s", job_id)
         _write_error_status(job_id, "resume", exc)
+
+
+# ---------------------------------------------------------------------------
+# F15 Part 2C: automatic retry for api_limit_wait stages
+# ---------------------------------------------------------------------------
+
+
+def _retry_time_passed(next_retry_at):
+    """True when an ISO-8601 next_retry_at string is in the past. Never raises."""
+    if not next_retry_at:
+        return False
+    try:
+        due = datetime.fromisoformat(str(next_retry_at))
+    except ValueError:
+        return False
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=timezone.utc)
+    return due <= datetime.now(timezone.utc)
+
+
+def _retry_due_api_limit_wait(job_id):
+    """Start the auto-retry for a job whose api_limit_wait has come due (F15).
+
+    Checks the top-level ``api_limit_wait`` block on every poll. When the block
+    exists and its ``next_retry_at`` has passed, the stuck stage is re-run the
+    same way it would normally run — ``_run_upload_pipeline`` for the
+    extraction/translation stages, ``_run_voiceover_auto`` for the auto-TTS
+    stage, and the segmented resume path for segmented jobs — so the job
+    resumes without any manual click. A second quota hit inside the retried
+    stage re-records the wait (attempt_count auto-increments) via the stage's
+    own wiring, and this poll re-triggers again once the new retry time passes.
+    Returns True when a retry was started.
+    """
+    block = job_status_store.get_api_limit_wait(job_id)
+    if not block or not _retry_time_passed(block.get("next_retry_at")):
+        return False
+    status = job_status_store.read_status(job_id)
+    if status.get("state") != "api_limit_wait":
+        return False
+    stage = block.get("stage")
+    if segmentation.is_segmented(job_id):
+        _start_stage(job_id, "resume", _run_resume)
+        return True
+    if stage in ("F1_extract", "C1_translate"):
+        _start_stage(job_id, "upload_pipeline", _run_upload_pipeline)
+        return True
+    if stage == "D2_voiceover":
+        _start_stage(job_id, "voiceover_auto", _run_voiceover_auto)
+        return True
+    return False
 
 
 @app.post("/jobs/{job_id}/unresolved/retry")
@@ -1867,6 +1922,13 @@ def unresolved_accept(job_id: str) -> dict:
 
 @app.get("/api/jobs/{job_id}/status")
 def job_status(job_id: str) -> dict:
+    # F15 Part 2C: a job waiting out an API rate limit is resumed automatically
+    # on the next poll once next_retry_at has passed. The trigger is
+    # best-effort — a failed trigger must never break polling.
+    try:
+        _retry_due_api_limit_wait(job_id)
+    except Exception:  # noqa: BLE001 - status is advisory
+        logger.warning("api_limit_wait retry trigger failed for job %s", job_id)
     return job_status_store.read_status(job_id)
 
 
