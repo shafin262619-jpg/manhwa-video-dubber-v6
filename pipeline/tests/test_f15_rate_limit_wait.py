@@ -467,6 +467,97 @@ class VoiceoverApiLimitWaitTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# F15 Part 3: segment-scoped api_limit_wait helpers.
+# ---------------------------------------------------------------------------
+
+
+class RecordSegmentApiLimitWaitTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.upload_root = Path(self._tmp.name) / "uploads"
+        self.job_id = "job-seg-api-limit-wait"
+        (self.upload_root / self.job_id).mkdir(parents=True)
+        self.hit = datetime(2026, 8, 19, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_record_writes_block_scoped_to_segment(self):
+        job_status.init_segments(
+            self.job_id,
+            {"segments": [{"index": 0, "start_sec": 0, "end_sec": 10}]},
+            upload_root=self.upload_root,
+        )
+        block = job_status.record_segment_api_limit_wait(
+            self.job_id, 0, "qa_gate", hit_at=self.hit,
+            upload_root=self.upload_root,
+        )
+        self.assertEqual(block["stage"], "qa_gate")
+        self.assertEqual(block["hit_at"], self.hit.isoformat())
+        self.assertEqual(block["next_retry_at"],
+                         (self.hit + timedelta(hours=24)).isoformat())
+        self.assertEqual(block["attempt_count"], 1)
+
+        entry = job_status.read_segment_status(
+            self.job_id, 0, upload_root=self.upload_root
+        )
+        self.assertEqual(entry["api_limit_wait"], block)
+        self.assertEqual(entry["state"], "api_limit_wait")
+        self.assertEqual(entry["stage"], "qa_gate")
+        self.assertEqual(
+            entry["stages"]["qa_gate"]["state"], "api_limit_wait",
+        )
+        # Top level untouched.
+        data = job_status.read_status(self.job_id, upload_root=self.upload_root)
+        self.assertIsNone(data.get("api_limit_wait"))
+
+    def test_attempt_count_increments_with_wider_backoff(self):
+        job_status.init_segments(
+            self.job_id,
+            {"segments": [{"index": 0, "start_sec": 0, "end_sec": 10}]},
+            upload_root=self.upload_root,
+        )
+        job_status.record_segment_api_limit_wait(
+            self.job_id, 0, "qa_gate", hit_at=self.hit,
+            upload_root=self.upload_root,
+        )
+        block = job_status.record_segment_api_limit_wait(
+            self.job_id, 0, "qa_gate", hit_at=self.hit,
+            upload_root=self.upload_root,
+        )
+        self.assertEqual(block["attempt_count"], 2)
+        self.assertEqual(block["next_retry_at"],
+                         (self.hit + timedelta(hours=25)).isoformat())
+
+    def test_get_returns_none_when_never_recorded(self):
+        job_status.init_segments(
+            self.job_id,
+            {"segments": [{"index": 0, "start_sec": 0, "end_sec": 10}]},
+            upload_root=self.upload_root,
+        )
+        self.assertIsNone(
+            job_status.get_segment_api_limit_wait(
+                self.job_id, 0, upload_root=self.upload_root
+            )
+        )
+
+    def test_get_returns_recorded_block(self):
+        job_status.init_segments(
+            self.job_id,
+            {"segments": [{"index": 0, "start_sec": 0, "end_sec": 10}]},
+            upload_root=self.upload_root,
+        )
+        block = job_status.record_segment_api_limit_wait(
+            self.job_id, 0, "qa_gate", hit_at=self.hit,
+            upload_root=self.upload_root,
+        )
+        self.assertEqual(
+            job_status.get_segment_api_limit_wait(
+                self.job_id, 0, upload_root=self.upload_root
+            ),
+            block,
+        )
+
+
 class ApiLimitWaitRetryTest(unittest.TestCase):
     """Auto-retry dispatcher tests — the poll-triggered retry mechanism."""
 
@@ -625,6 +716,162 @@ class ApiLimitWaitRetryTest(unittest.TestCase):
 
     def test_retry_time_passed_invalid(self):
         self.assertFalse(app_module._retry_time_passed("not-a-date"))
+
+    # -- per-segment QA gate waits (F15 Part 3) ----------------------------
+
+    def _make_segmented(self):
+        from pipeline import segmentation
+        seg_root = segmentation.segments_root(self.job_id)
+        seg_root.mkdir(parents=True, exist_ok=True)
+        (seg_root / "segment_plan.json").write_text(
+            json.dumps({
+                "segments": [
+                    {"index": 0, "start_sec": 0, "end_sec": 10},
+                    {"index": 1, "start_sec": 10, "end_sec": 20},
+                ],
+            }),
+            encoding="utf-8",
+        )
+        (video_ingest.UPLOAD_ROOT / self.job_id).mkdir(parents=True, exist_ok=True)
+        job_status.init_segments(
+            self.job_id,
+            {
+                "segments": [
+                    {"index": 0, "start_sec": 0, "end_sec": 10},
+                    {"index": 1, "start_sec": 10, "end_sec": 20},
+                ],
+            },
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+
+    def test_segment_qa_wait_triggers_gate_retry_when_due(self):
+        self._make_segmented()
+        job_status.record_segment_api_limit_wait(
+            self.job_id, 0, "qa_gate", hit_at=self.hit,
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        job_status.record_segment_qa(
+            self.job_id, 0, job_status.SEGMENT_QA_API_LIMIT_WAIT,
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        with mock.patch.object(app_module.threading, "Thread") as thread_cls:
+            started = app_module._retry_due_api_limit_wait(self.job_id)
+        self.assertTrue(started)
+        thread_cls.assert_called_once()
+        self.assertEqual(
+            thread_cls.call_args.kwargs["target"], app_module._run_qa_gate_retry,
+        )
+        self.assertEqual(
+            thread_cls.call_args.kwargs["args"], (self.job_id, 0),
+        )
+
+    def test_segment_qa_wait_future_retry_stays_waiting(self):
+        self._make_segmented()
+        job_status.record_segment_api_limit_wait(
+            self.job_id, 0, "qa_gate",
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        job_status.record_segment_qa(
+            self.job_id, 0, job_status.SEGMENT_QA_API_LIMIT_WAIT,
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        with mock.patch.object(app_module.threading, "Thread") as thread_cls:
+            started = app_module._retry_due_api_limit_wait(self.job_id)
+        self.assertFalse(started)
+        thread_cls.assert_not_called()
+
+    def test_stale_segment_block_without_qa_state_ignored(self):
+        self._make_segmented()
+        # Block exists but qa.state is not api_limit_wait (e.g. the gate later
+        # passed) — no retry.
+        job_status.record_segment_api_limit_wait(
+            self.job_id, 0, "qa_gate", hit_at=self.hit,
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        job_status.record_segment_qa(
+            self.job_id, 0, job_status.SEGMENT_QA_PASSED,
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        with mock.patch.object(app_module.threading, "Thread") as thread_cls:
+            started = app_module._retry_due_api_limit_wait(self.job_id)
+        self.assertFalse(started)
+        thread_cls.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# F15 Part 3: api_limit_wait badges on the history + segmented result pages.
+# ---------------------------------------------------------------------------
+
+
+class ApiLimitWaitBadgeTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._orig_root = video_ingest.UPLOAD_ROOT
+        video_ingest.UPLOAD_ROOT = Path(self._tmp.name) / "uploads"
+        self.job_id = "job-badge"
+        (video_ingest.UPLOAD_ROOT / self.job_id).mkdir(parents=True)
+
+    def tearDown(self):
+        video_ingest.UPLOAD_ROOT = self._orig_root
+
+    def test_history_card_whole_video_wait_state_badge(self):
+        job_status.record_api_limit_wait(
+            self.job_id, "C1_translate",
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        card = app_module._history_card(
+            {"job_id": self.job_id, "state": "api_limit_wait"}
+        )
+        self.assertIn("badge-wait", card)
+
+    def test_history_card_segment_wait_badge(self):
+        job_status.init_segments(
+            self.job_id,
+            {"segments": [{"index": 0, "start_sec": 0, "end_sec": 10}]},
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        job_status.record_segment_api_limit_wait(
+            self.job_id, 0, "qa_gate",
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        job_status.record_segment_qa(
+            self.job_id, 0, job_status.SEGMENT_QA_API_LIMIT_WAIT,
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        card = app_module._history_card(
+            {"job_id": self.job_id, "state": "done"}
+        )
+        self.assertIn("badge-wait", card)
+        self.assertIn("api_limit_wait", card)
+
+    def test_history_card_no_wait_no_badge(self):
+        job_status.write_status(
+            self.job_id, "C1_translate", "done",
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        card = app_module._history_card(
+            {"job_id": self.job_id, "state": "done"}
+        )
+        self.assertNotIn("badge-wait", card)
+
+    def test_segmented_result_page_shows_segment_wait_badge(self):
+        job_status.init_segments(
+            self.job_id,
+            {"segments": [{"index": 0, "start_sec": 0, "end_sec": 10}]},
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        job_status.record_segment_api_limit_wait(
+            self.job_id, 0, "qa_gate",
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        job_status.record_segment_qa(
+            self.job_id, 0, job_status.SEGMENT_QA_API_LIMIT_WAIT,
+            upload_root=video_ingest.UPLOAD_ROOT,
+        )
+        html = app_module._render_segmented_result(self.job_id).body.decode()
+        self.assertIn("badge-wait", html)
+        self.assertIn("api_limit_wait", html)
 
 
 if __name__ == "__main__":

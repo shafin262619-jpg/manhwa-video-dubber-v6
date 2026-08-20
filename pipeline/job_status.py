@@ -576,6 +576,10 @@ def restore_segment_state(job_id, seg_index, prior_entry, upload_root=None):
 SEGMENT_QA_CHECKING = "qa_checking"
 SEGMENT_QA_PASSED = "qa_passed"
 SEGMENT_QA_CAPPED = "qa_capped"
+# F15 Part 3: the gate could not run because every Gemini key is rate-limited;
+# the segment's ``qa`` block records this state alongside the segment-scoped
+# ``api_limit_wait`` block until the auto-retry re-runs the gate.
+SEGMENT_QA_API_LIMIT_WAIT = "api_limit_wait"
 
 # Bengali note attached when the automated QA cap is reached (F14b Part 2);
 # surfaced in F14a's review UI so the user knows to look closely.
@@ -862,7 +866,10 @@ def _atomic_write(path, data):
 # ``next_retry_at`` follows :func:`compute_next_retry`: the first hit waits a
 # full 24h quota window, each later hit re-queues one hour after the previous
 # attempt's retry time. The four Gemini call sites that can produce a
-# ``rate_limit`` result dict consume this in F15 Parts 2B/2C/3.
+# ``rate_limit`` result dict consume this in F15 Parts 2B/2C/3. F15 Part 3
+# adds the per-segment mirror (:func:`record_segment_api_limit_wait` /
+# :func:`get_segment_api_limit_wait`) with the same block shape under
+# ``data["segments"]["seg_XXX"]["api_limit_wait"]`` for the segmented QA gate.
 # ---------------------------------------------------------------------------
 
 
@@ -971,4 +978,74 @@ def get_api_limit_wait(job_id, upload_root=None):
     """The recorded ``api_limit_wait`` block (or ``None`` when never recorded)."""
     data = read_status(job_id, upload_root)
     block = data.get("api_limit_wait")
+    return block if isinstance(block, dict) else None
+
+
+def record_segment_api_limit_wait(job_id, seg_index, stage, *, hit_at=None,
+                                  attempt_count=None, upload_root=None):
+    """Record that a segment's stage hit API rate-limit exhaustion (F15 Part 3).
+
+    Mirrors :func:`record_api_limit_wait` scoped to one segment: writes the
+    ``api_limit_wait`` block (``stage`` / ``hit_at`` / ``next_retry_at`` /
+    ``attempt_count``) onto ``data["segments"]["seg_XXX"]`` and transitions
+    that segment's stage entry plus the segment's ``stage``/``state`` to
+    ``api_limit_wait``. When ``attempt_count`` is omitted it increments the
+    segment's previously recorded count; ``hit_at`` defaults to now and
+    ``next_retry_at`` follows :func:`compute_next_retry`. The top-level
+    ``segmented`` summary is recomputed. Returns the recorded block.
+    """
+    hit = _as_utc_datetime(hit_at) if hit_at is not None else datetime.now(timezone.utc)
+    prior = get_segment_api_limit_wait(job_id, seg_index, upload_root)
+    if attempt_count is not None:
+        count = int(attempt_count)
+    else:
+        count = int(prior.get("attempt_count", 0)) + 1 if prior else 1
+    if count < 1:
+        raise ValueError(
+            f"invalid attempt count {attempt_count!r}; attempts start at 1"
+        )
+    next_retry = compute_next_retry(hit, count)
+    block = {
+        "stage": str(stage),
+        "hit_at": hit.isoformat(),
+        "next_retry_at": next_retry.isoformat(),
+        "attempt_count": count,
+    }
+    path = status_path(job_id, upload_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _lock_for(job_id):
+        data = read_status(job_id, upload_root)
+        seg_map = data.get("segments")
+        if not isinstance(seg_map, dict):
+            seg_map = {}
+            data["segments"] = seg_map
+        key = segmentation.segment_key(seg_index)
+        entry = seg_map.get(key)
+        if not isinstance(entry, dict):
+            entry = {"index": int(seg_index), "stages": {}}
+            seg_map[key] = entry
+        entry["api_limit_wait"] = block
+        stages = entry.get("stages")
+        if not isinstance(stages, dict):
+            stages = {}
+            entry["stages"] = stages
+        stage_entry = stages.get(str(stage))
+        if not isinstance(stage_entry, dict):
+            stage_entry = {"stage": str(stage), "stages": {}}
+            stages[str(stage)] = stage_entry
+        stage_entry["state"] = "api_limit_wait"
+        stage_entry["hit_at"] = block["hit_at"]
+        stage_entry["next_retry_at"] = block["next_retry_at"]
+        stage_entry["attempt_count"] = count
+        entry["stage"] = str(stage)
+        entry["state"] = "api_limit_wait"
+        _update_segmented_overall(data)
+        _atomic_write(path, data)
+    return block
+
+
+def get_segment_api_limit_wait(job_id, seg_index, upload_root=None):
+    """The segment's recorded ``api_limit_wait`` block (or ``None``)."""
+    entry = read_segment_status(job_id, seg_index, upload_root)
+    block = entry.get("api_limit_wait")
     return block if isinstance(block, dict) else None

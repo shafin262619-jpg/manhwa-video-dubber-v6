@@ -848,6 +848,7 @@ code {
 .badge-done    { color: #dffbf3; border-color: rgba(63, 167, 150, .55); background: linear-gradient(135deg, rgba(63, 167, 150, .26), rgba(63, 167, 150, .08)); box-shadow: 0 0 0 1px rgba(63, 167, 150, .12), 0 1px 3px rgba(0, 0, 0, .25); font-weight: 700; }
 .badge-running { color: var(--accent); border-color: rgba(201, 210, 217, .5); background: rgba(201, 210, 217, .10); }
 .badge-error   { color: #ffb3b5; border-color: rgba(229, 72, 77, .6); background: rgba(229, 72, 77, .10); }
+.badge-wait    { color: #f2c879; border-color: rgba(222, 165, 60, .55); background: rgba(222, 165, 60, .12); }
 .badge-idle    { color: var(--text-muted); border-color: var(--hairline); background: rgba(168, 150, 127, .08); }
 
 .history-meta {

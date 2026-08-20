@@ -859,6 +859,12 @@ def rerun_segment_stage(job_id, seg_index, round_no=None, review=None,
 # note) is recorded in the segment's job-status ``qa`` block. A Gemini
 # API/parse failure counts as a failed attempt toward the cap and never
 # crashes the segment's pipeline run.
+#
+# F15 Part 3: quota exhaustion is handled BEFORE the failure counting — when
+# every key is rate-limited the check cannot run at all, so the segment
+# records a segment-scoped ``api_limit_wait`` and the gate returns
+# ``qa_state = "api_limit_wait"`` instead of burning fix attempts; the F15
+# Part 2C auto-retry re-runs the gate once ``next_retry_at`` passes.
 # ---------------------------------------------------------------------------
 
 SEGMENT_QA_PROMPT = (
@@ -1045,6 +1051,10 @@ def run_auto_qa_gate(job_id, segment, seg_dir, final_path, upload_root=None,
     - A Gemini API/parse failure counts as a failed attempt toward the cap
       (never crashes the pipeline run).
     - Cap reached with a mismatch -> ``qa_capped`` + a Bengali note for F14a.
+    - Quota exhaustion (every key rate-limited, F15 Part 3) -> a segment-scoped
+      ``api_limit_wait`` is recorded and ``qa_state = "api_limit_wait"`` is
+      returned WITHOUT counting a fix attempt; the auto-retry re-runs the gate
+      once ``next_retry_at`` passes.
 
     Only the given segment's state is touched; other segments are unaffected.
     Returns ``{"qa_state": str|None, "note_bn": str|None}`` (``qa_state`` is
@@ -1096,6 +1106,30 @@ def run_auto_qa_gate(job_id, segment, seg_dir, final_path, upload_root=None,
             call_budget=call_budget, logger_=log,
         )
         if result is None:
+            if subtitle_extract.is_rate_limit_result(error):
+                # F15 Part 3: quota exhaustion is NOT a QA failure — it is a
+                # temporary inability to run the check at all. Record a
+                # segment-scoped api_limit_wait and release WITHOUT counting a
+                # fix attempt (the fix_attempts/qa_capped counting stays
+                # reserved for real check/parse failures). The auto-retry
+                # (Part 2C) re-runs the gate once next_retry_at passes.
+                job_status_store.record_segment_api_limit_wait(
+                    job_id, index, "qa_gate", upload_root=root,
+                )
+                job_status_store.record_segment_qa(
+                    job_id, index, job_status_store.SEGMENT_QA_API_LIMIT_WAIT,
+                    upload_root=root,
+                )
+                note_bn = (
+                    "স্বয়ংক্রিয় QA চেকের জন্য সব জেমিনি API কী-এর দৈনিক "
+                    "কোটার সীমা পূর্ণ — কোটার রিসেটের পরে আবার চেষ্টা করা হবে।"
+                )
+                log.warning(
+                    "job %s seg %d: auto QA rate-limited; waiting for quota "
+                    "reset", job_id, index,
+                )
+                return {"qa_state": job_status_store.SEGMENT_QA_API_LIMIT_WAIT,
+                        "note_bn": note_bn}
             fix_attempts += 1
             bn = _qa_failure_bn(error)
             job_status_store.record_segment_qa(
@@ -1339,3 +1373,45 @@ def maybe_assemble_final_video(job_id, upload_root=None):
         }
     except Exception:  # noqa: BLE001 - the trigger must never crash a request
         return None
+
+
+def rerun_auto_qa_gate(job_id, seg_index, upload_root=None, call_budget=None,
+                       logger_=None):
+    """Re-run the automated QA gate for one segment (F15 Part 2C retry).
+
+    Resolves the segment's plan entry, mini-job directory and final video,
+    then calls :func:`run_auto_qa_gate` — the gate's own outcome recording
+    (passed / capped / another wait) applies exactly as on the first run.
+    Never raises: a gate failure is logged and swallowed.
+    """
+    root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
+    log = logger_ or logger
+    try:
+        plan = segmentation.load_plan(job_id, root)
+    except (OSError, ValueError) as exc:
+        log.error("job %s seg %d: cannot load plan for QA retry: %s",
+                  job_id, seg_index, exc)
+        return
+    segment = next(
+        (s for s in (plan.get("segments") or [])
+         if int(s.get("index")) == int(seg_index)),
+        None,
+    )
+    if segment is None:
+        log.error("job %s seg %d: no segment in plan for QA retry",
+                  job_id, seg_index)
+        return
+    seg_dir = segmentation.segment_dir(job_id, seg_index, root)
+    final_path = segment_final_path(job_id, seg_index)
+    if not final_path.exists():
+        log.error("job %s seg %d: final video missing for QA retry",
+                  job_id, seg_index)
+        return
+    try:
+        run_auto_qa_gate(
+            job_id, segment, seg_dir, final_path,
+            upload_root=root, call_budget=call_budget, logger_=log,
+        )
+    except Exception:  # noqa: BLE001 - never block the retry worker
+        log.exception("job %s seg %d: auto QA gate retry raised",
+                      job_id, seg_index)

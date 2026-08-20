@@ -1647,6 +1647,8 @@ def _history_card(entry):
         "done": "badge-done",
         "error": "badge-error",
         "running": "badge-running",
+        # F15 Part 2B: a job waiting out an API rate limit gets its own badge.
+        "api_limit_wait": "badge-wait",
         "not_started": "badge-idle",
     }.get(state, "badge-idle")
     created = (entry.get("created_at") or "")[:19].replace("T", " ")
@@ -1654,6 +1656,23 @@ def _history_card(entry):
     target_lang = html.escape(entry.get("target_lang") or "—")
     voice_source = html.escape(entry.get("voice_source") or "—")
     status = {"state": state, "stage": entry.get("stage")}
+    # F15 Part 3: a segmented job whose auto-QA gate is waiting out an API
+    # rate limit gets an extra badge so the wait is visible from History.
+    seg_wait_badge = ""
+    try:
+        status_data = job_status_store.read_status(job_id)
+    except Exception:  # noqa: BLE001 - badge is advisory
+        status_data = {}
+    if isinstance(status_data.get("segments"), dict):
+        waiting = [
+            seg_key for seg_key, seg_entry in status_data["segments"].items()
+            if isinstance(seg_entry, dict)
+            and (seg_entry.get("qa") or {}).get("state") == "api_limit_wait"
+        ]
+        if waiting:
+            seg_wait_badge = (
+                '<span class="history-badge badge-wait">api_limit_wait</span>'
+            )
     resume_form = ""
     if state == "error" or _job_is_stale_running(job_id, status):
         resume_form = (
@@ -1675,7 +1694,7 @@ def _history_card(entry):
         # final review page (final_ready / confirmed / assembly_failed) once
         # the job-wide video exists — keeping the final page reachable from
         # History, not only via a fresh polling redirect.
-        if isinstance(job_status_store.read_status(job_id).get("segmented"), dict):
+        if isinstance(status_data.get("segmented"), dict):
             view_link = (
                 f'<a class="history-view" href="/upload/{job_id}">দেখুন</a>'
             )
@@ -1688,6 +1707,7 @@ def _history_card(entry):
       <div class="history-card-top">
         <span class="history-id"><code>{html.escape(job_id)}</code></span>
         <span class="history-badge {badge_class}">{state}</span>
+        {seg_wait_badge}
       </div>
       <p class="history-meta">{created} · {name}</p>
       <p class="history-meta">target_lang: {target_lang} ·
@@ -1859,25 +1879,72 @@ def _retry_due_api_limit_wait(job_id):
     resumes without any manual click. A second quota hit inside the retried
     stage re-records the wait (attempt_count auto-increments) via the stage's
     own wiring, and this poll re-triggers again once the new retry time passes.
+
+    F15 Part 3: also scans every segment's ``qa.state`` for ``api_limit_wait``
+    and re-runs the automated QA gate for any segment whose wait has come due.
     Returns True when a retry was started.
     """
-    block = job_status_store.get_api_limit_wait(job_id)
-    if not block or not _retry_time_passed(block.get("next_retry_at")):
-        return False
-    status = job_status_store.read_status(job_id)
-    if status.get("state") != "api_limit_wait":
-        return False
-    stage = block.get("stage")
-    if segmentation.is_segmented(job_id):
-        _start_stage(job_id, "resume", _run_resume)
-        return True
-    if stage in ("F1_extract", "C1_translate"):
-        _start_stage(job_id, "upload_pipeline", _run_upload_pipeline)
-        return True
-    if stage == "D2_voiceover":
-        _start_stage(job_id, "voiceover_auto", _run_voiceover_auto)
-        return True
-    return False
+    started = False
+    data = job_status_store.read_status(job_id)
+
+    # Top-level stage wait (whole-video extraction/translation/voiceover or
+    # per-segment stage that recorded a top-level block).
+    block = data.get("api_limit_wait")
+    if (
+        isinstance(block, dict)
+        and _retry_time_passed(block.get("next_retry_at"))
+        and data.get("state") == "api_limit_wait"
+    ):
+        stage = block.get("stage")
+        if segmentation.is_segmented(job_id):
+            _start_stage(job_id, "resume", _run_resume)
+            started = True
+        elif stage in ("F1_extract", "C1_translate"):
+            _start_stage(job_id, "upload_pipeline", _run_upload_pipeline)
+            started = True
+        elif stage == "D2_voiceover":
+            _start_stage(job_id, "voiceover_auto", _run_voiceover_auto)
+            started = True
+
+    # Per-segment QA gate waits (F15 Part 3).
+    for seg_key, entry in (data.get("segments") or {}).items():
+        if not isinstance(entry, dict) or entry.get("index") is None:
+            continue
+        qa = entry.get("qa")
+        if not isinstance(qa, dict) or qa.get("state") != "api_limit_wait":
+            continue
+        seg_block = entry.get("api_limit_wait")
+        if not isinstance(seg_block, dict) or not _retry_time_passed(
+            seg_block.get("next_retry_at")
+        ):
+            continue
+        threading.Thread(
+            target=_run_qa_gate_retry,
+            args=(job_id, int(entry["index"])),
+            daemon=True,
+        ).start()
+        started = True
+    return started
+
+
+def _run_qa_gate_retry(job_id, seg_index):
+    """Re-run one segment's automated QA gate on a background thread (F15 Part 3).
+
+    Started by :func:`_retry_due_api_limit_wait` once the segment's
+    ``next_retry_at`` has passed. The gate records its own outcome (passed /
+    capped / another wait); failures are logged and swallowed so the worker
+    thread never dies.
+    """
+    try:
+        segmented_pipeline.rerun_auto_qa_gate(job_id, seg_index)
+    except Exception:  # noqa: BLE001 - never crash the background worker
+        try:
+            log = job_logging.get_job_logger(job_id)
+            log.exception(
+                "job %s seg %d: auto QA gate retry failed", job_id, seg_index
+            )
+        except Exception:  # noqa: BLE001 - logging is best-effort
+            pass
 
 
 @app.post("/jobs/{job_id}/unresolved/retry")
@@ -2535,6 +2602,13 @@ def _render_segmented_result(job_id: str, reviewed=None, verdict=None) -> HTMLRe
         index = entry.get("index")
         state = entry.get("state", "unknown")
         cls = badge_class.get(state, "badge-idle")
+        # F15 Part 3: a segment whose auto-QA gate is waiting out an API rate
+        # limit shows an extra wait badge next to its state badge.
+        wait_badge = ""
+        if (entry.get("qa") or {}).get("state") == "api_limit_wait":
+            wait_badge = (
+                '<span class="history-badge badge-wait">api_limit_wait</span>'
+            )
         final_path = entry.get("final_path")
         link = "—"
         has_final = bool(final_path) and Path(final_path).exists()
@@ -2545,7 +2619,8 @@ def _render_segmented_result(job_id: str, reviewed=None, verdict=None) -> HTMLRe
             )
         rows.append(
             f"<tr><td><code>{key}</code></td>"
-            f"<td><span class=\"history-badge {cls}\">{html.escape(str(state))}</span></td>"
+            f"<td><span class=\"history-badge {cls}\">{html.escape(str(state))}</span>"
+            f" {wait_badge}</td>"
             f"<td>{entry.get('start_sec')} → {entry.get('end_sec')}s</td>"
             f"<td>{link}</td></tr>"
         )

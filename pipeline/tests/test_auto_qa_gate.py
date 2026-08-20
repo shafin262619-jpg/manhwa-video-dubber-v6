@@ -361,7 +361,9 @@ class AutoQaGateBehaviorTest(AutoQaGateBase):
 
     def test_gemini_failure_counts_toward_cap_without_crashing(self):
         checks = []
-        error = {"type": "rate_limit", "message": "429 quota exceeded"}
+        # A non-rate-limit failure (transient/network) MUST still count toward
+        # the cap — the old behavior.
+        error = {"type": "transient", "message": "timeout"}
         responses = [{"error": error}] * config.MAX_AUTO_QA_FIX_ATTEMPTS
         seg_dir = self._materialize_seg(0)
         final_path = segmented_pipeline.segment_final_path(self.job_id, 0)
@@ -395,6 +397,38 @@ class AutoQaGateBehaviorTest(AutoQaGateBase):
             self.job_id, 0, upload_root=self.upload_root
         )
         self.assertNotEqual(entry["state"], "error")
+
+    def test_rate_limit_returns_api_limit_wait_and_does_not_count_fix(self):
+        """F15 Part 3: a rate-limit error returns api_limit_wait, not cap."""
+        seg_dir = self._materialize_seg(0)
+        final_path = segmented_pipeline.segment_final_path(self.job_id, 0)
+        with mock.patch.object(key_store, "get_active_keys", return_value=["k1"]), (
+            mock.patch.object(
+                segmented_pipeline.subtitle_extract, "call_with_rotation",
+                side_effect=_fake_gemini(
+                    [{"error": {"type": "rate_limit", "message": "429 quota"}}]
+                ),
+            )
+        ):
+            result = segmented_pipeline.run_auto_qa_gate(
+                self.job_id, self.plan["segments"][0], seg_dir, final_path,
+                upload_root=self.upload_root, call_budget=None,
+            )
+
+        self.assertEqual(result["qa_state"], store.SEGMENT_QA_API_LIMIT_WAIT)
+        self.assertTrue(result["note_bn"])
+        # The qa block must reflect the wait.
+        qa = store.get_segment_qa(self.job_id, 0, upload_root=self.upload_root)
+        self.assertEqual(qa["state"], store.SEGMENT_QA_API_LIMIT_WAIT)
+        # No fix attempts were consumed.
+        self.assertNotIn("attempts", qa)
+        # The segment-scoped api_limit_wait block must exist.
+        block = store.get_segment_api_limit_wait(
+            self.job_id, 0, upload_root=self.upload_root
+        )
+        self.assertIsNotNone(block)
+        self.assertEqual(block["stage"], "qa_gate")
+        self.assertEqual(block["attempt_count"], 1)
 
     def test_failed_check_then_pass_resumes_normally(self):
         error = {"type": "transient", "message": "timeout"}
