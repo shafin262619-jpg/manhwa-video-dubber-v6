@@ -43,7 +43,7 @@ from pathlib import Path
 from google import genai
 from google.genai import types as genai_types
 
-from pipeline import config, job_logging, key_store, video_ingest
+from pipeline import config, job_logging, job_status, key_store, video_ingest
 from pipeline.gemini_rotation import (
     AllKeysExhausted,
     CallBudgetExceeded,
@@ -625,6 +625,12 @@ def extract_subtitles(job_id, upload_root=None, call_budget=None, progress_cb=No
     ``progress_cb(processed, total)`` (optional) is called after every
     segment/chunk is handled, with the 1-based count of handled segments over
     the total, so the job-status wiring can report per-chunk progress (F9).
+
+    F15 Part 2B: the ONE exception to "never raises" is quota exhaustion —
+    when every configured Gemini key fails with a rate limit, the job is
+    transitioned to ``api_limit_wait`` and :class:`job_status.ApiLimitWaitError`
+    is raised so the stage stops instead of reporting ``extraction_failed``.
+    Any other Gemini failure keeps the old never-raising behavior.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = upload_root / job_id
@@ -665,6 +671,13 @@ def extract_subtitles(job_id, upload_root=None, call_budget=None, progress_cb=No
         )
         segments_count = 1
         if subs is None:
+            if is_rate_limit_result(error):
+                job_status.record_api_limit_wait(
+                    job_id, "F1_extract", upload_root=upload_root,
+                )
+                raise job_status.ApiLimitWaitError(
+                    f"All Gemini keys rate-limited during extraction for job {job_id}"
+                )
             failed_segments.append(0)
             errors[0] = error
         else:
@@ -685,6 +698,13 @@ def extract_subtitles(job_id, upload_root=None, call_budget=None, progress_cb=No
                 call_budget=call_budget, logger_=job_logger,
             )
             if subs is None:
+                if is_rate_limit_result(error):
+                    job_status.record_api_limit_wait(
+                        job_id, "F1_extract", upload_root=upload_root,
+                    )
+                    raise job_status.ApiLimitWaitError(
+                        f"All Gemini keys rate-limited during extraction for job {job_id}"
+                    )
                 failed_segments.append(seg["index"])
                 errors[seg["index"]] = error
             else:

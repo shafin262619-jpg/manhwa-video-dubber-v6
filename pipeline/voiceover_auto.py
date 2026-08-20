@@ -35,7 +35,15 @@ from pathlib import Path
 from google import genai
 from google.genai import types as genai_types
 
-from pipeline import config, job_logging, key_store, lang_files, subtitle_extract, video_ingest
+from pipeline import (
+    config,
+    job_logging,
+    job_status,
+    key_store,
+    lang_files,
+    subtitle_extract,
+    video_ingest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +160,11 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None,
     stage against a different directory (a per-segment mini job, F13b) instead
     of ``upload_root / job_id``.
 
+    F15 Part 2B: the ONE exception to "never raises on per-line TTS failures"
+    is quota exhaustion — every key rate-limited raises
+    :class:`job_status.ApiLimitWaitError` after transitioning the job to
+    ``api_limit_wait``, so the job waits instead of finishing with silence.
+
     ``correction_hint`` (optional, F14b) is a reviewer-framed correction
     instruction. When given it disables the U1c clip-reuse heuristic (a
     correction must produce fresh TTS audio, never reuse the flagged clips)
@@ -234,13 +247,23 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None,
             # Only forward the correction hint to _call_tts when it exists, so
             # 3-arg TTS mocks/callables keep working unchanged on first pass.
             tts_args = (text, voice, correction_hint) if correction_hint else (text, voice)
-            audio, rotation, _ = subtitle_extract.call_with_rotation(
+            audio, rotation, error = subtitle_extract.call_with_rotation(
                 keys, rotation, _call_tts, *tts_args,
                 call_budget=call_budget, logger_=job_logger,
             )
             if audio is not None:
                 clip_path.write_bytes(audio)
                 tts_failed = False
+            elif subtitle_extract.is_rate_limit_result(error):
+                # F15 Part 2B: every key is rate-limited — silence placeholders
+                # would silently "finish" the job with no voiceover. Stop the
+                # stage and let the auto-retry re-run it later.
+                job_status.record_api_limit_wait(
+                    job_id, "D2_voiceover", upload_root=upload_root,
+                )
+                raise job_status.ApiLimitWaitError(
+                    f"All Gemini keys rate-limited during voiceover for job {job_id}"
+                )
 
         if tts_failed:
             failed_serials.append(serial)
@@ -283,11 +306,18 @@ def generate_auto_voiceover(job_id, upload_root=None, call_budget=None,
                 continue
             clip_path = clips_dir / f"serial_{serial}.wav"
             tts_args = (text, voice, correction_hint) if correction_hint else (text, voice)
-            audio, rotation, _ = subtitle_extract.call_with_rotation(
+            audio, rotation, error = subtitle_extract.call_with_rotation(
                 keys, rotation, _call_tts, *tts_args,
                 call_budget=call_budget, logger_=job_logger,
             )
             if audio is None:
+                if subtitle_extract.is_rate_limit_result(error):
+                    job_status.record_api_limit_wait(
+                        job_id, "D2_voiceover", upload_root=upload_root,
+                    )
+                    raise job_status.ApiLimitWaitError(
+                        f"All Gemini keys rate-limited during voiceover for job {job_id}"
+                    )
                 still_failed.append(serial)
                 continue
             clip_path.write_bytes(audio)

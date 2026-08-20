@@ -13,7 +13,7 @@ from unittest import mock
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
-from pipeline import config, job_config, key_store, subtitle_extract, video_ingest
+from pipeline import config, job_config, job_status, key_store, subtitle_extract, video_ingest
 from pipeline.gemini_rotation import CallBudget
 
 
@@ -633,6 +633,8 @@ class SubtitleExtractRetryTest(SubtitleExtractBase):
         # U2b: rotation is now classification-based (call_with_rotation_v2) —
         # a 429 is "rotatable" and rotates immediately, there is no same-key
         # backoff any more, so with a single key the segment fails cleanly.
+        # F15 Part 2B: a rate-limit exhaustion now transitions the job to
+        # api_limit_wait and raises instead of reporting extraction_failed.
         self._write_meta(30.0)
         self._set_keys(["key-one"])
         calls = []
@@ -644,14 +646,15 @@ class SubtitleExtractRetryTest(SubtitleExtractBase):
         with mock.patch.object(
             subtitle_extract, "_call_gemini", side_effect=fake_call
         ):
-            result = subtitle_extract.extract_subtitles(
-                self.job_id, upload_root=self.upload_root
-            )
+            with self.assertRaises(job_status.ApiLimitWaitError):
+                subtitle_extract.extract_subtitles(
+                    self.job_id, upload_root=self.upload_root
+                )
 
-        self.assertEqual(result["status"], "extraction_failed")
         self.assertEqual(calls, ["key-one"])
-        self.assertEqual(result["failed_segments"], [0])
-        self.assertEqual(result["errors"]["0"]["type"], "rate_limit")
+        data = job_status.read_status(self.job_id, upload_root=self.upload_root)
+        self.assertEqual(data["state"], "api_limit_wait")
+        self.assertEqual(data["api_limit_wait"]["stage"], "F1_extract")
 
     def test_rate_limit_rotates_immediately(self):
         self._write_meta(30.0)
@@ -665,14 +668,15 @@ class SubtitleExtractRetryTest(SubtitleExtractBase):
         with mock.patch.object(
             subtitle_extract, "_call_gemini", side_effect=fake_call
         ):
-            result = subtitle_extract.extract_subtitles(
-                self.job_id, upload_root=self.upload_root
-            )
+            with self.assertRaises(job_status.ApiLimitWaitError):
+                subtitle_extract.extract_subtitles(
+                    self.job_id, upload_root=self.upload_root
+                )
 
-        self.assertEqual(result["status"], "extraction_failed")
         self.assertEqual(calls, ["key-a", "key-b"])
-        self.assertEqual(result["failed_segments"], [0])
-        self.assertEqual(result["errors"]["0"]["type"], "rate_limit")
+        data = job_status.read_status(self.job_id, upload_root=self.upload_root)
+        self.assertEqual(data["state"], "api_limit_wait")
+        self.assertEqual(data["api_limit_wait"]["stage"], "F1_extract")
 
     def test_non_rotatable_error_stops_without_rotation(self):
         # U2b: a 400 is classified "non_rotatable" — the very first key's

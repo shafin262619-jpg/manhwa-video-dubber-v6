@@ -117,6 +117,12 @@ def run_stage(job_id, stage, func, *args, **kwargs):
         pass
     try:
         result = func(*args, **kwargs)
+    except ApiLimitWaitError:
+        # F15: the stage already transitioned the job to ``api_limit_wait``
+        # (via record_api_limit_wait) before raising — writing ``error`` here
+        # would clobber the wait state, so the exception just propagates to
+        # the caller's handler unchanged.
+        raise
     except Exception:
         try:
             write_status(job_id, stage, "error")
@@ -855,10 +861,23 @@ def _atomic_write(path, data):
 #
 # ``next_retry_at`` follows :func:`compute_next_retry`: the first hit waits a
 # full 24h quota window, each later hit re-queues one hour after the previous
-# attempt's retry time. No rendering/UI or pipeline wiring exists yet — the
-# four Gemini call sites that can produce a ``rate_limit`` result dict consume
-# this in a later chunk.
+# attempt's retry time. The four Gemini call sites that can produce a
+# ``rate_limit`` result dict consume this in F15 Parts 2B/2C/3.
 # ---------------------------------------------------------------------------
+
+
+class ApiLimitWaitError(RuntimeError):
+    """Raised by a stage that stopped because every Gemini key is rate-limited.
+
+    F15 Part 2B: the stage functions (extraction / translation / voiceover /
+    QA gate) detect the exhaustion via ``subtitle_extract.is_rate_limit_result``
+    and transition the job to ``api_limit_wait`` with
+    :func:`record_api_limit_wait` BEFORE raising this. Raising lets the stage
+    stop immediately instead of silently falling back; the caller's error
+    handler must treat this exception as "the wait state is already recorded"
+    rather than writing an ``error`` status (see :func:`run_stage` and the
+    app's ``_write_error_status``).
+    """
 
 
 def _as_utc_datetime(value):

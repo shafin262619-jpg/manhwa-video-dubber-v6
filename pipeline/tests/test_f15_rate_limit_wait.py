@@ -3,15 +3,21 @@
 Covers the additive ``api_limit_wait`` state in ``job_status``, the
 ``api_limit_wait`` record block read/write helpers, the shared
 ``is_rate_limit_result`` detection helper and the ``compute_next_retry``
-back-off schedule. No pipeline wiring is tested here — that is a later chunk.
+back-off schedule. F15 Part 2B (added later): the stage-level wiring —
+extraction / translation / voiceover-auto transition to ``api_limit_wait``
+and raise :class:`job_status.ApiLimitWaitError` on quota exhaustion, while
+``run_stage``/``_write_error_status`` never clobber the wait state with an
+``error`` status.
 """
 
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
-from pipeline import job_status, subtitle_extract
+from pipeline import job_status, key_store, subtitle_extract, translator, video_ingest, voiceover_auto
 
 
 class ApiLimitWaitStateTest(unittest.TestCase):
@@ -228,6 +234,231 @@ class IsRateLimitResultTest(unittest.TestCase):
 
     def test_false_for_non_dict_input(self):
         self.assertFalse(subtitle_extract.is_rate_limit_result("rate_limit"))
+
+
+# ---------------------------------------------------------------------------
+# F15 Part 2B: stage wiring — ApiLimitWaitError, run_stage re-raise, and
+# detection in the three Gemini stage functions.
+# ---------------------------------------------------------------------------
+
+
+class ApiLimitWaitStageWiringTest(unittest.TestCase):
+    """run_stage re-raises ApiLimitWaitError without writing error status."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._orig_root = video_ingest.UPLOAD_ROOT
+        video_ingest.UPLOAD_ROOT = Path(self._tmp.name) / "uploads"
+        self.job_id = "job-api-wiring"
+        self.job_dir = video_ingest.UPLOAD_ROOT / self.job_id
+        self.job_dir.mkdir(parents=True)
+
+    def tearDown(self):
+        video_ingest.UPLOAD_ROOT = self._orig_root
+
+    def test_run_stage_reraises_api_limit_wait_without_error_status(self):
+        """run_stage must not write ``error`` when the stage raised ApiLimitWaitError."""
+        def boom(job_id):
+            job_status.record_api_limit_wait(
+                job_id, "C1_translate", upload_root=video_ingest.UPLOAD_ROOT,
+            )
+            raise job_status.ApiLimitWaitError("rate-limited")
+
+        with self.assertRaises(job_status.ApiLimitWaitError):
+            job_status.run_stage(
+                self.job_id, "C1_translate", boom, self.job_id,
+            )
+
+        data = job_status.read_status(self.job_id)
+        self.assertEqual(data["state"], "api_limit_wait")
+        self.assertEqual(
+            data["stages"]["C1_translate"]["state"], "api_limit_wait",
+        )
+
+    def test_other_exceptions_still_write_error(self):
+        """run_stage must still write ``error`` for non-ApiLimitWaitError exceptions."""
+        def boom(job_id):
+            raise RuntimeError("something else broke")
+
+        with self.assertRaises(RuntimeError):
+            job_status.run_stage(
+                self.job_id, "extract", boom, self.job_id,
+            )
+
+        data = job_status.read_status(self.job_id)
+        self.assertEqual(data["state"], "error")
+        self.assertEqual(data["stages"]["extract"]["state"], "error")
+
+
+class ExtractApiLimitWaitTest(unittest.TestCase):
+    """extract_subtitles raises ApiLimitWaitError + records api_limit_wait."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._orig_root = video_ingest.UPLOAD_ROOT
+        video_ingest.UPLOAD_ROOT = Path(self._tmp.name) / "uploads"
+        self.job_id = "job-extract-rate-limit"
+        self.job_dir = video_ingest.UPLOAD_ROOT / self.job_id
+        self.job_dir.mkdir(parents=True)
+        # A short source.mp4 (any bytes — ffprobe is never called because
+        # job_meta.json provides duration_sec).
+        (self.job_dir / "source.mp4").write_bytes(b"dummy video content")
+        (self.job_dir / "job_meta.json").write_text(
+            '{"duration_sec": 10}', encoding="utf-8",
+        )
+        self._keys_patch = mock.patch.object(
+            key_store, "get_active_keys", return_value=["k1"],
+        )
+        self._keys_patch.start()
+        self.addCleanup(self._keys_patch.stop)
+
+    def tearDown(self):
+        video_ingest.UPLOAD_ROOT = self._orig_root
+
+    def test_rate_limit_raises_and_records_wait(self):
+        with mock.patch.object(
+            subtitle_extract, "call_with_rotation",
+            return_value=(None, 0, {"type": "rate_limit", "message": "429 quota"}),
+        ):
+            with self.assertRaises(job_status.ApiLimitWaitError):
+                subtitle_extract.extract_subtitles(
+                    self.job_id, upload_root=video_ingest.UPLOAD_ROOT,
+                )
+
+        data = job_status.read_status(self.job_id)
+        self.assertEqual(data["state"], "api_limit_wait")
+        self.assertEqual(
+            data["api_limit_wait"]["stage"], "F1_extract",
+        )
+
+    def test_other_error_keeps_old_behavior(self):
+        """A non-rate-limit error does NOT raise — extraction returns normally."""
+        with mock.patch.object(
+            subtitle_extract, "call_with_rotation",
+            return_value=(None, 0, {"type": "permanent", "message": "bad request"}),
+        ):
+            result = subtitle_extract.extract_subtitles(
+                self.job_id, upload_root=video_ingest.UPLOAD_ROOT,
+            )
+
+        self.assertEqual(result["status"], "extraction_failed")
+
+
+class TranslateApiLimitWaitTest(unittest.TestCase):
+    """translate_subtitles raises ApiLimitWaitError + records api_limit_wait."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._orig_root = video_ingest.UPLOAD_ROOT
+        video_ingest.UPLOAD_ROOT = Path(self._tmp.name) / "uploads"
+        self.job_id = "job-translate-rate-limit"
+        self.job_dir = video_ingest.UPLOAD_ROOT / self.job_id
+        self.job_dir.mkdir(parents=True)
+        (self.job_dir / "subtitles_zh.json").write_text(
+            json.dumps([
+                {"serial": 1, "text_zh": "你好", "start_sec": 0.0, "end_sec": 3.2},
+            ]),
+            encoding="utf-8",
+        )
+        self._keys_patch = mock.patch.object(
+            key_store, "get_active_keys", return_value=["k1"],
+        )
+        self._keys_patch.start()
+        self.addCleanup(self._keys_patch.stop)
+
+    def tearDown(self):
+        video_ingest.UPLOAD_ROOT = self._orig_root
+
+    def test_rate_limit_raises_and_records_wait(self):
+        with mock.patch.object(
+            subtitle_extract, "call_with_rotation",
+            return_value=(None, 0, {"type": "rate_limit", "message": "429 quota"}),
+        ):
+            with self.assertRaises(job_status.ApiLimitWaitError):
+                translator.translate_subtitles(
+                    self.job_id, upload_root=video_ingest.UPLOAD_ROOT,
+                )
+
+        data = job_status.read_status(self.job_id)
+        self.assertEqual(data["state"], "api_limit_wait")
+        self.assertEqual(
+            data["api_limit_wait"]["stage"], "C1_translate",
+        )
+
+    def test_call_budget_exceeded_keeps_old_behavior(self):
+        """A call_budget_exceeded error falls back, never raises."""
+        with mock.patch.object(
+            subtitle_extract, "call_with_rotation",
+            return_value=(
+                None, 0, {"type": "call_budget_exceeded", "message": "budget", "used": 5, "max_calls": 5}
+            ),
+        ):
+            output = translator.translate_subtitles(
+                self.job_id, upload_root=video_ingest.UPLOAD_ROOT,
+            )
+
+        self.assertEqual(len(output), 1)
+        self.assertTrue(output[0]["translation_fallback"])
+
+
+class VoiceoverApiLimitWaitTest(unittest.TestCase):
+    """generate_auto_voiceover raises ApiLimitWaitError + records api_limit_wait."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._orig_root = video_ingest.UPLOAD_ROOT
+        video_ingest.UPLOAD_ROOT = Path(self._tmp.name) / "uploads"
+        self.job_id = "job-voiceover-rate-limit"
+        self.job_dir = video_ingest.UPLOAD_ROOT / self.job_id
+        self.job_dir.mkdir(parents=True)
+        (self.job_dir / "subtitles_hi.json").write_text(
+            json.dumps([
+                {"serial": 1, "text_zh": "你好", "text_hi": "Namaste",
+                 "start_sec": 0.0, "end_sec": 3.2},
+            ]),
+            encoding="utf-8",
+        )
+        self._keys_patch = mock.patch.object(
+            key_store, "get_active_keys", return_value=["k1"],
+        )
+        self._keys_patch.start()
+        self.addCleanup(self._keys_patch.stop)
+
+    def tearDown(self):
+        video_ingest.UPLOAD_ROOT = self._orig_root
+
+    def test_rate_limit_raises_and_records_wait(self):
+        with mock.patch.object(
+            subtitle_extract, "call_with_rotation",
+            return_value=(None, 0, {"type": "rate_limit", "message": "429 quota"}),
+        ):
+            with self.assertRaises(job_status.ApiLimitWaitError):
+                voiceover_auto.generate_auto_voiceover(
+                    self.job_id, upload_root=video_ingest.UPLOAD_ROOT,
+                )
+
+        data = job_status.read_status(self.job_id)
+        self.assertEqual(data["state"], "api_limit_wait")
+        self.assertEqual(
+            data["api_limit_wait"]["stage"], "D2_voiceover",
+        )
+
+    def test_other_tts_failure_keeps_silence_fallback(self):
+        """A non-rate-limit TTS failure still uses silence placeholder."""
+        with mock.patch.object(
+            subtitle_extract, "call_with_rotation",
+            return_value=(None, 0, {"type": "non_rotatable", "message": "content blocked"}),
+        ):
+            result = voiceover_auto.generate_auto_voiceover(
+                self.job_id, upload_root=video_ingest.UPLOAD_ROOT,
+            )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["failed_serials"], [1])
 
 
 if __name__ == "__main__":

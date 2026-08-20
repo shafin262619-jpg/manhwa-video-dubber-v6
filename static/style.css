@@ -534,6 +534,28 @@ code {
   box-shadow: 0 4px 12px rgba(0, 0, 0, .3);
 }
 
+/* F15 Part 2B: API rate-limit wait banner (polling page) — amber, not red:
+   the job is paused, not failed, and resumes automatically. */
+.wait-banner {
+  border: 1px solid rgba(222, 165, 60, .55);
+  background: rgba(222, 165, 60, .12);
+  color: #f2c879;
+  border-radius: var(--radius);
+  padding: 1.1rem 1.2rem;
+}
+
+.wait-banner-title {
+  margin: 0 0 0.5rem;
+  font-weight: 700;
+  color: #f2c879;
+}
+
+.wait-banner p {
+  margin: 0;
+  word-break: break-word;
+  color: #f5dca8;
+}
+
 .page-nav {
   margin-top: 2.5rem;
   padding-top: 1rem;

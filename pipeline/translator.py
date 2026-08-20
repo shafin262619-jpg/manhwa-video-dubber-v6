@@ -41,6 +41,7 @@ from pipeline import (
     config,
     job_config,
     job_logging,
+    job_status,
     key_store,
     lang_files,
     subtitle_extract,
@@ -116,7 +117,8 @@ def _translate_lines(key, lines, expected_count, emphasis, language,
 
 
 def _translate_chunk(keys, rotation, lines, depth, max_depth, language,
-                     call_budget=None, logger_=None, correction_hint=None):
+                     call_budget=None, logger_=None, correction_hint=None,
+                     job_id=None, upload_root=None):
     """Attempt a strict translation of ``lines``; on count mismatch, split.
 
     Returns ``(translations, rotation)`` where ``translations`` is aligned
@@ -129,6 +131,11 @@ def _translate_chunk(keys, rotation, lines, depth, max_depth, language,
     chunk falls back as a unit — smaller chunks cannot help, and the budget
     rule is to keep what already matched and fall the rest back, never raise.
 
+    F15 Part 2B: the ONE exception is quota exhaustion — when the error dict
+    indicates rate-limit the job is transitioned to ``api_limit_wait`` and
+    :class:`job_status.ApiLimitWaitError` is raised so the whole stage stops
+    instead of silently falling back to Chinese.
+
     ``logger_`` (optional) is the per-job logger threaded from the entry
     function so Gemini failures land in the job's ``pipeline.log``.
     """
@@ -138,6 +145,13 @@ def _translate_chunk(keys, rotation, lines, depth, max_depth, language,
         correction_hint, call_budget=call_budget, logger_=logger_,
     )
     if error is not None:
+        if subtitle_extract.is_rate_limit_result(error):
+            job_status.record_api_limit_wait(
+                job_id, "C1_translate", upload_root=upload_root,
+            )
+            raise job_status.ApiLimitWaitError(
+                f"All Gemini keys rate-limited during translation for job {job_id}"
+            )
         return [None] * n, rotation
     if len(result) == n:
         return result, rotation
@@ -145,11 +159,13 @@ def _translate_chunk(keys, rotation, lines, depth, max_depth, language,
         keys, rotation, lines, depth + 1, max_depth, language,
         call_budget=call_budget, logger_=logger_,
         correction_hint=correction_hint,
+        job_id=job_id, upload_root=upload_root,
     )
 
 
 def _repair_split(keys, rotation, lines, depth, max_depth, language,
-                  call_budget=None, logger_=None, correction_hint=None):
+                  call_budget=None, logger_=None, correction_hint=None,
+                  job_id=None, upload_root=None):
     """Split ``lines`` into two roughly equal halves and repair each one.
 
     ``depth`` counts how many times this chunk has already been split. A chunk
@@ -165,11 +181,13 @@ def _repair_split(keys, rotation, lines, depth, max_depth, language,
         keys, rotation, lines[:mid], depth, max_depth, language,
         call_budget=call_budget, logger_=logger_,
         correction_hint=correction_hint,
+        job_id=job_id, upload_root=upload_root,
     )
     right, rotation = _translate_chunk(
         keys, rotation, lines[mid:], depth, max_depth, language,
         call_budget=call_budget, logger_=logger_,
         correction_hint=correction_hint,
+        job_id=job_id, upload_root=upload_root,
     )
     return left + right, rotation
 
@@ -261,6 +279,10 @@ def translate_subtitles(
     it is appended to every Gemini translation prompt so the model is told
     plainly what was wrong and what to fix while re-translating; when ``None``
     the prompt is byte-identical to a first pass.
+
+    F15 Part 2B: quota exhaustion (every key rate-limited) raises
+    :class:`job_status.ApiLimitWaitError` after transitioning the job to
+    ``api_limit_wait`` — the ONE exception to the never-raise fallback rule.
     """
     upload_root = Path(upload_root) if upload_root else video_ingest.UPLOAD_ROOT
     job_dir = Path(job_dir) if job_dir else upload_root / job_id
@@ -314,6 +336,16 @@ def translate_subtitles(
                         "keeping original Chinese (translation_fallback)",
                         job_id,
                     )
+                elif subtitle_extract.is_rate_limit_result(error):
+                    # F15 Part 2B: every key is rate-limited — the batch-split
+                    # repair would only burn more calls. Transition to
+                    # api_limit_wait and stop the stage.
+                    job_status.record_api_limit_wait(
+                        job_id, "C1_translate", upload_root=upload_root,
+                    )
+                    raise job_status.ApiLimitWaitError(
+                        f"All Gemini keys rate-limited during translation for job {job_id}"
+                    )
                 else:
                     job_logger.warning(
                         "translation failed/mismatched after strict retry for job %s; "
@@ -324,6 +356,7 @@ def translate_subtitles(
                         keys, rotation, lines, 0, max_split_rounds, language,
                         call_budget=call_budget, logger_=job_logger,
                         correction_hint=correction_hint,
+                        job_id=job_id, upload_root=upload_root,
                     )
 
     output = _build_output(entries, translations, fallback)

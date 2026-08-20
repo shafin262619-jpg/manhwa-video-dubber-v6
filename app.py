@@ -116,7 +116,12 @@ def _write_error_status(job_id, stage, exc):
     ``detail_bn`` mirror can never drift out of sync with ``detail``. The
     Bengali mapper is best-effort: if it raises (it should not), the English
     detail is reused so the banner still has something to show.
+
+    F15 Part 2B: an ``ApiLimitWaitError`` means the stage already transitioned
+    the job to ``api_limit_wait`` — never clobber that state with ``error``.
     """
+    if isinstance(exc, job_status_store.ApiLimitWaitError):
+        return
     extra = {"detail": _friendly_error(exc)}
     try:
         extra["detail_bn"] = error_bn.explain_bn(exc, stage)
@@ -719,6 +724,10 @@ def _polling_page(job_id, page_title, result_url, stage):
     <ol id="stage-list" class="stage-list"></ol>
   </div>
   <div id="job-error" class="error-banner" hidden></div>
+  <div id="job-wait" class="wait-banner" hidden>
+    <p class="wait-banner-title">সব জেমিনি API কী-এর দৈনিক কোটার সীমা পূর্ণ</p>
+    <p id="wait-message"></p>
+  </div>
   <div id="log-panel" class="log-panel" hidden>
     <div class="log-panel-head">
       <span class="log-panel-title">লাইভ লগ</span>
@@ -880,6 +889,16 @@ def _polling_page(job_id, page_title, result_url, stage):
         .catch(function () {{ /* transient — retried on the next tick */ }});
     }}
 
+    function showWait(status) {{
+      document.getElementById('job-processing').hidden = true;
+      var el = document.getElementById('job-wait');
+      el.hidden = false;
+      var block = status.api_limit_wait || {{}};
+      var nextRetry = block.next_retry_at || 'unknown';
+      document.getElementById('wait-message').textContent =
+        'কাজটি স্বয়ংক্রিয়ভাবে পরবর্তী চেষ্টার সময় আবার শুরু হবে (UTC): ' + nextRetry;
+    }}
+
     function poll() {{
       fetch('/api/jobs/' + encodeURIComponent(JOB_ID) + '/status')
         .then(function (r) {{ return r.json(); }})
@@ -890,6 +909,11 @@ def _polling_page(job_id, page_title, result_url, stage):
           }}
           if (status.state === 'error') {{
             showError(status);
+            return;
+          }}
+          if (status.state === 'api_limit_wait') {{
+            showWait(status);
+            setTimeout(poll, 30000);
             return;
           }}
           document.getElementById('progress-panel').hidden = false;
