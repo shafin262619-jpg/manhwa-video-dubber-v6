@@ -519,5 +519,32 @@ class VoiceoverAutoEndpointTest(VoiceoverAutoBase):
         self.assertEqual(res.status_code, 400)
 
 
+class WrapPcmWavTest(unittest.TestCase):
+    """F23: the TTS API returns raw L16 PCM — _wrap_pcm_wav adds the header."""
+
+    def test_wraps_raw_pcm_in_valid_wav(self):
+        import io
+        import wave
+
+        pcm = bytes(range(0, 256)) * 10  # 2560 bytes of 16-bit samples
+        out = voiceover_auto._wrap_pcm_wav(pcm, 24000)
+        self.assertTrue(out.startswith(b"RIFF"), "must be a WAV container")
+        with wave.open(io.BytesIO(out)) as wav:
+            self.assertEqual(wav.getnchannels(), 1)
+            self.assertEqual(wav.getsampwidth(), 2)
+            self.assertEqual(wav.getframerate(), 24000)
+            self.assertEqual(wav.readframes(1280), pcm)
+
+    def test_wrap_is_lossless(self):
+        pcm = b"\x01\x00\x02\x00\x03\x00"
+        out = voiceover_auto._wrap_pcm_wav(pcm, 16000)
+        import io
+        import wave
+
+        with wave.open(io.BytesIO(out)) as wav:
+            self.assertEqual(wav.getframerate(), 16000)
+            self.assertEqual(wav.readframes(3), pcm)
+
+
 if __name__ == "__main__":
     unittest.main()

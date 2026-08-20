@@ -26,10 +26,12 @@ Resilience rules:
   (silence placeholder) so a single bad clip never aborts the whole job.
 """
 
+import io
 import json
 import logging
 import subprocess
 import tempfile
+import wave
 from pathlib import Path
 
 from google import genai
@@ -83,8 +85,32 @@ def _call_tts(key, text, voice_name, correction_hint=None):
     )
     for part in response.candidates[0].content.parts:
         if part.inline_data and part.inline_data.data:
-            return part.inline_data.data
+            audio = part.inline_data.data
+            mime = (part.inline_data.mime_type or "").lower()
+            # The Gemini TTS API returns raw 16-bit PCM (`audio/L16;codec=pcm;
+            # rate=<sr>`) with NO WAV container — writing those bytes straight
+            # to a `.wav` file makes ffprobe/ffmpeg reject the clip as
+            # "Invalid data found", so every clip falls back to silence. Wrap
+            # raw PCM in a minimal WAV header (matching the pipeline's
+            # mono/16-bit/24000 Hz clip convention); real RIFF/WAV payloads
+            # (older model behaviour) pass through untouched.
+            if not audio.startswith(b"RIFF") and (
+                mime.startswith("audio/l16") or "pcm" in mime
+            ):
+                audio = _wrap_pcm_wav(audio, config.TTS_SAMPLE_RATE)
+            return audio
     raise RuntimeError("TTS response contained no audio")
+
+
+def _wrap_pcm_wav(pcm_bytes, sample_rate):
+    """Wrap raw 16-bit mono PCM bytes in a minimal WAV container."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm_bytes)
+    return buf.getvalue()
 
 
 def _run(cmd, timeout):
